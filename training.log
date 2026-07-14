@@ -1,0 +1,94 @@
+Loading data...
+  8,813 players | 2022-02-08 to 2026-07-07
+  231 tournament weeks
+
+Building training dataset...
+    500/8,813 players processed...
+    1,000/8,813 players processed...
+    1,500/8,813 players processed...
+    2,000/8,813 players processed...
+    2,500/8,813 players processed...
+    3,000/8,813 players processed...
+    3,500/8,813 players processed...
+    4,000/8,813 players processed...
+    4,500/8,813 players processed...
+    5,000/8,813 players processed...
+    5,500/8,813 players processed...
+    6,000/8,813 players processed...
+    6,500/8,813 players processed...
+    7,000/8,813 players processed...
+    7,500/8,813 players processed...
+    8,000/8,813 players processed...
+    8,500/8,813 players processed...
+  Cached to models\dataset_cache_weekly.parquet
+  613,369 observations | label=1: 159,291 (26.0%) | label=0: 454,078 (74.0%)
+  6,780 unique players in dataset
+
+Cross-validating (TimeSeriesSplit, 5 folds)...
+  (CV using most-recent 200,000 rows for speed)
+  logistic              AUC=0.794  Brier=0.178  LogLoss=0.538
+  random_forest         AUC=0.803  Brier=0.176  LogLoss=0.530
+  gradient_boost        AUC=0.802  Brier=0.149  LogLoss=0.463
+
+Training final models on all data...
+  logistic - trained on 613,369 rows
+  random_forest - trained on 613,369 rows
+  gradient_boost - trained on 613,369 rows
+
+Saving models...
+  Saved -> models\attendance_logistic.pkl
+  Saved -> models\attendance_random_forest.pkl
+  Saved -> models\attendance_gradient_boost.pkl
+
+-- Logistic Regression Coefficients (by |coef|) -----------------
+  decay_score                  +1.8373  ####################################
+  log_weeks_since_last         -0.5608  ###########
+  att_rate_16w                 -0.5352  ##########
+  att_rate_8w                  -0.4408  ########
+  month_sin                    +0.1627  ###
+  week_sin                     -0.1359  ##
+  avg_rank_pct_recent          +0.1075  ##
+  log_n_appearances            +0.0808  #
+  att_rate_4w                  -0.0656  #
+  week_cos                     -0.0238  
+  current_rating               -0.0231  
+  month_cos                    -0.0197  
+  avg_rank_pct_all             -0.0164  
+  rating_trend                 +0.0104  
+
+-- Random Forest Feature Importances ----------------------------
+  decay_score                  0.2451  ########################
+  att_rate_4w                  0.2269  ######################
+  log_weeks_since_last         0.2137  #####################
+  att_rate_8w                  0.1630  ################
+  att_rate_16w                 0.1020  ##########
+  log_n_appearances            0.0299  ##
+  avg_rank_pct_recent          0.0063  
+  avg_rank_pct_all             0.0045  
+  rating_trend                 0.0026  
+  current_rating               0.0015  
+  week_cos                     0.0013  
+  week_sin                     0.0013  
+  month_sin                    0.0009  
+  month_cos                    0.0009  
+
+-- Gradient Boost Feature Importances ---------------------------
+  decay_score                  0.6943  #####################################################################
+  att_rate_4w                  0.1592  ###############
+  log_weeks_since_last         0.1013  ##########
+  log_n_appearances            0.0140  #
+  avg_rank_pct_recent          0.0094  
+  week_sin                     0.0047  
+  att_rate_16w                 0.0038  
+  week_cos                     0.0036  
+  month_sin                    0.0023  
+  current_rating               0.0022  
+  rating_trend                 0.0016  
+  avg_rank_pct_all             0.0015  
+  month_cos                    0.0012  
+  att_rate_8w                  0.0007  
+
+Next prediction target: 2026-07-14
+Run with --predict to generate attendance probabilities.
+
+Done.
