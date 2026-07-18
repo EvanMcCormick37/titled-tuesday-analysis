@@ -17,12 +17,12 @@ Typical notebook usage
 
     df, p_participate, app_counts = load_and_prepare(
         cut_players=['Magnus Carlsen'],
-        player_to_usernames=PLAYER_TO_USERNAMES,
+        player_to_username=PLAYER_TO_USERNAME,
     )
     players, p_play, hist_pcts, hist_wts = build_player_pool(
         df, p_participate, app_counts
     )
-    portfolio = build_portfolio(df_tt, players, PLAYER_TO_USERNAMES)
+    portfolio = build_portfolio(df_tt, players, PLAYER_TO_USERNAME)
     pnl = run_portfolio_mc(players, p_play, hist_pcts, hist_wts, portfolio,
                            n_sims=100_000)
     pnl_summary(pnl)
@@ -32,153 +32,21 @@ import time
 import numpy as np
 import pandas as pd
 from datetime import datetime
+import csv
+import joblib
+from sklearn.isotonic import IsotonicRegression
 
-USERNAME_TO_PLAYER = {
-    # ── Verified via chess.com profile ──────────────────────────────
-    'FairChess_on_YouTube': 'Dmitry Andreikin',        # [V]
-    'Fandorine': 'Maksim Chigaev',                     # [V]
-    'Konavets': 'Sam Sevian',                          # [V]
-
-    # ── Well-documented handles ─────────────────────────────────────
-    'Hikaru': 'Hikaru Nakamura',                       # [D]
-    'MagnusCarlsen': 'Magnus Carlsen',                 # [D]
-    'DenLaz': 'Denis Lazavik',                         # [D]
-    'Jospem': 'Jose Martinez',
-    'Polish_fighter3000': 'Jan-Krzysztof Duda',        # [D]
-    'mishanick': 'Aleksei Sarana',                      # [D]
-    'Duhless': 'Daniil Dubov',                         # [D]
-    'HansOnTwitch': 'Hans Niemann',                    # [D]
-    'LyonBeast': 'Maxime Vachier-Lagrave',             # [D]
-    'lachesisQ': 'Ian Nepomniachtchi',                 # [D]
-    'Bigfish1995': 'Vladimir Fedoseev',                # [D]
-    'GMWSO': 'Wesley So',                              # [D]
-    'wonderfultime': 'Le Tuan Minh',                   # [D]
-    'Parhamov': 'Parham Maghsoodloo',                  # [D]
-    'Msb2': 'Matthias Bluebaum',                       # [D]
-    'GHANDEEVAM2003': 'Arjun Erigaisi',                # [D]
-    'vi_pranav': 'Pranav Venkatesh',                   # [D]
-    'dropstoneDP': 'David Paravyan',                   # [D]
-    'Njal28': 'Baadur Jobava',                         # [D]
-    'Salem-AR': 'Salem Saleh',                         # [D]
-    'GM_dmitrij': 'Dmitrij Kollars',                   # [D]
-    'AnishOnYoutube': 'Anish Giri',                    # [D]
-    'dretch': 'Conrad Holt',                           # [D]
-
-    # ── Name-derived usernames ──────────────────────────────────────
-    'Vaathi_Coming': 'Aravindh Chithambaram',
-    'FabianoCaruana': 'Fabiano Caruana',               # [N]
-    'Firouzja2003': 'Alireza Firouzja',                # [N]
-    'LevonAronian': 'Levon Aronian',                   # [N]
-    'Grischuk': 'Alexander Grischuk',                  # [N]
-    'VladimirKramnik': 'Vladimir Kramnik',             # [N]
-    'DanielNaroditsky': 'Daniel Naroditsky',           # [N]
-    'nihalsarin': 'Nihal Sarin',                       # [N]
-    'Oleksandr_Bortnyk': 'Oleksandr Bortnyk',          # [N]
-    'BogdanDeac': 'Bogdan-Daniel Deac',                # [N]
-    'Javokhir_Sindarov05': 'Javokhir Sindarov',        # [N]
-    'ChristopherYoo': 'Christopher Yoo',               # [N]
-    'AryanTari': 'Aryan Tari',                         # [N]
-    'amintabatabaei': 'Amin Tabatabaei',               # [N]
-    'frederiksvane': 'Frederik Svane',                 # [N]
-    'GMBenjaminBok': 'Benjamin Bok',                   # [N]
-    'iturrizaga': 'Eduardo Iturrizaga Bonelli',        # [N]
-    'jefferyx': 'Jeffery Xiong',                       # [N]
-    'kirillshevchenko': 'Kirill Shevchenko',           # [N]
-    'LiemLe': 'Le Quang Liem',                         # [N]
-    'OparinGrigoriy': 'Grigoriy Oparin',               # [N]
-    'RaunakSadhwani2005': 'Raunak Sadhwani',           # [N]
-    'rezamahdavi2008': 'Reza Mahdavi',                 # [N]
-    'Shankland': 'Sam Shankland',                      # [N]
-    'Sina-Movahed': 'Sina Movahed',                    # [N]
-    'VincentKeymer': 'Vincent Keymer',                 # [N]
-    'VitaliyBernadskiy': 'Vitaliy Bernadskiy',         # [N]
-    'vladislavkovalev': 'Vladislav Kovalev',           # [N]
-    'vugarrasulov': 'Vugar Rasulov',                   # [N]
-    'GeorgMeier': 'Georg Meier',                       # [N]
-    'SergeyKarjakin': 'Sergey Karjakin',               # [N]
-    'PSvidler': 'Peter Svidler',                       # [N]
-    'Dlugy': 'Maxim Dlugy',                            # [N]
-    'KuzubovYuriy': 'Yuriy Kuzubov',                   # [N]
-    'Alexander_Moskalenko': 'Alexander Moskalenko',    # [N]
-    'Anton_Demchenko': 'Anton Demchenko',              # [N]
-    'Shant_Sargsyan': 'Shant Sargsyan',                # [N]
-    'TigranLPetrosyan': 'Tigran L. Petrosian',         # [N]
-    'rpragchess': 'Praggnanandhaa R',                  # [N]
-    'viditchess': 'Vidit Gujrathi',                    # [N]
-    'penguingm1': 'Andrew Tang',                       # [N]
-    'GMVallejo': 'Francisco Vallejo Pons',             # [N]
-    'GGuseinov': 'Gadir Guseinov',                     # [N]
-    'Izoria123': 'Zviad Izoria',                       # [N]
-    'GigaQuparadze': 'Giga Quparadze',                 # [N]
-    'GM_Levan_Pantsulaia': 'Levan Pantsulaia',         # [N]
-    'Elshan1985': 'Elshan Moradiabadi',                # [N]
-    'jcibarra': 'Jose Carlos Ibarra Jerez',            # [N]
-    'Zaven_ChessMood': 'Zaven Andriasian',             # [N]
-    'Micki-taryan': 'Haik Martirosyan',
-    'Zhuu96': 'Zhamsaran Tsydypov',
-    'artooon': 'Pranesh M',
-    'Annawel': 'Jules Moussard',
-    'MITerryble': 'Renato Terry Lujan',
-    'NikoTheodorou':'Nikolas Theodorou',
-    'rasmussvane':'Rasmus Svane',
-    'Beca95': 'Aleksandar Indjic',
-    'shimastream': 'Aleksandr Shimanov',
-    'Bardiya06': 'Bardiya Daneshvar',
-    'HVillagra': 'Cristobal Henriquez Villagra',
-    'ChessFighter_2011': 'Dau Khuong Duy',
-    'FaustinoOro': 'Faustino Oro',
-    'ChessWarrior7197':'Nodirbek Abdusattorov',
-    'amintabatabaei':'Seyyed Mohammad Amin Tabatabaei',
-    'Shield12':'Shamsiddin Vokhidov',
-    'Sibelephant':'Vladislav Artemiev',
-    'yosephtaher':'Yoseph Theolifus Taher',
-    'Indianlad' : 'S.L. Narayanan',
-    'Andreikka' : 'Andrey Esipenko',
-    'Volodar_Murzin': 'Volodar Murzin',
-    'legendisback1' :'Yagiz Kaan Erdogmus',
-    'Sargsyan_Shant': 'Shant Sargsyan',
-    'Macho_2006':'Mukhiddin Madaminov',
-    'Jagadeesh_Siddharth':'Siddarth Jagadeesh',
-    'AlmasRakhmatullaev':'Almas Rakhmatullaev',
-    'Dolphin_2010':'Aleksandr Usov',
-    'PiliposyanRobertChess' : 'Robert Piloposyan',
-    'Fedoseev-Vladimir':'Vladimir Fedoseev',
-    'GOGIEFF':'Anton Korobov',
-    'ChessLover0108':'Muhammed Muradi',
-    'Dr_Tyger': 'Haowen Xue',
-    'Kacparov':'Kacper Drozdowski',
-    'Turboplombir':'Sergey Sklokin',
-    'artooon':'Pranesh Munirethinam',
-    'yavrukurt40':'Dincer Tasdogen',
-    'faryma91': 'Maksym Faryma',
-    'chessmatist53': 'Dmitrij Osetrov',
-    'SuanQuek':'Suan-Shiau Evans-Quek',
-    'Baratheont': 'Joaquin Castro Castro',
-    'De La Garza, Miguel':'De La Garza, Miguel',
-    'Hardy Gu':'Hardy Gu',
-    'Rafael Palathingal':'Rafael Palathingal',
-
-    # ── Same player, multiple accounts ──────────────────────────────
-    'Eltaj_Safarli': 'Eltaj Safarli',                  # [N] two accounts,
-    'EltajSafarli': 'Eltaj Safarli',                   # [N] same player
-    'Onischuk_V': 'Volodymyr Onyshchuk',               # [N] two accounts,
-    'onyshchuk_v': 'Volodymyr Onyshchuk',              # [N] same player
-
-    # ── Plausible but unverified ────────────────────────────────────
-    'daro94': 'Dariusz Swiercz',                       # [?] "Daro", b. 1994
-}
-
-# Reverse lookup: player -> list of known usernames (handles multi-account
-# players like Safarli and Onyshchuk correctly).
-PLAYER_TO_USERNAMES = {}
-for _u, _p in USERNAME_TO_PLAYER.items():
-    PLAYER_TO_USERNAMES.setdefault(_p, []).append(_u)
+with open('data/username_to_player.csv', mode='r') as f:
+    reader = csv.reader(f)
+    USERNAME_TO_PLAYER = dict(reader)
+    PLAYER_TO_USERNAME = {value: key for key, value in USERNAME_TO_PLAYER.items()}
 
 
 # ── Hyperparameters ───────────────────────────────────────────────────────────
 DATA_CUTOFF         = '2022-02-01'
 SKILL_DECAY         = 0.975
 PARTICIPATION_DECAY = 0.85
+MIN_PARTICIPATION_RATE = 0.005
 N_SIMS              = 100_000
 N_VALUES            = [1, 3, 8]
 MIN_P               = 0.0
@@ -203,8 +71,8 @@ def load_and_prepare(cut_players=CUT_PLAYERS, keep_players=KEEP_PLAYERS,
         features; defaults to the next Tuesday after the last date in the data.
         Ignored when attendance_model='decay'.
     """
-    cut_users  = [PLAYER_TO_USERNAMES[player][0] for player in cut_players]
-    keep_users = [PLAYER_TO_USERNAMES[player][0] for player in keep_players]
+    cut_users  = [PLAYER_TO_USERNAME[player] for player in cut_players]
+    keep_users = [PLAYER_TO_USERNAME[player] for player in keep_players]
 
     df = pd.read_csv('data/titled_tuesday_standings.csv', parse_dates=['date'])
     df = df[df['date'] >= '2022-02-08'].copy()
@@ -227,7 +95,13 @@ def load_and_prepare(cut_players=CUT_PLAYERS, keep_players=KEEP_PLAYERS,
     # Always compute the EWMA baseline; it serves as the fallback for players
     # who have too few appearances for the ML models (< 3 unique weeks).
     Z_part        = sum(PARTICIPATION_DECAY ** k for k in range(N))
-    p_participate = (df.groupby('username')['part_w'].sum() / Z_part).rename('p_participate')
+    p_participate = (df.groupby('username')['part_w'].sum() / Z_part).clip(lower=MIN_PARTICIPATION_RATE).rename('p_participate')
+
+    # Adding an Isotonic Regression model to act as a floor for p(participate)
+    iso_reg = joblib.load('models/isotonic_regression.joblib')
+    p_participate_np = p_participate.to_numpy()
+    iso_floor = np.where((p_participate_np > .05), p_participate_np, iso_reg.predict(p_participate_np))
+    p_participate = pd.Series(iso_floor, index=p_participate.index, name='p_participate')
 
     if attendance_model != 'decay':
         try:
@@ -252,7 +126,7 @@ def load_and_prepare(cut_players=CUT_PLAYERS, keep_players=KEEP_PLAYERS,
         except Exception as e:
             print(f'  p_participate: falling back to EWMA ({e})')
     else:
-        print(f'  p_participate: decay-weighted EWMA')
+        print(f'  p_participate: decay-weighted EWMA with Isotonic Gaussian participation floor (@p < .05)')
 
     # Honour explicit cut / keep overrides
     p_participate[p_participate.index.isin(cut_users)]  = 0.0
@@ -353,14 +227,14 @@ def print_top(results, sort_col, n=20, n_values=N_VALUES):
 
 # ── Portfolio parsing ─────────────────────────────────────────────────────────
 
-def build_portfolio(df_tt, players, player_to_usernames):
+def build_portfolio(df_tt, players, player_to_username):
     """
     Convert a Kalshi portfolio DataFrame into numpy arrays for vectorized
     Monte Carlo evaluation.
 
     df_tt required columns
     ----------------------
-    marketTitle  : player display name (key into player_to_usernames)
+    marketTitle  : player display name (key into player_to_username)
     n            : top-N threshold (int)
     position     : 'Yes' or 'No'
     volume       : payout if position resolves correctly
@@ -379,10 +253,9 @@ def build_portfolio(df_tt, players, player_to_usernames):
     not_found = []
     for i, name in enumerate(df_tt['marketTitle']):
         idx = -1
-        for u in player_to_usernames.get(name, []):
-            if u in player_index:
-                idx = player_index[u]
-                break
+        u = player_to_username[name]
+        if u in player_index:
+            idx = player_index[u]
         player_idx_list.append(idx)
         if idx < 0:
             not_found.append(name)
@@ -830,3 +703,157 @@ def pnl_summary(pnl, label='Portfolio'):
     print(f'  95th pctile : ${np.percentile(p, 95):+.2f}')
     print(f'  Worst case  : ${p.min():+.2f}')
     print(f'  Best case   : ${p.max():+.2f}')
+
+
+# ── Kelly sizing ──────────────────────────────────────────────────────────────
+
+def run_payoff_matrix(players, p_play, hist_pcts, hist_wts,
+                      portfolio, n_sims=N_SIMS, chunk=CHUNK, seed=SEED):
+    """
+    Simulate tournaments and return a (n_sims, n_positions) matrix of
+    per-share net payoffs for portfolio Kelly optimisation.
+
+    payoff[s, i] = (1 - c_i)  if position i resolves in your favour in sim s
+                 = -c_i        otherwise
+    where c_i = cost / volume for that portfolio position.
+
+    Parameters
+    ----------
+    players, p_play, hist_pcts, hist_wts : from build_player_pool
+    portfolio : from build_portfolio (volume should be 1 share per position
+                so that cost == cost_per_share)
+
+    Returns
+    -------
+    payoff_matrix : np.ndarray, shape (n_sims, n_positions)
+    cost_per_share : np.ndarray, shape (n_positions,)
+    """
+    rng   = np.random.default_rng(seed)
+    n     = len(players)
+    max_N = int(portfolio['n_values'].max())
+    P     = len(portfolio['player_idx'])
+
+    port_idx    = portfolio['player_idx']   # (P,)
+    port_n      = portfolio['n_values']     # (P,)
+    port_is_yes = portfolio['is_yes']       # (P,)
+    port_vols   = portfolio['volumes']      # (P,)
+    port_costs  = portfolio['costs']        # (P,)
+    known       = port_idx >= 0             # (P,)
+
+    cps = np.where(port_vols > 0, port_costs / port_vols, 0.0)  # cost per share
+
+    payoff_matrix = np.empty((n_sims, P), dtype=np.float64)
+    payoff_matrix[:, ~known] = -cps[~known]  # unknown players always lose
+
+    t0 = time.time()
+    for start in range(0, n_sims, chunk):
+        c  = min(chunk, n_sims - start)
+        sl = slice(start, start + c)
+        row = np.arange(c)[:, None]
+
+        scores = np.empty((c, n), dtype=np.float32)
+        for i in range(n):
+            idx = rng.choice(len(hist_pcts[i]), size=c, p=hist_wts[i], replace=True)
+            scores[:, i] = hist_pcts[i][idx]
+
+        present = rng.random((c, n)) < p_play
+        scores[~present] = -np.inf
+
+        k     = min(max_N, n - 1)
+        part  = np.argpartition(-scores, k, axis=1)[:, :max_N]
+        order = part[row, np.argsort(-scores[row, part], axis=1)]  # (c, max_N)
+        valid = scores[row, order] > -np.inf                        # (c, max_N)
+
+        # Vectorised in-top check for all positions simultaneously
+        matches    = order[:, :, None] == port_idx[None, None, :]  # (c, max_N, P)
+        matches   &= valid[:, :, None]
+        has_match  = matches.any(axis=1)                            # (c, P)
+        first_rank = np.where(
+            has_match, np.argmax(matches, axis=1) + 1, max_N + 1
+        )                                                           # (c, P)
+
+        in_top            = first_rank <= port_n[None, :]          # (c, P)
+        in_top[:, ~known] = False
+
+        win = np.where(port_is_yes[None, :], in_top, ~in_top)     # (c, P)
+        win[:, ~known] = False
+
+        payoff_matrix[sl] = np.where(win, 1.0 - cps[None, :], -cps[None, :])
+
+        print(f'  {start + c:>7,} / {n_sims:,}  ({time.time() - t0:.1f}s)')
+
+    return payoff_matrix, cps
+
+
+def portfolio_kelly(payoff_matrix, cost_per_share, bankroll,
+                    kelly_fraction=0.5, verbose=True):
+    """
+    Numerically optimise Kelly bet sizes for a portfolio of correlated bets.
+
+    Maximises E[log(bankroll + PnL)] subject to:
+      - shares_i >= 0  (long only)
+      - sum_i(shares_i * cost_i) <= kelly_fraction * bankroll
+
+    The kelly_fraction cap replaces the full-Kelly / fractional-Kelly
+    distinction: set 0.5 for half-Kelly, 0.25 for quarter-Kelly, etc.
+
+    Parameters
+    ----------
+    payoff_matrix   : (n_sims, P) array  — net payoff per share per sim
+    cost_per_share  : (P,) array          — cost per share for each position
+    bankroll        : float               — total capital available
+    kelly_fraction  : float               — max fraction of bankroll to risk
+    verbose         : bool
+
+    Returns
+    -------
+    shares     : np.ndarray of int  — optimal integer share counts
+    result     : scipy OptimizeResult
+    """
+    from scipy.optimize import minimize
+
+    n_sims, P  = payoff_matrix.shape
+    max_budget = kelly_fraction * bankroll
+
+    # Estimate model EV per position from the payoff matrix to initialise
+    ev_per_share = payoff_matrix.mean(axis=0)                          # (P,)
+    init_kelly_f = (ev_per_share / (1.0 - cost_per_share)).clip(0)    # single-bet Kelly
+    total_f = init_kelly_f.sum()
+    if total_f > 1.0:
+        init_kelly_f /= total_f
+    x0 = (init_kelly_f * bankroll / cost_per_share.clip(1e-8)).clip(0)
+
+    def neg_E_log(shares):
+        pnl = bankroll + payoff_matrix @ shares
+        return -np.mean(np.log(np.maximum(pnl, 1e-8)))
+
+    def grad(shares):
+        pnl = bankroll + payoff_matrix @ shares
+        return -(payoff_matrix / np.maximum(pnl, 1e-8)[:, None]).mean(axis=0)
+
+    constraints = [{
+        'type': 'ineq',
+        'fun':  lambda x: max_budget - cost_per_share @ x,
+        'jac':  lambda x: -cost_per_share,
+    }]
+    bounds = [(0.0, None)] * P
+
+    result = minimize(neg_E_log, x0, jac=grad, method='SLSQP',
+                      bounds=bounds, constraints=constraints,
+                      options={'ftol': 1e-10, 'maxiter': 1000})
+
+    shares_opt = result.x
+    total_cost = cost_per_share @ shares_opt
+    if verbose:
+        pnl = bankroll + payoff_matrix @ shares_opt
+        print(f"Converged: {result.success}  |  "
+              f"Exposure ${total_cost:.2f} ({total_cost/bankroll*100:.1f}% of bankroll)  |  "
+              f"E[log-return]: {-result.fun - np.log(bankroll):.4f}")
+
+    return np.round(shares_opt).astype(int), result
+
+def kalshi_order_price(price, make = False):
+    if make:
+        return price + (0.0175 * price * (1.0 - price))
+    else:
+        return price + (0.07 * price * (1.0 - price))

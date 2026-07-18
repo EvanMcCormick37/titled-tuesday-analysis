@@ -7,9 +7,10 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() not in ('utf-8', 'utf-8-s
 attendance_models.py - Train logistic regression models for P(player shows up)
 
 Predicts weekly attendance: will a given player show up to next week's Titled
-Tuesday? The model is session-agnostic - in the two-session era (pre Sept 2025)
-a player is considered "attending" if they played either the early or late
-session. This matches the modern single-session format cleanly.
+Tuesday? Trained exclusively on data from 2025-09-02 onwards, when Titled
+Tuesday switched from a twice-weekly (early/late session) format to a single
+weekly tournament. Pre-era data is excluded entirely to avoid contaminating
+the models with stale session-preference and bi-weekly attendance patterns.
 
 Trains 3 classifiers and saves them to models/:
   1. logistic       - L2 logistic regression (interpretable baseline)
@@ -43,12 +44,9 @@ warnings.filterwarnings("ignore")
 
 DATA_PATH  = Path("data/titled_tuesday_standings_modern.csv")
 MODELS_DIR = Path("models")
-DATA_START = "2022-02-08"
-PART_DECAY = 0.85   # must match bootstrap_mc_kalshi.py
-MIN_APP    = 3      # minimum weeks attended to be included in training
-
-# Session features removed: Titled Tuesday moved to one session/week on
-# 2025-09-02, making early/late distinctions both stale and misleading.
+DATA_START = "2025-09-02"  # single-session era begins; pre-era data excluded
+PART_DECAY = 0.85          # must match bootstrap_mc_kalshi.py
+MIN_APP    = 3             # minimum weeks attended to be included in training
 FEATURE_COLS = [
     "month_sin", "month_cos",
     "week_sin",  "week_cos",
@@ -229,6 +227,7 @@ def build_dataset(df: pd.DataFrame, weekly_slots: pd.DataFrame) -> pd.DataFrame:
 # ── Models ────────────────────────────────────────────────────────────────────
 
 def make_models() -> dict:
+    # Post-era dataset is ~45 weeks / ~50-100K rows — reduce capacity vs. full-history models.
     return {
         "logistic": Pipeline([
             ("scaler", StandardScaler()),
@@ -237,32 +236,29 @@ def make_models() -> dict:
             )),
         ]),
         "random_forest": RandomForestClassifier(
-            n_estimators=200, max_depth=8, min_samples_leaf=50,
+            n_estimators=200, max_depth=8, min_samples_leaf=20,
             class_weight="balanced", random_state=42, n_jobs=-1,
         ),
         "gradient_boost": GradientBoostingClassifier(
-            n_estimators=200, max_depth=4, learning_rate=0.05,
-            min_samples_leaf=50, subsample=0.5, random_state=42,
+            n_estimators=150, max_depth=3, learning_rate=0.05,
+            min_samples_leaf=20, subsample=0.8, random_state=42,
         ),
     }
 
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
 
-def cross_validate(dataset: pd.DataFrame, models: dict,
-                   cv_sample: int = 200_000) -> dict:
+def cross_validate(dataset: pd.DataFrame, models: dict) -> dict:
     """
-    TimeSeriesSplit CV (5 folds) on a chronological subsample for speed.
-    Uses the most recent cv_sample rows so metrics reflect current behaviour.
+    TimeSeriesSplit CV (4 folds) on the full post-era dataset.
+    45 tournament weeks → 4 folds gives ~11 weeks per test split.
     """
     data = dataset.dropna(subset=FEATURE_COLS + ["label"]).sort_values("date")
-    if len(data) > cv_sample:
-        data = data.iloc[-cv_sample:].reset_index(drop=True)
-        print(f"  (CV using most-recent {cv_sample:,} rows for speed)")
+    print(f"  (CV on {len(data):,} rows, TimeSeriesSplit n_splits=4)")
     X = data[FEATURE_COLS].values
     y = data["label"].values
 
-    tscv = TimeSeriesSplit(n_splits=5)
+    tscv = TimeSeriesSplit(n_splits=4)
     cv_results = {}
 
     for name, model in models.items():
@@ -395,8 +391,11 @@ def get_p_participate_for_mc(
     """
     Drop-in replacement for the p_participate Series used in bootstrap_mc_kalshi.py.
     Returns a Series indexed by username with P(player attends next tournament).
+    Returns an empty Series if no eligible players exist (e.g. first post-era event).
     """
     preds = predict_attendance(df, weekly_slots, models_payload, target_date)
+    if preds.empty:
+        return pd.Series(dtype=float, name="p_participate")
     col = f"p_{model_name}" if f"p_{model_name}" in preds.columns else "p_ensemble"
     return preds.set_index("username")[col].rename("p_participate")
 
@@ -480,8 +479,8 @@ def main() -> None:
         return
 
     # ── Train mode ────────────────────────────────────────────────────────────
-    # Cache filename includes "weekly" to distinguish from the old per-session cache.
-    dataset_cache = MODELS_DIR / "dataset_cache_weekly.parquet"
+    # Cache name includes era start date to distinguish from pre-era caches.
+    dataset_cache = MODELS_DIR / "dataset_cache_post2025.parquet"
     MODELS_DIR.mkdir(exist_ok=True)
     if dataset_cache.exists():
         print("\nLoading cached training dataset...")
@@ -499,7 +498,7 @@ def main() -> None:
           f"label=0: {n_tot-n_pos:,} ({(n_tot-n_pos)/n_tot:.1%})")
     print(f"  {dataset['username'].nunique():,} unique players in dataset")
 
-    print("\nCross-validating (TimeSeriesSplit, 5 folds)...")
+    print("\nCross-validating (TimeSeriesSplit, 4 folds)...")
     models = make_models()
     cv_results = cross_validate(dataset, models)
 

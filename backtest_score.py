@@ -4,49 +4,58 @@ Walk-forward backtest: score/tiebreak Monte Carlo model.
 
 For each Titled Tuesday from START_DATE onward, trains on *all prior data*
 (back to the CSV's earliest entry, ~2014) and records predicted top-N
-probabilities for every participant in that tournament.
+probabilities for every player in the pool at that time — including players
+who did NOT participate (rank = -1, participated = 0).
 
 Output CSV columns
 ------------------
-tournament_slug, date, username, rank, field_size, p_participate,
+tournament_slug, date, username, rank, participated, field_size,
+p_participate,
 p_top1, p_top3, p_top8, p_top10,
 p_top1_given_play, p_top3_given_play, p_top8_given_play, p_top10_given_play,
 in_top1, in_top3, in_top8, in_top10
 
+attendance_model options
+------------------------
+  decay           – recency-weighted EWMA (default, matches original model)
+  gradient_boost  – GBM from attendance_models.py (post-2025-09-02 era only)
+  random_forest   – RF  from attendance_models.py (post-2025-09-02 era only)
+  logistic        – LR  from attendance_models.py (post-2025-09-02 era only)
+
+For pre-2025-09-02 tournaments, all models produce identical results
+(ML models have no pre-era training history and fall back to EWMA).
+
 Usage
 -----
-    python backtest_score.py              # full run, saves to OUTPUT_PATH
-    python backtest_score.py --sample 20  # quick sanity-check on first 20 events
+    python backtest_score.py              # run all 4 models, save 4 CSVs
+    python backtest_score.py --sample 20  # quick sanity-check, first 20 events
+    python backtest_score.py --model decay --sample 5
 """
 
 import argparse
 import time
+from pathlib import Path
 import numpy as np
 import pandas as pd
 
 from bootstrap_mc_kalshi import SKILL_DECAY, PARTICIPATION_DECAY, _SCORE_COMPOSITE_SCALE
 
 # ── Defaults ──────────────────────────────────────────────────────────────────
-START_DATE  = '2022-02-08'
-N_VALUES    = [1, 3, 8, 10]
-N_SIMS      = 10_000       # per tournament; SE on p_top1 ≈ 0.2 %
-CHUNK       = 5_000
-BASE_SEED   = 42
-OUTPUT_PATH = 'data/backtest_score_predictions.csv'
+START_DATE     = '2025-09-02'
+N_VALUES       = [1, 3, 8, 10]
+N_SIMS         = 10_000
+CHUNK          = 5_000
+BASE_SEED      = 42
+OUTPUT_DIR     = 'data'
+ML_ERA_START   = pd.Timestamp('2025-09-02')
+ATTENDANCE_MODELS = ['decay', 'gradient_boost', 'random_forest', 'logistic']
 
-# Converged geometric-series normaliser for p_participate.
-# With PARTICIPATION_DECAY = 0.85 and 400+ weeks of data, the exact sum
-# differs from this limit by < 0.001 %.
 _Z_PART = 1.0 / (1.0 - PARTICIPATION_DECAY)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _precompute_user_histories(df: pd.DataFrame) -> dict:
-    """
-    Group the full DataFrame by username once.
-    Returns {username: {'dates': ndarray[datetime64], 'composites': ndarray[f64]}}.
-    """
     df = df.copy()
     df['composite'] = (
         df['score'].fillna(0).to_numpy(dtype=np.float64) * _SCORE_COMPOSITE_SCALE
@@ -55,7 +64,7 @@ def _precompute_user_histories(df: pd.DataFrame) -> dict:
     user_data = {}
     for username, grp in df.groupby('username'):
         user_data[username] = {
-            'dates':      grp['date'].to_numpy(),               # datetime64[ns]
+            'dates':      grp['date'].to_numpy(),
             'composites': grp['composite'].to_numpy(dtype=np.float64),
         }
     return user_data
@@ -63,17 +72,10 @@ def _precompute_user_histories(df: pd.DataFrame) -> dict:
 
 def _build_pool_at(user_data: dict, cutoff: pd.Timestamp):
     """
-    Build player-pool arrays using only entries with date < cutoff.
-
-    Returns
-    -------
-    players         : list[str]
-    p_play          : ndarray[f64]  – P(participates in next event)
-    hist_composites : list[ndarray] – per-player composite arrays
-    hist_wts        : list[ndarray] – normalised skill-decay weights
+    Build player-pool arrays using entries with date < cutoff.
+    Returns players, p_play (decay), hist_composites, hist_wts.
     """
     cutoff_np = np.datetime64(cutoff)
-
     players, p_play_list, hist_composites, hist_wts = [], [], [], []
 
     for username, data in user_data.items():
@@ -85,7 +87,7 @@ def _build_pool_at(user_data: dict, cutoff: pd.Timestamp):
             (cutoff - pd.DatetimeIndex(data['dates'][mask]))
             .days.to_numpy(dtype=np.float64)
         )
-        weeks_back = (days_back / 7.0).astype(int)   # truncate, matches original
+        weeks_back = (days_back / 7.0).astype(int)
 
         skill_w = SKILL_DECAY ** weeks_back
         part_w  = PARTICIPATION_DECAY ** weeks_back
@@ -94,7 +96,7 @@ def _build_pool_at(user_data: dict, cutoff: pd.Timestamp):
         skill_w_norm = skill_w / skill_w.sum()
 
         players.append(username)
-        p_play_list.append(min(p_part, 1.0))          # cap: random() ∈ [0,1)
+        p_play_list.append(min(p_part, 1.0))
         hist_composites.append(data['composites'][mask])
         hist_wts.append(skill_w_norm)
 
@@ -104,15 +106,6 @@ def _build_pool_at(user_data: dict, cutoff: pd.Timestamp):
 
 def _simulate(players, p_play, hist_composites, hist_wts,
               n_sims: int, n_values: list, chunk: int, seed: int):
-    """
-    Bootstrap simulation over score/tiebreak composites.
-
-    Returns
-    -------
-    p_sim_part        : ndarray – simulated P(participates)
-    p_topn            : dict[k -> ndarray] – P(finish top-k)
-    p_topn_given_play : dict[k -> ndarray] – P(finish top-k | participates)
-    """
     rng   = np.random.default_rng(seed)
     n     = len(players)
     max_N = max(n_values)
@@ -157,17 +150,40 @@ def _simulate(players, p_play, hist_composites, hist_wts,
 # ── Main backtest loop ────────────────────────────────────────────────────────
 
 def run_backtest(
-    start_date: str   = START_DATE,
-    n_sims: int       = N_SIMS,
-    n_values: list    = N_VALUES,
-    chunk: int        = CHUNK,
-    base_seed: int    = BASE_SEED,
-    output_path: str  = OUTPUT_PATH,
-    sample: int       = None,     # if set, only process first N tournaments
+    start_date: str      = START_DATE,
+    n_sims: int          = N_SIMS,
+    n_values: list       = N_VALUES,
+    chunk: int           = CHUNK,
+    base_seed: int       = BASE_SEED,
+    output_path: str     = None,
+    sample: int          = None,
+    attendance_model: str = 'decay',
 ) -> pd.DataFrame:
+
+    if output_path is None:
+        output_path = f'{OUTPUT_DIR}/backtest_score_{attendance_model}.csv'
 
     t0 = time.time()
 
+    # ── Load ML attendance model once if needed ───────────────────────────────
+    ml_models = None
+    am_df     = None
+    am_slots  = None
+    _get_ml_p = None
+
+    if attendance_model != 'decay':
+        from attendance_models import (
+            load_data as _am_load, get_weekly_slots as _am_slots,
+            load_models as _am_load_models, get_p_participate_for_mc,
+        )
+        print(f'Loading attendance model: {attendance_model} ...')
+        am_df    = _am_load()
+        am_slots = _am_slots(am_df)
+        ml_models = _am_load_models()
+        _get_ml_p = get_p_participate_for_mc
+        print(f'  Models loaded: {list(ml_models.keys())}')
+
+    # ── Load tournament standings ─────────────────────────────────────────────
     print('Loading titled_tuesday_standings.csv ...')
     df_full = pd.read_csv('data/titled_tuesday_standings.csv', parse_dates=['date'])
     df_full = (
@@ -194,12 +210,36 @@ def run_backtest(
     n_total = len(bt_tournaments)
     print(f'  {n_total} tournaments to evaluate '
           f'({bt_tournaments["date"].min().date()} – '
-          f'{bt_tournaments["date"].max().date()})\n')
+          f'{bt_tournaments["date"].max().date()})')
+    print(f'  attendance_model = {attendance_model}\n')
+
+    # ── Pre-load pre-era rows for ML models ───────────────────────────────────
+    # Pre-era tournaments (before 2025-09-02) produce identical results for all
+    # attendance models because the ML models have no pre-era training history
+    # and fall back to EWMA anyway.  Reusing the decay CSV saves ~75% of runtime.
+    pre_era_records = []
+    pre_era_slugs   = set()
+
+    if attendance_model != 'decay':
+        decay_csv = Path(OUTPUT_DIR) / 'backtest_score_decay.csv'
+        if decay_csv.exists():
+            print(f'Pre-loading pre-era rows from {decay_csv} ...')
+            _decay_df   = pd.read_csv(decay_csv, parse_dates=['date'])
+            _pre        = _decay_df[_decay_df['date'] < ML_ERA_START]
+            pre_era_records = _pre.to_dict('records')
+            pre_era_slugs   = set(_pre['tournament_slug'].unique())
+            print(f'  Reusing {len(pre_era_records):,} rows '
+                  f'from {len(pre_era_slugs)} pre-era tournaments\n')
+        else:
+            print(f'  (decay CSV not found at {decay_csv} — will simulate pre-era too)\n')
 
     records = []
     for i, t_row in bt_tournaments.iterrows():
         t_date = t_row['date']
         t_slug = t_row['tournament_slug']
+
+        if t_slug in pre_era_slugs:
+            continue   # rows already in pre_era_records
 
         players, p_play, hist_composites, hist_wts = _build_pool_at(user_data, t_date)
 
@@ -207,39 +247,80 @@ def run_backtest(
             print(f'  [{i+1:>3}/{n_total}] SKIP {t_slug}: pool={len(players)} < {max(n_values)}')
             continue
 
+        # Replace decay p_play with ML predictions for post-era tournaments
+        if ml_models is not None and t_date >= ML_ERA_START:
+            ml_p = _get_ml_p(
+                am_df, am_slots, ml_models,
+                pd.Timestamp(t_date),
+                model_name=attendance_model,
+            )
+            player_to_j = {u: j for j, u in enumerate(players)}
+            for username, prob in ml_p.items():
+                if username in player_to_j:
+                    p_play[player_to_j[username]] = float(prob)
+
         p_sim_part, p_topn, p_topn_gp = _simulate(
             players, p_play, hist_composites, hist_wts,
             n_sims=n_sims, n_values=n_values, chunk=chunk, seed=base_seed + i,
         )
-        player_idx  = {u: j for j, u in enumerate(players)}
-        df_t        = df_full[df_full['tournament_slug'] == t_slug]
-        field_size  = len(df_t)
 
-        for _, r in df_t.iterrows():
-            username = r['username']
-            j        = player_idx.get(username, -1)
-            rec = {
-                'tournament_slug': t_slug,
-                'date':            t_date,
-                'username':        username,
-                'rank':            int(r['rank']),
-                'field_size':      field_size,
-                'p_participate':   round(float(p_sim_part[j]), 6) if j >= 0 else np.nan,
-            }
-            for k in n_values:
-                rec[f'p_top{k}']           = round(float(p_topn[k][j]),    6) if j >= 0 else np.nan
-                rec[f'p_top{k}_given_play'] = round(float(p_topn_gp[k][j]), 6) if j >= 0 else np.nan
-                rec[f'in_top{k}']          = int(r['rank'] <= k)
+        # ── Build output rows for ALL pool players ────────────────────────────
+        df_t        = df_full[df_full['tournament_slug'] == t_slug]
+        actual_ranks = dict(zip(df_t['username'], df_t['rank'].astype(int)))
+        field_size  = len(df_t)
+        player_idx  = {u: j for j, u in enumerate(players)}
+
+        # Universe: everyone in the pool + first-timers who actually played
+        output_users = set(players) | set(actual_ranks.keys())
+
+        for username in output_users:
+            j            = player_idx.get(username, -1)
+            rank_val     = actual_ranks.get(username, -1)
+            participated = int(rank_val != -1)
+
+            if j >= 0:
+                rec = {
+                    'tournament_slug': t_slug,
+                    'date':            t_date,
+                    'username':        username,
+                    'rank':            rank_val,
+                    'participated':    participated,
+                    'field_size':      field_size,
+                    'p_participate':   round(float(p_sim_part[j]), 6),
+                }
+                for k in n_values:
+                    rec[f'p_top{k}']           = round(float(p_topn[k][j]),    6)
+                    rec[f'p_top{k}_given_play'] = round(float(p_topn_gp[k][j]), 6)
+                    rec[f'in_top{k}']           = int(participated and rank_val <= k)
+            else:
+                # First-timer: in the tournament but no prior history for predictions
+                rec = {
+                    'tournament_slug': t_slug,
+                    'date':            t_date,
+                    'username':        username,
+                    'rank':            rank_val,
+                    'participated':    participated,
+                    'field_size':      field_size,
+                    'p_participate':   np.nan,
+                }
+                for k in n_values:
+                    rec[f'p_top{k}']           = np.nan
+                    rec[f'p_top{k}_given_play'] = np.nan
+                    rec[f'in_top{k}']           = int(participated and rank_val <= k)
+
             records.append(rec)
 
+        n_ml = int(ml_p.index.isin(players).sum()) if (ml_models is not None and t_date >= ML_ERA_START) else 0
         print(f'  [{i+1:>3}/{n_total}]  {t_slug}'
-              f'  field={field_size:>3}  pool={len(players):>4}'
-              f'  no_hist={sum(1 for r in df_t["username"] if r not in player_idx):>2}'
-              f'  {time.time()-t0:>6.1f}s')
+              f'  field={field_size:>3}  pool={len(players):>5}'
+              f'  output={len(output_users):>5}'
+              f'  ml_overrides={n_ml:>4}'
+              f'  {time.time()-t0:>7.1f}s')
 
-    df_out = pd.DataFrame(records)
+    df_out = pd.DataFrame(pre_era_records + records)
+    df_out = df_out.sort_values(['date', 'tournament_slug', 'username']).reset_index(drop=True)
     df_out.to_csv(output_path, index=False)
-    print(f'\nSaved {len(df_out):,} prediction rows to {output_path}')
+    print(f'\nSaved {len(df_out):,} rows -> {output_path}')
     print(f'Total time: {time.time()-t0:.1f}s')
     return df_out
 
@@ -247,38 +328,56 @@ def run_backtest(
 # ── Quick calibration summary ─────────────────────────────────────────────────
 
 def calibration_summary(df: pd.DataFrame, n_values: list = N_VALUES):
-    """
-    For each top-N threshold, print mean predicted probability vs actual hit rate.
-    A well-calibrated model should show mean_pred ≈ hit_rate in every slice.
-    """
-    print('\n-- Global calibration (mean predicted vs actual hit rate) ----------')
+    """Mean predicted probability vs actual hit rate, for participants only."""
+    sub = df[df['participated'] == 1].copy() if 'participated' in df.columns else df.copy()
+    print('\n-- Attendance calibration (participants only) ----------------------')
+    sub_att = df.dropna(subset=['p_participate'])
+    if not sub_att.empty and 'participated' in df.columns:
+        print(f'  mean p_participate:  {sub_att["p_participate"].mean():.4f}  '
+              f'actual rate: {sub_att["participated"].mean():.4f}  '
+              f'n={len(sub_att):,}')
+
+    print('\n-- Rank-conditional calibration (mean predicted vs actual hit rate) -')
     print(f'  {"Metric":<22}  {"mean_pred":>10}  {"hit_rate":>10}  {"n_bets":>8}  {"bias_pp":>8}')
     for k in n_values:
         col_p = f'p_top{k}_given_play'
         col_y = f'in_top{k}'
-        sub = df[[col_p, col_y]].dropna()
-        if sub.empty:
+        s = sub[[col_p, col_y]].dropna()
+        if s.empty:
             continue
-        mean_pred = sub[col_p].mean()
-        hit_rate  = sub[col_y].mean()
+        mean_pred = s[col_p].mean()
+        hit_rate  = s[col_y].mean()
         print(f'  top-{k:<18}  {mean_pred:>10.4f}  {hit_rate:>10.4f}'
-              f'  {len(sub):>8,}  {(mean_pred - hit_rate)*100:>+7.2f}pp')
+              f'  {len(s):>8,}  {(mean_pred - hit_rate)*100:>+7.2f}pp')
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Score/tiebreak backtest')
-    parser.add_argument('--start',   default=START_DATE,  help='First tournament date')
-    parser.add_argument('--sims',    type=int, default=N_SIMS, help='Sims per tournament')
-    parser.add_argument('--sample',  type=int, default=None,   help='Only run first N events')
-    parser.add_argument('--output',  default=OUTPUT_PATH,       help='Output CSV path')
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--start',  default=START_DATE,
+                        help='First tournament date (default: 2022-02-08)')
+    parser.add_argument('--sims',   type=int, default=N_SIMS,
+                        help='Sims per tournament (default: 10000)')
+    parser.add_argument('--sample', type=int, default=None,
+                        help='Only run first N events (for quick testing)')
+    parser.add_argument('--model',  default=None,
+                        choices=ATTENDANCE_MODELS,
+                        help='Run a single attendance model (default: run all 4)')
     args = parser.parse_args()
 
-    df_results = run_backtest(
-        start_date=args.start,
-        n_sims=args.sims,
-        output_path=args.output,
-        sample=args.sample,
-    )
-    calibration_summary(df_results)
+    models_to_run = [args.model] if args.model else ATTENDANCE_MODELS
+
+    for model in models_to_run:
+        print(f'\n{"="*70}')
+        print(f'  Running backtest: attendance_model = {model}')
+        print(f'{"="*70}')
+        df_results = run_backtest(
+            start_date=args.start,
+            n_sims=args.sims,
+            sample=args.sample,
+            attendance_model=model,
+        )
+        calibration_summary(df_results)
+        print()
