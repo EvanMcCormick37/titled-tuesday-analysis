@@ -1,0 +1,14 @@
+# Claude files
+.claude
+
+# Python Caches
+__pycache__
+
+# Logs
+*.log
+
+# Model Weights
+models
+
+# Data
+data

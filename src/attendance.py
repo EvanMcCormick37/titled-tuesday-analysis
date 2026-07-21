@@ -1,344 +1,407 @@
 """
-Attendance model: predict P(player shows up to next Titled Tuesday).
+Schedule-conflict and opportunism adjustments for TT attendance.
 
-Trains 3 classifiers on post-DATA_START tournament history:
-  logistic       – L2 logistic regression (interpretable baseline)
-  random_forest  – Random Forest
-  gradient_boost – Gradient Boosted Trees
+The single attendance model is decay-weighted EWMA + isotonic floor,
+computed in src.data.load_and_prepare().  This module adds two further
+adjustments via apply_schedule_adjustments():
 
-Models are saved to models/attendance_{name}.pkl and loaded via load_models().
-The get_p_participate_for_mc() function is the drop-in replacement for the
-EWMA-based p_participate used in src/data.py.
+  1. Conflict-rate cap (cut players):
+     For each player with a broadcast round on TT day, cap p_participate at
+     their historical TT attendance rate on past conflict dates.
+     Only lowers — never raises — their attendance probability.
+
+  2. Opportunism boost (non-cut players):
+     Fit an OLS slope of (attended ~ n_top_conflicted) per player on their
+     non-conflict TT dates, shrink via DerSimonian-Laird empirical Bayes,
+     and add  shrunk_slope × n_top_conflicted  to p_participate.
+     Only positive slopes are applied (opportunism can only raise attendance).
 """
 
-import pickle
 import sqlite3
-import warnings
-from pathlib import Path
+import unicodedata
+from collections import defaultdict
 
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import StandardScaler
 
-from .config import DB_PATH, MODELS_DIR, DATA_START, MIN_APP, FEATURE_COLS, PARTICIPATION_DECAY
-
-warnings.filterwarnings('ignore')
+from .config import DB_PATH
 
 
-# ── Data loading ──────────────────────────────────────────────────────────────
+# ── Name normalisation ────────────────────────────────────────────────────────
 
-def load_data() -> pd.DataFrame:
-    """Load post-era standings from DB, compute rank_pct and rating_num."""
+def _norm_name(s: str) -> str:
+    """'Last, First' → 'first last', strip diacritics, lowercase."""
+    if not s:
+        return ''
+    if ',' in s:
+        last, first = s.split(',', 1)
+        s = f"{first.strip()} {last.strip()}"
+    s = unicodedata.normalize('NFD', s)
+    s = ''.join(c for c in s if unicodedata.category(c) != 'Mn')
+    return ' '.join(s.lower().split())
+
+
+# ── Name → username resolution ────────────────────────────────────────────────
+
+def _resolve_player_names(player_names: list[str]) -> dict[str, str]:
+    """Map player_information.player_name values to chess.com usernames.
+
+    Tries exact normalized match first, then word-set containment for PGN
+    names (e.g. 'Sarin, Nihal' → 'nihalsarin').
+    Returns dict[player_name → username] for matched names only.
+    """
     conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query(
-        f"SELECT * FROM titled_tuesday_standings WHERE date >= '{DATA_START}'",
-        conn, parse_dates=['date'],
-    )
+    pi_rows = conn.execute(
+        'SELECT username, player_name FROM player_information WHERE player_name IS NOT NULL'
+    ).fetchall()
     conn.close()
 
-    df = (
-        df.sort_values('rank')
-          .drop_duplicates(subset=['tournament_slug', 'username'], keep='first')
-          .reset_index(drop=True)
-    )
-    n_in_event = df.groupby('tournament_slug')['username'].transform('count')
-    df['rank_pct']   = 1.0 - (df['rank'].astype(float) - 1) / (n_in_event - 1)
-    df['rating_num'] = pd.to_numeric(df['rating'], errors='coerce').fillna(2500.0)
+    exact: dict[str, str] = {}
+    prefix_list: list[tuple[str, str]] = []
+    for uname, pname in pi_rows:
+        n = _norm_name(pname)
+        if n not in exact:
+            exact[n] = uname
+        prefix_list.append((n, uname))
+    prefix_list.sort(key=lambda x: -len(x[0]))
+
+    result: dict[str, str] = {}
+    for player_name in player_names:
+        n = _norm_name(player_name)
+        if n in exact:
+            result[player_name] = exact[n]
+            continue
+        oep_words = set(n.split())
+        for known_norm, uname in prefix_list:
+            known_words = set(known_norm.split())
+            if len(known_words) >= 2 and known_words <= oep_words:
+                result[player_name] = uname
+                break
+    return result
+
+
+# ── Conflict-rate computation ─────────────────────────────────────────────────
+
+def _compute_conflict_rates(
+    cut_usernames: list[str],
+    account_groups: dict[str, list[str]],
+) -> dict[str, float]:
+    """Historical TT attendance rate for each cut player on conflict TT dates.
+
+    Returns dict[username → rate].  Players with fewer than 3 conflict dates
+    are omitted (insufficient data).
+    """
+    if not cut_usernames:
+        return {}
+
+    conn = sqlite3.connect(DB_PATH)
+    tt_dates = {row[0][:10] for row in conn.execute(
+        'SELECT DISTINCT date FROM titled_tuesday_standings'
+    ).fetchall()}
+
+    cut_set = set(cut_usernames)
+    pi_rows = conn.execute(
+        'SELECT username, player_name FROM player_information WHERE player_name IS NOT NULL'
+    ).fetchall()
+
+    exact: dict[str, str] = {}
+    prefix_list: list[tuple[str, str]] = []
+    for uname, pname in pi_rows:
+        if uname not in cut_set:
+            continue
+        n = _norm_name(pname)
+        exact[n] = uname
+        prefix_list.append((n, uname))
+    prefix_list.sort(key=lambda x: -len(x[0]))
+
+    def _lookup(oep_name: str):
+        n = _norm_name(oep_name)
+        if n in exact:
+            return exact[n]
+        oep_words = set(n.split())
+        for known_norm, uname in prefix_list:
+            known_words = set(known_norm.split())
+            if len(known_words) >= 2 and known_words <= oep_words:
+                return uname
+        return None
+
+    oep_rows = conn.execute(
+        'SELECT broadcast_name, player_name FROM other_event_participants'
+    ).fetchall()
+    event_to_cut: dict[str, set] = defaultdict(set)
+    for bname, pname in oep_rows:
+        u = _lookup(pname)
+        if u:
+            event_to_cut[bname].add(u)
+
+    oer_rows = conn.execute(
+        'SELECT broadcast_name, date(earliest_start_utc) FROM other_event_rounds'
+    ).fetchall()
+    user_round_dates: dict[str, set] = defaultdict(set)
+    for bname, rdate in oer_rows:
+        for u in event_to_cut.get(bname, ()):
+            user_round_dates[u].add(rdate)
+
+    result: dict[str, float] = {}
+    for username in cut_usernames:
+        conflict_dates = sorted(user_round_dates[username] & tt_dates)
+        n_c = len(conflict_dates)
+        if n_c < 3:
+            print(f'  {username}: only {n_c} conflict TT date(s) - leaving p_participate unchanged')
+            continue
+        all_accts = account_groups.get(username, [username])
+        acc_ph = ','.join('?' * len(all_accts))
+        dt_ph  = ','.join('?' * n_c)
+        n_att  = conn.execute(
+            f'SELECT COUNT(DISTINCT date(date)) FROM titled_tuesday_standings '
+            f'WHERE username IN ({acc_ph}) AND date(date) IN ({dt_ph})',
+            all_accts + conflict_dates,
+        ).fetchone()[0]
+        rate = n_att / n_c
+        result[username] = rate
+        note = f' (combined {len(all_accts)} accounts)' if len(all_accts) > 1 else ''
+        print(f'  {username}{note}: {n_att}/{n_c} conflict TTs -> conflict_rate={rate:.3f}')
+
+    conn.close()
+    return result
+
+
+# ── Broadcast conflict map ────────────────────────────────────────────────────
+
+def _compute_broadcast_conflict_map() -> dict[str, set]:
+    """Return dict[username → set[date_str]] of broadcast-round dates per player.
+
+    Uses exact normalized name matching only (no fuzzy fallback).  Fast because
+    other_event_participants has 450K+ rows — the fuzzy word-set scan would be
+    prohibitively slow at that scale.  Exact matching covers the vast majority
+    of identifiable players for the opportunism slope computation.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    pi_rows = conn.execute(
+        'SELECT username, player_name FROM player_information WHERE player_name IS NOT NULL'
+    ).fetchall()
+    exact: dict[str, str] = {}
+    for uname, pname in pi_rows:
+        n = _norm_name(pname)
+        if n not in exact:
+            exact[n] = uname
+
+    oep_rows = conn.execute(
+        'SELECT broadcast_name, player_name FROM other_event_participants'
+    ).fetchall()
+    event_to_users: dict[str, set] = defaultdict(set)
+    for bname, pname in oep_rows:
+        u = exact.get(_norm_name(pname))
+        if u:
+            event_to_users[bname].add(u)
+
+    oer_rows = conn.execute(
+        'SELECT broadcast_name, date(earliest_start_utc) FROM other_event_rounds'
+    ).fetchall()
+    conflict_map: dict[str, set] = defaultdict(set)
+    for bname, rdate in oer_rows:
+        for u in event_to_users.get(bname, ()):
+            conflict_map[u].add(rdate)
+
+    conn.close()
+    return dict(conflict_map)
+
+
+# ── Opportunism slopes ────────────────────────────────────────────────────────
+
+def _compute_opportunism_slopes(
+    top_usernames: set,
+    conflict_map: dict,
+    min_obs: int,
+) -> pd.DataFrame:
+    """OLS slope of P(attend) ~ n_top_conflicted on non-conflict TT dates per player.
+
+    Returns DataFrame[username, slope, se, n_obs].
+    Uses the full TT history (no DATA_CUTOFF) for maximum regression window.
+    Skips players with <min_obs eligible dates or a constant outcome.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        'SELECT username, date(date) AS date FROM titled_tuesday_standings'
+    ).fetchall()
+    conn.close()
+
+    attended: set = set(rows)
+    tt_dates = sorted({d for _, d in attended})
+
+    career: dict[str, tuple] = {}
+    for u, d in attended:
+        p = career.get(u)
+        career[u] = (d, d) if p is None else (min(p[0], d), max(p[1], d))
+
+    hist_ntc = {
+        d: sum(1 for u in top_usernames if d in conflict_map.get(u, set()))
+        for d in tt_dates
+    }
+
+    results = []
+    for username, (first, last) in career.items():
+        conf = conflict_map.get(username, set())
+        elig = [d for d in tt_dates if first <= d <= last and d not in conf]
+        if len(elig) < min_obs:
+            continue
+
+        x = np.array([hist_ntc[d] for d in elig], dtype=float)
+        y = np.array([1.0 if (username, d) in attended else 0.0 for d in elig])
+
+        if np.var(x, ddof=1) < 1e-6 or y.std() < 1e-6:
+            continue
+
+        n     = len(elig)
+        slope = np.cov(x, y, ddof=1)[0, 1] / np.var(x, ddof=1)
+        y_hat = np.mean(y) + slope * (x - np.mean(x))
+        sig   = np.sqrt(max(np.sum((y - y_hat) ** 2) / (n - 2), 0.0))
+        se    = sig / (np.std(x, ddof=1) * np.sqrt(n))
+
+        results.append({'username': username, 'slope': slope, 'se': se, 'n_obs': n})
+
+    return (pd.DataFrame(results) if results
+            else pd.DataFrame(columns=['username', 'slope', 'se', 'n_obs']))
+
+
+def _shrink_slopes(df_slopes: pd.DataFrame) -> pd.DataFrame:
+    """DerSimonian-Laird empirical-Bayes shrinkage toward grand mean.
+
+    Shrunk slopes are floored at 0: opportunism can only raise attendance.
+    (A negative grand mean reflects tournament-season confounding, not a causal
+    anti-opportunism effect.)
+    """
+    df     = df_slopes.copy()
+    slopes = df['slope'].values
+    ses    = df['se'].values
+    k      = len(slopes)
+
+    w  = 1.0 / np.maximum(ses ** 2, 1e-12)
+    W  = w.sum()
+    mu = np.dot(w, slopes) / W
+
+    Q    = np.dot(w, (slopes - mu) ** 2)
+    C    = W - np.dot(w ** 2, np.ones(k)) / W
+    tau2 = max(0.0, (Q - (k - 1)) / C)
+    I2   = max(0.0, (Q - (k - 1)) / Q) * 100 if Q > 0 else 0.0
+
+    if tau2 == 0.0:
+        raw, med_B = np.full(k, mu), 1.0
+    else:
+        B          = ses ** 2 / (ses ** 2 + tau2)
+        raw, med_B = mu + (1.0 - B) * (slopes - mu), float(np.median(B))
+
+    df['shrunk_slope'] = np.maximum(raw, 0.0)
+    print(f'  Shrinkage: grand_mean={mu:.4f}  tau={np.sqrt(tau2):.4f}  '
+          f'Q={Q:.0f}  I2={I2:.0f}%  median_shrinkage={med_B:.2f}')
     return df
 
 
-def get_weekly_slots(df: pd.DataFrame) -> pd.DataFrame:
-    """One row per unique tournament date (week), sorted chronologically."""
-    return (
-        df.groupby('date').size()
-          .reset_index(name='n_players')
-          .sort_values('date')
-          .reset_index(drop=True)
-    )
+# ── Public entry point ────────────────────────────────────────────────────────
 
-
-# ── Feature engineering ───────────────────────────────────────────────────────
-
-def _compute_features(
-    tdate: np.datetime64,
-    pd_uniq: np.ndarray,
-    rp_: np.ndarray,
-    ra_: np.ndarray,
-    week_dates_sorted: np.ndarray,
-    start_ts: np.datetime64,
-) -> dict:
-    n = len(pd_uniq)
-
-    ts   = pd.Timestamp(tdate)
-    mo_s = np.sin(2 * np.pi * ts.month / 12)
-    mo_c = np.cos(2 * np.pi * ts.month / 12)
-    wk   = ts.isocalendar().week
-    wk_s = np.sin(2 * np.pi * wk / 52)
-    wk_c = np.cos(2 * np.pi * wk / 52)
-
-    days_since = int((tdate - pd_uniq[-1]) / np.timedelta64(1, 'D'))
-    i_td = int(np.searchsorted(week_dates_sorted, tdate, side='left'))
-
-    def att_rate(n_weeks: int) -> float:
-        cut      = tdate - np.timedelta64(int(n_weeks * 7), 'D')
-        n_avail  = i_td - int(np.searchsorted(week_dates_sorted, cut, side='left'))
-        n_played = n - int(np.searchsorted(pd_uniq, cut, side='left'))
-        return n_played / max(n_avail, 1)
-
-    total_wk = max(int((tdate - start_ts) / np.timedelta64(7, 'D')), 1)
-    Z        = (1.0 - PARTICIPATION_DECAY ** total_wk) / (1.0 - PARTICIPATION_DECAY)
-    wdiffs   = ((tdate - pd_uniq) / np.timedelta64(7, 'D')).astype(float)
-    decay    = float(np.sum(PARTICIPATION_DECAY ** wdiffs) / Z)
-
-    n_all = len(rp_)
-    rec_n = min(8, n_all)
-    rat   = float(ra_[-1])
-    trend = float(np.mean(ra_[-4:]) - np.mean(ra_[-8:-4])) if n_all >= 8 else 0.0
-
-    return {
-        'month_sin':            mo_s,
-        'month_cos':            mo_c,
-        'week_sin':             wk_s,
-        'week_cos':             wk_c,
-        'log_weeks_since_last': np.log1p(days_since / 7.0),
-        'att_rate_4w':          att_rate(4),
-        'att_rate_8w':          att_rate(8),
-        'att_rate_16w':         att_rate(16),
-        'decay_score':          decay,
-        'log_n_appearances':    np.log1p(n),
-        'avg_rank_pct_recent':  float(np.mean(rp_[-rec_n:])),
-        'avg_rank_pct_all':     float(np.mean(rp_)),
-        'current_rating':       rat,
-        'rating_trend':         trend,
-    }
-
-
-# ── Dataset builder ───────────────────────────────────────────────────────────
-
-def build_dataset(df: pd.DataFrame, weekly_slots: pd.DataFrame) -> pd.DataFrame:
-    """Build training rows: one per (player, tournament-week) in the player's active window."""
-    start_ts       = np.datetime64(DATA_START, 'D').astype('datetime64[ns]')
-    week_dates     = weekly_slots['date'].values.astype('datetime64[ns]')
-    week_dates_srt = np.sort(week_dates)
-    n_users        = df['username'].nunique()
-    rows = []
-
-    for u_idx, (username, hist) in enumerate(df.groupby('username')):
-        if (u_idx + 1) % 500 == 0:
-            print(f'    {u_idx + 1:,}/{n_users:,} players processed...')
-
-        hist = hist.sort_values('date').reset_index(drop=True)
-        attended_dates  = set(hist['date'].values.astype('datetime64[ns]'))
-        n_unique_weeks  = len(attended_dates)
-        if n_unique_weeks < MIN_APP:
-            continue
-
-        first_dt = hist['date'].iloc[0].to_datetime64()
-        last_dt  = hist['date'].iloc[-1].to_datetime64()
-        wm       = (week_dates >= first_dt) & (week_dates <= last_dt)
-        ps_dates = week_dates[wm]
-        if len(ps_dates) == 0:
-            continue
-
-        h_dates   = hist['date'].values.astype('datetime64[ns]')
-        h_rp      = hist['rank_pct'].values.astype(float)
-        h_ratings = hist['rating_num'].values.astype(float)
-        ptr = 0
-
-        for tdate in ps_dates:
-            while ptr < len(h_dates) and h_dates[ptr] < tdate:
-                ptr += 1
-            if ptr == 0:
-                continue
-            pd_uniq = np.unique(h_dates[:ptr])
-            feats   = _compute_features(
-                tdate, pd_uniq, h_rp[:ptr], h_ratings[:ptr],
-                week_dates_srt, start_ts,
-            )
-            feats['username'] = username
-            feats['date']     = pd.Timestamp(tdate)
-            feats['label']    = int(tdate in attended_dates)
-            rows.append(feats)
-
-    return pd.DataFrame(rows)
-
-
-# ── Models ────────────────────────────────────────────────────────────────────
-
-def make_models() -> dict:
-    return {
-        'logistic': Pipeline([
-            ('scaler', StandardScaler()),
-            ('clf', LogisticRegression(
-                C=1.0, max_iter=1000, class_weight='balanced', random_state=42,
-            )),
-        ]),
-        'random_forest': RandomForestClassifier(
-            n_estimators=200, max_depth=8, min_samples_leaf=20,
-            class_weight='balanced', random_state=42, n_jobs=-1,
-        ),
-        'gradient_boost': GradientBoostingClassifier(
-            n_estimators=150, max_depth=3, learning_rate=0.05,
-            min_samples_leaf=20, subsample=0.8, random_state=42,
-        ),
-    }
-
-
-# ── Cross-validation ──────────────────────────────────────────────────────────
-
-def cross_validate(dataset: pd.DataFrame, models: dict) -> dict:
-    data = dataset.dropna(subset=FEATURE_COLS + ['label']).sort_values('date')
-    print(f'  (CV on {len(data):,} rows, TimeSeriesSplit n_splits=4)')
-    X = data[FEATURE_COLS].values
-    y = data['label'].values
-
-    tscv       = TimeSeriesSplit(n_splits=4)
-    cv_results = {}
-    for name, model in models.items():
-        aucs, briers, lls = [], [], []
-        for train_idx, val_idx in tscv.split(X):
-            model.fit(X[train_idx], y[train_idx])
-            proba = model.predict_proba(X[val_idx])[:, 1]
-            aucs.append(roc_auc_score(y[val_idx], proba))
-            briers.append(brier_score_loss(y[val_idx], proba))
-            lls.append(log_loss(y[val_idx], proba))
-        cv_results[name] = {
-            'auc':      round(float(np.mean(aucs)),   4),
-            'brier':    round(float(np.mean(briers)), 4),
-            'log_loss': round(float(np.mean(lls)),    4),
-        }
-        print(f'  {name:<20}  AUC={cv_results[name]["auc"]:.3f}  '
-              f'Brier={cv_results[name]["brier"]:.3f}  '
-              f'LogLoss={cv_results[name]["log_loss"]:.3f}')
-    return cv_results
-
-
-def train_final(dataset: pd.DataFrame, models: dict) -> dict:
-    data = dataset.dropna(subset=FEATURE_COLS + ['label']).sort_values('date')
-    X, y = data[FEATURE_COLS].values, data['label'].values
-    final = {}
-    for name, model in models.items():
-        model.fit(X, y)
-        final[name] = model
-        print(f'  {name} - trained on {len(y):,} rows')
-    return final
-
-
-# ── Persistence ───────────────────────────────────────────────────────────────
-
-def save_models(final_models: dict, cv_results: dict) -> None:
-    MODELS_DIR.mkdir(exist_ok=True)
-    for name, model in final_models.items():
-        path = MODELS_DIR / f'attendance_{name}.pkl'
-        with open(path, 'wb') as f:
-            pickle.dump({'model': model, 'features': FEATURE_COLS, 'cv': cv_results.get(name, {})}, f)
-        print(f'  Saved -> {path}')
-
-
-def load_models() -> dict:
-    models = {}
-    for path in sorted(MODELS_DIR.glob('attendance_*.pkl')):
-        name = path.stem.replace('attendance_', '')
-        with open(path, 'rb') as f:
-            models[name] = pickle.load(f)
-        print(f'  Loaded {path}  (CV: {models[name].get("cv", {})})')
-    return models
-
-
-# ── Prediction ────────────────────────────────────────────────────────────────
-
-def build_prediction_features(
-    df: pd.DataFrame,
-    weekly_slots: pd.DataFrame,
-    target_date: pd.Timestamp,
-) -> pd.DataFrame:
-    start_ts       = np.datetime64(DATA_START, 'D').astype('datetime64[ns]')
-    tdate          = target_date.to_datetime64().astype('datetime64[ns]')
-    week_dates_srt = np.sort(weekly_slots['date'].values.astype('datetime64[ns]'))
-
-    rows = []
-    for username, hist in df.groupby('username'):
-        hist    = hist.sort_values('date').reset_index(drop=True)
-        h_dates   = hist['date'].values.astype('datetime64[ns]')
-        h_rp      = hist['rank_pct'].values.astype(float)
-        h_ratings = hist['rating_num'].values.astype(float)
-
-        mask    = h_dates < tdate
-        pd_uniq = np.unique(h_dates[mask])
-        if len(pd_uniq) < MIN_APP:
-            continue
-        feats = _compute_features(
-            tdate, pd_uniq, h_rp[mask], h_ratings[mask],
-            week_dates_srt, start_ts,
-        )
-        feats['username'] = username
-        feats['date']     = target_date
-        rows.append(feats)
-
-    return pd.DataFrame(rows)
-
-
-def predict_attendance(
-    df: pd.DataFrame,
-    weekly_slots: pd.DataFrame,
-    models_payload: dict,
-    target_date: pd.Timestamp,
-) -> pd.DataFrame:
-    feat_df = build_prediction_features(df, weekly_slots, target_date)
-    if feat_df.empty:
-        print('No eligible players found.')
-        return pd.DataFrame()
-
-    X   = feat_df[FEATURE_COLS].values
-    out = feat_df[['username', 'date']].copy()
-    for name, payload in models_payload.items():
-        out[f'p_{name}'] = payload['model'].predict_proba(X)[:, 1]
-
-    prob_cols      = [c for c in out.columns if c.startswith('p_')]
-    out['p_ensemble'] = out[prob_cols].mean(axis=1)
-    return out.sort_values('p_ensemble', ascending=False).reset_index(drop=True)
-
-
-def get_p_participate_for_mc(
-    df: pd.DataFrame,
-    weekly_slots: pd.DataFrame,
-    models_payload: dict,
-    target_date: pd.Timestamp,
-    model_name: str = 'gradient_boost',
+def apply_schedule_adjustments(
+    p_participate: pd.Series,
+    cut_players: list[str],
+    canonical_accounts: dict[str, str] | None = None,
+    account_groups: dict[str, list[str]] | None = None,
+    top_player_threshold: float = 0.10,
+    min_obs_opportunism: int = 20,
 ) -> pd.Series:
+    """Apply broadcast-conflict and opportunism adjustments to p_participate.
+
+    Parameters
+    ----------
+    p_participate        Series[username → float] from load_and_prepare().
+    cut_players          Player names (player_information.player_name) with a
+                         broadcast round on the upcoming TT Tuesday.
+    canonical_accounts   Maps closed/alt username → active canonical username
+                         (e.g. {'IMHansNiemann': 'HansOnTwitch'}).
+    account_groups       Maps canonical username → list of all chess.com accounts
+                         for the same player (for attendance aggregation).
+    top_player_threshold P_top10_given_play threshold to count as a 'top player'
+                         for n_top_conflicted (read from latest_model_predictions).
+    min_obs_opportunism  Minimum non-conflict TT dates required to estimate a slope.
+
+    Returns a modified copy of p_participate.
     """
-    Drop-in replacement for the EWMA p_participate used in src/data.load_and_prepare().
-    Returns a Series indexed by username. Empty if no eligible players exist.
-    """
-    preds = predict_attendance(df, weekly_slots, models_payload, target_date)
-    if preds.empty:
-        return pd.Series(dtype=float, name='p_participate')
-    col = f'p_{model_name}' if f'p_{model_name}' in preds.columns else 'p_ensemble'
-    return preds.set_index('username')[col].rename('p_participate')
+    if canonical_accounts is None:
+        canonical_accounts = {}
+    if account_groups is None:
+        account_groups = {}
 
+    p = p_participate.copy()
 
-# ── Feature inspection ────────────────────────────────────────────────────────
+    if not cut_players:
+        return p
 
-def print_feature_importances(final_models: dict) -> None:
-    print('\n-- Logistic Regression Coefficients (by |coef|) -----------------')
-    pipe  = final_models['logistic']
-    coefs = pipe.named_steps['clf'].coef_[0]
-    for feat, coef in sorted(zip(FEATURE_COLS, coefs), key=lambda x: abs(x[1]), reverse=True):
-        bar  = '#' * int(abs(coef) * 20)
-        sign = '+' if coef > 0 else '-'
-        print(f'  {feat:<28} {sign}{abs(coef):.4f}  {bar}')
+    # ── Resolve names → canonical usernames ───────────────────────────────────
+    name_map = _resolve_player_names(cut_players)
+    missing  = [pl for pl in cut_players if pl not in name_map]
+    if missing:
+        print(f'  Warning: no player_information entry for: {missing}')
 
-    print('\n-- Random Forest Feature Importances ----------------------------')
-    rf = final_models['random_forest']
-    for feat, imp in sorted(zip(FEATURE_COLS, rf.feature_importances_), key=lambda x: x[1], reverse=True):
-        print(f'  {feat:<28} {imp:.4f}  {"#" * int(imp * 100)}')
+    raw_usernames = [name_map[pl] for pl in cut_players if pl in name_map]
+    cut_usernames = list(dict.fromkeys(
+        canonical_accounts.get(u, u) for u in raw_usernames
+    ))
 
-    print('\n-- Gradient Boost Feature Importances ---------------------------')
-    gb = final_models['gradient_boost']
-    for feat, imp in sorted(zip(FEATURE_COLS, gb.feature_importances_), key=lambda x: x[1], reverse=True):
-        print(f'  {feat:<28} {imp:.4f}  {"#" * int(imp * 100)}')
+    for old, canonical in canonical_accounts.items():
+        if canonical in cut_usernames and old in p.index:
+            p[old] = 0.0
+
+    # ── Conflict-rate cap ──────────────────────────────────────────────────────
+    print('Computing conflict-conditional attendance rates...')
+    for username, rate in _compute_conflict_rates(cut_usernames, account_groups).items():
+        if username not in p.index:
+            continue
+        ewma = p[username]
+        p[username] = min(ewma, rate)
+        print(f'  {username}: EWMA={ewma:.3f}  conflict={rate:.3f}  -> p_participate={p[username]:.3f}')
+
+    # ── Opportunism boost ──────────────────────────────────────────────────────
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        pred_rows = conn.execute(
+            'SELECT username, P_top10_given_play FROM latest_model_predictions'
+        ).fetchall()
+        top_usernames = {u for u, pv in pred_rows if pv is not None and pv >= top_player_threshold}
+    except Exception:
+        top_usernames = set()
+    conn.close()
+
+    if not top_usernames:
+        print('Opportunism: skipping (no prior latest_model_predictions found)')
+        return p
+
+    n_top_conflicted = sum(1 for u in cut_usernames if u in top_usernames)
+    print(f'Opportunism: n_top_conflicted={n_top_conflicted}  '
+          f'({len(top_usernames)} top players, threshold P_top10>{top_player_threshold})')
+
+    print('  Building broadcast conflict map...')
+    conflict_map = _compute_broadcast_conflict_map()
+
+    print('  Computing per-player opportunism slopes...')
+    df_slopes = _compute_opportunism_slopes(top_usernames, conflict_map, min_obs_opportunism)
+    print(f'  Slopes computed for {len(df_slopes):,} players')
+
+    if df_slopes.empty:
+        return p
+
+    df_slopes = _shrink_slopes(df_slopes)
+    slope_map = dict(zip(df_slopes['username'], df_slopes['shrunk_slope']))
+
+    if n_top_conflicted > 0:
+        n_adj = 0
+        for username in p.index:
+            if username in cut_usernames:
+                continue
+            shrunk = slope_map.get(username, 0.0)
+            if shrunk < 1e-9:
+                continue
+            p[username] = float(np.clip(p[username] + shrunk * n_top_conflicted, 0.0, 1.0))
+            n_adj += 1
+        print(f'  p_participate adjusted for {n_adj:,} players')
+    else:
+        print('  n_top_conflicted=0 -> no opportunism adjustment applied')
+
+    return p

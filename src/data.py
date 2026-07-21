@@ -19,49 +19,113 @@ from .config import (
 
 # ── Username / player-name mapping ────────────────────────────────────────────
 
+# Alternative player names used on betting lines that differ from player_information.
+# Maps alias → canonical player_name in player_information.
+_PLAYER_ALIASES: dict[str, str] = {
+    'Jose Martinez': 'Jose Martinez Alcantara',
+}
+
 _USERNAME_TO_PLAYER: dict | None = None
 _PLAYER_TO_USERNAME: dict | None = None
 
 
+def _populate_is_default(conn: sqlite3.Connection) -> None:
+    """Set is_default=1 for each player's most-recently-seen TT username, 0 for all others."""
+    conn.execute('UPDATE player_information SET is_default = 0')
+    latest = dict(conn.execute(
+        'SELECT username, MAX(date) FROM titled_tuesday_standings GROUP BY username'
+    ).fetchall())
+    rows = conn.execute(
+        'SELECT username, player_name FROM player_information WHERE player_name IS NOT NULL'
+    ).fetchall()
+    groups: dict[str, list] = {}
+    for u, p in rows:
+        groups.setdefault(p, []).append(u)
+    for p, usernames in groups.items():
+        dated = [(latest.get(u), u) for u in usernames if latest.get(u)]
+        default_u = max(dated)[1] if dated else usernames[0]
+        conn.execute('UPDATE player_information SET is_default = 1 WHERE username = ?', (default_u,))
+    conn.commit()
+
+
+def _ensure_is_default(conn: sqlite3.Connection) -> None:
+    """Add is_default column to player_information and populate it if not present."""
+    cols = {row[1] for row in conn.execute('PRAGMA table_info(player_information)')}
+    if 'is_default' not in cols:
+        conn.execute('ALTER TABLE player_information ADD COLUMN is_default INTEGER DEFAULT 0')
+        conn.commit()
+        _populate_is_default(conn)
+
+
+def refresh_default_usernames() -> None:
+    """Re-compute is_default flags from current TT standings. Call after new data is loaded."""
+    global _USERNAME_TO_PLAYER, _PLAYER_TO_USERNAME
+    conn = sqlite3.connect(DB_PATH)
+    _ensure_is_default(conn)
+    _populate_is_default(conn)
+    conn.close()
+    _USERNAME_TO_PLAYER = None
+    _PLAYER_TO_USERNAME = None
+
+
 def get_username_mappings() -> tuple[dict, dict]:
-    """Return (username→player, player→username) dicts, loaded lazily from DB."""
+    """Return (username→player_name, player_name→default_username) dicts, loaded lazily from DB.
+
+    username→player_name maps ALL known usernames (including alt/closed accounts).
+    player_name→username maps to the DEFAULT username (most-recently-seen in TT standings).
+    Aliases in _PLAYER_ALIASES are injected so betting-line names resolve correctly.
+    """
     global _USERNAME_TO_PLAYER, _PLAYER_TO_USERNAME
     if _USERNAME_TO_PLAYER is None:
         conn = sqlite3.connect(DB_PATH)
+        _ensure_is_default(conn)
         rows = conn.execute(
-            'SELECT username, player_name FROM player_information'
+            'SELECT username, player_name, is_default FROM player_information WHERE player_name IS NOT NULL'
         ).fetchall()
         conn.close()
-        _USERNAME_TO_PLAYER = {u: p for u, p in rows}
-        _PLAYER_TO_USERNAME = {p: u for u, p in rows}
+        _USERNAME_TO_PLAYER = {u: p for u, p, _ in rows}
+        # Build PLAYER_TO_USERNAME: prefer is_default=1; fall back to last row for the name
+        _PLAYER_TO_USERNAME = {}
+        for u, p, is_def in rows:
+            if p not in _PLAYER_TO_USERNAME or is_def:
+                _PLAYER_TO_USERNAME[p] = u
+        # Inject aliases so betting-line names (e.g. 'Jose Martinez') also resolve
+        for alias, canonical in _PLAYER_ALIASES.items():
+            if canonical in _PLAYER_TO_USERNAME:
+                _PLAYER_TO_USERNAME[alias] = _PLAYER_TO_USERNAME[canonical]
     return _USERNAME_TO_PLAYER, _PLAYER_TO_USERNAME
 
 
 # ── Main data loader ──────────────────────────────────────────────────────────
 
 def load_and_prepare(cut_players=None, keep_players=None,
-                     attendance_model='decay', target_date=None):
+                     canonical_accounts=None, account_groups=None,
+                     top_player_threshold=0.10, min_obs_opportunism=20):
     """
     Load standings from DB and compute per-player MC inputs.
 
-    attendance_model options
-    ------------------------
-    'decay'         – recency-weighted EWMA (default)
-    'gradient_boost'– gradient boosted trees (src/attendance.py)
-    'random_forest' – random forest          (src/attendance.py)
-    'logistic'      – logistic regression    (src/attendance.py)
+    Attendance model: decay-weighted EWMA + isotonic floor, then schedule
+    adjustments via src.attendance.apply_schedule_adjustments():
+      - cut_players  : broadcast-conflict cap (historical conflict-date rate)
+      - non-cut players: opportunism boost (OLS slope × n_top_conflicted)
 
-    target_date : pd.Timestamp used by ML models to compute features.
-        Defaults to one week after the last date in the data.
-        Ignored for attendance_model='decay'.
+    Parameters
+    ----------
+    cut_players          Player names with a broadcast round on TT Tuesday.
+    keep_players         Player names forced to p_participate = 1.0.
+    canonical_accounts   Maps closed/alt username → active canonical username.
+    account_groups       Maps canonical username → list of all accounts.
+    top_player_threshold P_top10_given_play threshold for opportunism 'top player'.
+    min_obs_opportunism  Min non-conflict TT dates needed to compute a slope.
     """
+    from .attendance import apply_schedule_adjustments
+
     if cut_players is None:
         cut_players = []
     if keep_players is None:
         keep_players = []
 
     _, PLAYER_TO_USERNAME = get_username_mappings()
-    cut_users  = [PLAYER_TO_USERNAME[p] for p in cut_players if p in PLAYER_TO_USERNAME]
     keep_users = [PLAYER_TO_USERNAME[p] for p in keep_players if p in PLAYER_TO_USERNAME]
 
     conn = sqlite3.connect(DB_PATH)
@@ -100,35 +164,19 @@ def load_and_prepare(cut_players=None, keep_players=None,
         p_participate = pd.Series(iso_floor, index=p_participate.index,
                                   name='p_participate')
 
-    # Optionally replace EWMA with ML model predictions
-    if attendance_model != 'decay':
-        try:
-            from .attendance import (
-                load_data as _am_load, get_weekly_slots,
-                load_models as _am_load_models, get_p_participate_for_mc,
-            )
-            if target_date is None:
-                last_date   = df['date'].max()
-                target_date = last_date + pd.Timedelta(weeks=1)
+    print('  p_participate: decay-weighted EWMA with isotonic floor (p < 0.05)')
 
-            _df    = _am_load()
-            _slots = get_weekly_slots(_df)
-            _mdls  = _am_load_models()
-            ml_p   = get_p_participate_for_mc(
-                _df, _slots, _mdls, pd.Timestamp(target_date),
-                model_name=attendance_model,
-            )
-            n_updated = ml_p.index.isin(p_participate.index).sum()
-            p_participate.update(ml_p)
-            print(f'  p_participate: {attendance_model} model '
-                  f'({n_updated:,} players, {len(p_participate) - n_updated:,} EWMA fallback)')
-        except Exception as e:
-            print(f'  p_participate: falling back to EWMA ({e})')
-    else:
-        print('  p_participate: decay-weighted EWMA with isotonic floor (p < 0.05)')
-
-    p_participate[p_participate.index.isin(cut_users)]  = 0.0
+    # Force keep_players to attend, then apply schedule adjustments for cut_players
     p_participate[p_participate.index.isin(keep_users)] = 1.0
+
+    p_participate = apply_schedule_adjustments(
+        p_participate,
+        cut_players,
+        canonical_accounts=canonical_accounts,
+        account_groups=account_groups,
+        top_player_threshold=top_player_threshold,
+        min_obs_opportunism=min_obs_opportunism,
+    )
 
     app_counts = df.groupby('username')['tournament_slug'].nunique().rename('appearances')
     print(f'  {N} events | {df["username"].nunique():,} unique players '
@@ -172,5 +220,23 @@ def load_model_predictions() -> pd.DataFrame:
     """Load latest MC model predictions from DB."""
     conn = sqlite3.connect(DB_PATH)
     df   = pd.read_sql_query('SELECT * FROM latest_model_predictions', conn)
+    conn.close()
+    return df
+
+def load_player_usernames() -> pd.DataFrame:
+    """Load all player chess.com usernames form DB"""
+    conn = sqlite3.connect(DB_PATH)
+    df   = pd.read_sql_query("SELECT DISTINCT username FROM titled_tuesday_standings", conn)
+    conn.close()
+    return df
+
+
+def load_backtest_results(model: str | None = None) -> pd.DataFrame:
+    """Load backtest results from DB. Pass model='decay' etc. to filter by model."""
+    conn = sqlite3.connect(DB_PATH)
+    q    = 'SELECT * FROM backtest_results'
+    if model:
+        q += f" WHERE model = '{model}'"
+    df = pd.read_sql_query(q, conn, parse_dates=['date'])
     conn.close()
     return df

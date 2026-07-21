@@ -11,7 +11,6 @@ Usage
 """
 
 import json
-import sqlite3
 import sys
 import warnings
 from pathlib import Path
@@ -21,6 +20,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 warnings.filterwarnings('ignore')
 
+import sqlite3
 import pandas as pd
 from src.config import DB_PATH, N_SIMS
 from src.data import load_and_prepare
@@ -28,13 +28,12 @@ from src.simulation import build_player_pool_score, run_simulation_score, build_
 
 PRED_N_VALUES = [1, 3, 5, 8, 10]
 
+# Players with a broadcast round on the next TT Tuesday.
+# Names must match player_information.player_name exactly.
 CUT_PLAYERS = [
-    'Matthias Bluebaum',
     'Levon Aronian',
     'Yagiz Kaan Erdogmus',
-    'Jose Martinez',
     'Le Quang Liem',
-    'Daniel Naroditsky',
     'Hans Niemann',
     'Arjun Erigaisi',
     'Pranesh Munirethinam',
@@ -45,9 +44,19 @@ CUT_PLAYERS = [
 ]
 KEEP_PLAYERS = []
 
+# Closed/alt accounts → active canonical account.
+CANONICAL_ACCOUNTS: dict[str, str] = {
+    'IMHansNiemann':   'HansOnTwitch',
+    'HansCoolNiemann': 'HansOnTwitch',
+}
+
+# All chess.com accounts belonging to the same player (for TT attendance aggregation).
+PLAYER_ACCOUNT_GROUPS: dict[str, list[str]] = {
+    'HansOnTwitch': ['HansOnTwitch', 'IMHansNiemann', 'HansCoolNiemann'],
+}
+
 
 def main():
-    # Determine the tournament date being predicted
     conn = sqlite3.connect(DB_PATH)
     last_date = conn.execute(
         'SELECT MAX(date) FROM titled_tuesday_standings'
@@ -57,8 +66,12 @@ def main():
     print(f'Predicting for tournament date: {tourn_date}')
 
     df, p_participate, app_counts = load_and_prepare(
-        CUT_PLAYERS, KEEP_PLAYERS, attendance_model='decay'
+        cut_players=CUT_PLAYERS,
+        keep_players=KEEP_PLAYERS,
+        canonical_accounts=CANONICAL_ACCOUNTS,
+        account_groups=PLAYER_ACCOUNT_GROUPS,
     )
+
     players, p_play, hist_composites, hist_wts = build_player_pool_score(
         df, p_participate, app_counts, min_appearances=5
     )
@@ -73,7 +86,6 @@ def main():
         n_sims=N_SIMS, n_values=PRED_N_VALUES,
     )
 
-    # Keep only p_participate and the conditional probabilities
     keep_cols = ['p_participate'] + [f'P_top{k}_given_play' for k in PRED_N_VALUES]
     results   = results[keep_cols].reset_index()
 

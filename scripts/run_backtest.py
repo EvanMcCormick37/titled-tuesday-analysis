@@ -6,26 +6,23 @@ For each Titled Tuesday from START_DATE onward, uses all prior data as training
 history and records predicted top-N probabilities for every player in the pool —
 including players who did NOT participate (rank = -1, participated = 0).
 
-Output CSV columns
-------------------
-tournament_slug, date, username, rank, participated, field_size,
+Results are written to the backtest_results table in data/titled_tuesday.db.
+Attendance model: decay-weighted EWMA (no schedule adjustments in backtest —
+those require knowing the CUT_PLAYERS list for each future date).
+
+DB columns
+----------
+model, tournament_slug, date, username, rank, participated, field_size,
 p_participate,
 p_top1, p_top3, p_top8, p_top10,
 p_top1_given_play, p_top3_given_play, p_top8_given_play, p_top10_given_play,
 in_top1, in_top3, in_top8, in_top10
 
-attendance_model options
-------------------------
-  decay           – recency-weighted EWMA (default)
-  gradient_boost  – GBM from src/attendance.py (post-2025-09-02 era only)
-  random_forest   – RF  from src/attendance.py (post-2025-09-02 era only)
-  logistic        – LR  from src/attendance.py (post-2025-09-02 era only)
-
 Usage
 -----
-    python scripts/run_backtest.py                      # all 4 models
+    python scripts/run_backtest.py
     python scripts/run_backtest.py --sample 20          # quick test, first 20 events
-    python scripts/run_backtest.py --model decay --sample 5
+    python scripts/run_backtest.py --sample 5
 """
 
 import argparse
@@ -41,17 +38,15 @@ import numpy as np
 import pandas as pd
 
 from src.config import (
-    DB_PATH, BACKTEST_DIR,
+    DB_PATH,
     SKILL_DECAY, PARTICIPATION_DECAY, _SCORE_COMPOSITE_SCALE,
 )
 
-START_DATE        = '2025-09-02'
-N_VALUES          = [1, 3, 8, 10]
-N_SIMS            = 10_000
-CHUNK             = 5_000
-BASE_SEED         = 42
-ML_ERA_START      = pd.Timestamp('2025-09-02')
-ATTENDANCE_MODELS = ['decay', 'gradient_boost', 'random_forest', 'logistic']
+START_DATE = '2025-09-02'
+N_VALUES   = [1, 3, 8, 10]
+N_SIMS     = 10_000
+CHUNK      = 5_000
+BASE_SEED  = 42
 
 _Z_PART = 1.0 / (1.0 - PARTICIPATION_DECAY)
 
@@ -147,38 +142,15 @@ def _simulate(players, p_play, hist_composites, hist_wts,
 # ── Main backtest loop ────────────────────────────────────────────────────────
 
 def run_backtest(
-    start_date: str       = START_DATE,
-    n_sims: int           = N_SIMS,
-    n_values: list        = N_VALUES,
-    chunk: int            = CHUNK,
-    base_seed: int        = BASE_SEED,
-    output_path: str      = None,
-    sample: int           = None,
-    attendance_model: str = 'decay',
+    start_date: str = START_DATE,
+    n_sims: int     = N_SIMS,
+    n_values: list  = N_VALUES,
+    chunk: int      = CHUNK,
+    base_seed: int  = BASE_SEED,
+    sample: int     = None,
 ) -> pd.DataFrame:
 
-    BACKTEST_DIR.mkdir(parents=True, exist_ok=True)
-    if output_path is None:
-        output_path = BACKTEST_DIR / f'backtest_score_{attendance_model}.csv'
-
     t0 = time.time()
-
-    ml_models = None
-    am_df     = None
-    am_slots  = None
-    _get_ml_p = None
-
-    if attendance_model != 'decay':
-        from src.attendance import (
-            load_data as _am_load, get_weekly_slots as _am_slots_fn,
-            load_models as _am_load_models, get_p_participate_for_mc,
-        )
-        print(f'Loading attendance model: {attendance_model} ...')
-        am_df     = _am_load()
-        am_slots  = _am_slots_fn(am_df)
-        ml_models = _am_load_models()
-        _get_ml_p = get_p_participate_for_mc
-        print(f'  Models loaded: {list(ml_models.keys())}')
 
     print('Loading standings from DB...')
     conn    = sqlite3.connect(DB_PATH)
@@ -208,48 +180,18 @@ def run_backtest(
     n_total = len(bt_tournaments)
     print(f'  {n_total} tournaments to evaluate '
           f'({bt_tournaments["date"].min().date()} – '
-          f'{bt_tournaments["date"].max().date()})')
-    print(f'  attendance_model = {attendance_model}\n')
-
-    # Reuse pre-era rows from decay CSV to save ~75% runtime for ML models
-    pre_era_records = []
-    pre_era_slugs   = set()
-
-    if attendance_model != 'decay':
-        decay_csv = BACKTEST_DIR / 'backtest_score_decay.csv'
-        if decay_csv.exists():
-            print(f'Pre-loading pre-era rows from {decay_csv} ...')
-            _decay_df = pd.read_csv(decay_csv, parse_dates=['date'])
-            _pre      = _decay_df[_decay_df['date'] < ML_ERA_START]
-            pre_era_records = _pre.to_dict('records')
-            pre_era_slugs   = set(_pre['tournament_slug'].unique())
-            print(f'  Reusing {len(pre_era_records):,} rows '
-                  f'from {len(pre_era_slugs)} pre-era tournaments\n')
-        else:
-            print(f'  (decay CSV not found at {decay_csv} — will simulate pre-era too)\n')
+          f'{bt_tournaments["date"].max().date()})\n')
 
     records = []
     for i, t_row in bt_tournaments.iterrows():
         t_date = t_row['date']
         t_slug = t_row['tournament_slug']
 
-        if t_slug in pre_era_slugs:
-            continue
-
         players, p_play, hist_composites, hist_wts = _build_pool_at(user_data, t_date)
 
         if len(players) < max(n_values):
             print(f'  [{i+1:>3}/{n_total}] SKIP {t_slug}: pool={len(players)} < {max(n_values)}')
             continue
-
-        ml_p = None
-        if ml_models is not None and t_date >= ML_ERA_START:
-            ml_p = _get_ml_p(am_df, am_slots, ml_models,
-                             pd.Timestamp(t_date), model_name=attendance_model)
-            player_to_j = {u: j for j, u in enumerate(players)}
-            for username, prob in ml_p.items():
-                if username in player_to_j:
-                    p_play[player_to_j[username]] = float(prob)
 
         p_sim_part, p_topn, p_topn_gp = _simulate(
             players, p_play, hist_composites, hist_wts,
@@ -297,17 +239,26 @@ def run_backtest(
                     rec[f'in_top{k}']           = int(participated and rank_val <= k)
             records.append(rec)
 
-        n_ml = int(ml_p.index.isin(players).sum()) if ml_p is not None else 0
         print(f'  [{i+1:>3}/{n_total}]  {t_slug}'
               f'  field={field_size:>3}  pool={len(players):>5}'
               f'  output={len(output_users):>5}'
-              f'  ml_overrides={n_ml:>4}'
               f'  {time.time()-t0:>7.1f}s')
 
-    df_out = pd.DataFrame(pre_era_records + records)
+    df_out = pd.DataFrame(records)
     df_out = df_out.sort_values(['date', 'tournament_slug', 'username']).reset_index(drop=True)
-    df_out.to_csv(output_path, index=False)
-    print(f'\nSaved {len(df_out):,} rows -> {output_path}')
+    df_out.insert(0, 'model', 'decay')
+
+    all_slugs    = list(df_out['tournament_slug'].unique())
+    placeholders = ','.join('?' * len(all_slugs))
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        f"DELETE FROM backtest_results WHERE model = 'decay' AND tournament_slug IN ({placeholders})",
+        all_slugs,
+    )
+    df_out.to_sql('backtest_results', conn, if_exists='append', index=False)
+    conn.commit()
+    conn.close()
+    print(f'\nWrote {len(df_out):,} rows -> backtest_results (model=decay)')
     print(f'Total time: {time.time()-t0:.1f}s')
     return df_out
 
@@ -346,21 +297,11 @@ if __name__ == '__main__':
     parser.add_argument('--sims',   type=int, default=N_SIMS)
     parser.add_argument('--sample', type=int, default=None,
                         help='Only run first N events (quick test)')
-    parser.add_argument('--model',  default=None, choices=ATTENDANCE_MODELS,
-                        help='Run a single model (default: all 4)')
     args = parser.parse_args()
 
-    models_to_run = [args.model] if args.model else ATTENDANCE_MODELS
-
-    for model in models_to_run:
-        print(f'\n{"="*70}')
-        print(f'  Running backtest: attendance_model = {model}')
-        print(f'{"="*70}')
-        df_results = run_backtest(
-            start_date=args.start,
-            n_sims=args.sims,
-            sample=args.sample,
-            attendance_model=model,
-        )
-        calibration_summary(df_results)
-        print()
+    df_results = run_backtest(
+        start_date=args.start,
+        n_sims=args.sims,
+        sample=args.sample,
+    )
+    calibration_summary(df_results)
