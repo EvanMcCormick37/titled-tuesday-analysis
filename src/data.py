@@ -98,7 +98,7 @@ def get_username_mappings() -> tuple[dict, dict]:
 
 # ── Main data loader ──────────────────────────────────────────────────────────
 
-def load_and_prepare(cut_players=None, keep_players=None,
+def load_and_prepare(scheduling_conflict=None, cut_players=None, keep_players=None,
                      canonical_accounts=None, account_groups=None,
                      top_player_threshold=0.10, min_obs_opportunism=20):
     """
@@ -106,12 +106,14 @@ def load_and_prepare(cut_players=None, keep_players=None,
 
     Attendance model: decay-weighted EWMA + isotonic floor, then schedule
     adjustments via src.attendance.apply_schedule_adjustments():
-      - cut_players  : broadcast-conflict cap (historical conflict-date rate)
-      - non-cut players: opportunism boost (OLS slope × n_top_conflicted)
+      - cut_players        : unavoidable conflict → p_participate = 0
+      - scheduling_conflict: broadcast-conflict cap (historical conflict-date rate)
+      - non-conflicted players: opportunism boost (OLS slope × n_top_conflicted)
 
     Parameters
     ----------
-    cut_players          Player names with a broadcast round on TT Tuesday.
+    scheduling_conflict  Player names with a broadcast round on TT Tuesday.
+    cut_players          Player names with an unavoidable conflict (p_participate=0).
     keep_players         Player names forced to p_participate = 1.0.
     canonical_accounts   Maps closed/alt username → active canonical username.
     account_groups       Maps canonical username → list of all accounts.
@@ -120,6 +122,8 @@ def load_and_prepare(cut_players=None, keep_players=None,
     """
     from .attendance import apply_schedule_adjustments
 
+    if scheduling_conflict is None:
+        scheduling_conflict = []
     if cut_players is None:
         cut_players = []
     if keep_players is None:
@@ -131,8 +135,9 @@ def load_and_prepare(cut_players=None, keep_players=None,
     conn = sqlite3.connect(DB_PATH)
     df = pd.read_sql_query(
         f"SELECT * FROM titled_tuesday_standings WHERE date >= '{DATA_CUTOFF}'",
-        conn, parse_dates=['date'],
+        conn,
     )
+    df['date'] = pd.to_datetime(df['date'], format='mixed')
     conn.close()
 
     df = (
@@ -140,7 +145,7 @@ def load_and_prepare(cut_players=None, keep_players=None,
           .drop_duplicates(subset=['tournament_slug', 'username'], keep='first')
     )
 
-    time_diff = (pd.Timestamp.now() - pd.to_datetime(df['date'])) // pd.Timedelta(weeks=1)
+    time_diff = (pd.Timestamp.now() - pd.to_datetime(df['date'], format='mixed')) // pd.Timedelta(weeks=1)
     N = (datetime.now() - datetime(2022, 2, 8)) // pd.Timedelta(weeks=1)
 
     df['skill_w'] = SKILL_DECAY          ** time_diff
@@ -166,12 +171,13 @@ def load_and_prepare(cut_players=None, keep_players=None,
 
     print('  p_participate: decay-weighted EWMA with isotonic floor (p < 0.05)')
 
-    # Force keep_players to attend, then apply schedule adjustments for cut_players
+    # Force keep_players to attend, then apply schedule adjustments
     p_participate[p_participate.index.isin(keep_users)] = 1.0
 
     p_participate = apply_schedule_adjustments(
         p_participate,
-        cut_players,
+        scheduling_conflict,
+        cut_players=cut_players,
         canonical_accounts=canonical_accounts,
         account_groups=account_groups,
         top_player_threshold=top_player_threshold,

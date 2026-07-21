@@ -2,19 +2,24 @@
 Schedule-conflict and opportunism adjustments for TT attendance.
 
 The single attendance model is decay-weighted EWMA + isotonic floor,
-computed in src.data.load_and_prepare().  This module adds two further
+computed in src.data.load_and_prepare().  This module adds three further
 adjustments via apply_schedule_adjustments():
 
-  1. Conflict-rate cap (cut players):
+  1. Hard cut (cut_players):
+     For each player with an unavoidable conflict on TT day, set p_participate
+     to 0.
+
+  2. Conflict-rate cap (scheduling_conflict players):
      For each player with a broadcast round on TT day, cap p_participate at
      their historical TT attendance rate on past conflict dates.
      Only lowers — never raises — their attendance probability.
 
-  2. Opportunism boost (non-cut players):
+  3. Opportunism boost (non-conflicted players):
      Fit an OLS slope of (attended ~ n_top_conflicted) per player on their
      non-conflict TT dates, shrink via DerSimonian-Laird empirical Bayes,
      and add  shrunk_slope × n_top_conflicted  to p_participate.
-     Only positive slopes are applied (opportunism can only raise attendance).
+     n_top_conflicted counts top players across both cut_players and
+     scheduling_conflict.  Only positive slopes are applied.
 """
 
 import sqlite3
@@ -301,7 +306,8 @@ def _shrink_slopes(df_slopes: pd.DataFrame) -> pd.DataFrame:
 
 def apply_schedule_adjustments(
     p_participate: pd.Series,
-    cut_players: list[str],
+    scheduling_conflict: list[str],
+    cut_players: list[str] | None = None,
     canonical_accounts: dict[str, str] | None = None,
     account_groups: dict[str, list[str]] | None = None,
     top_player_threshold: float = 0.10,
@@ -312,8 +318,10 @@ def apply_schedule_adjustments(
     Parameters
     ----------
     p_participate        Series[username → float] from load_and_prepare().
-    cut_players          Player names (player_information.player_name) with a
+    scheduling_conflict  Player names (player_information.player_name) with a
                          broadcast round on the upcoming TT Tuesday.
+    cut_players          Player names with an unavoidable conflict; p_participate
+                         is set to 0 for these players.
     canonical_accounts   Maps closed/alt username → active canonical username
                          (e.g. {'IMHansNiemann': 'HansOnTwitch'}).
     account_groups       Maps canonical username → list of all chess.com accounts
@@ -328,37 +336,57 @@ def apply_schedule_adjustments(
         canonical_accounts = {}
     if account_groups is None:
         account_groups = {}
+    if cut_players is None:
+        cut_players = []
 
     p = p_participate.copy()
 
-    if not cut_players:
+    if not scheduling_conflict and not cut_players:
         return p
 
-    # ── Resolve names → canonical usernames ───────────────────────────────────
-    name_map = _resolve_player_names(cut_players)
-    missing  = [pl for pl in cut_players if pl not in name_map]
-    if missing:
-        print(f'  Warning: no player_information entry for: {missing}')
+    # ── Resolve scheduling_conflict names → canonical usernames ───────────────
+    sc_name_map = _resolve_player_names(scheduling_conflict) if scheduling_conflict else {}
+    sc_missing  = [pl for pl in scheduling_conflict if pl not in sc_name_map]
+    if sc_missing:
+        print(f'  Warning: no player_information entry for: {sc_missing}')
 
-    raw_usernames = [name_map[pl] for pl in cut_players if pl in name_map]
-    cut_usernames = list(dict.fromkeys(
-        canonical_accounts.get(u, u) for u in raw_usernames
-    ))
+    sc_raw = [sc_name_map[pl] for pl in scheduling_conflict if pl in sc_name_map]
+    sc_usernames = list(dict.fromkeys(canonical_accounts.get(u, u) for u in sc_raw))
+
+    # ── Resolve cut_players names → canonical usernames ───────────────────────
+    cut_name_map = _resolve_player_names(cut_players) if cut_players else {}
+    cut_missing  = [pl for pl in cut_players if pl not in cut_name_map]
+    if cut_missing:
+        print(f'  Warning: no player_information entry for: {cut_missing}')
+
+    cut_raw = [cut_name_map[pl] for pl in cut_players if pl in cut_name_map]
+    cut_usernames = list(dict.fromkeys(canonical_accounts.get(u, u) for u in cut_raw))
 
     for old, canonical in canonical_accounts.items():
-        if canonical in cut_usernames and old in p.index:
+        if old not in p.index:
+            continue
+        if canonical in sc_usernames or canonical in cut_usernames:
             p[old] = 0.0
 
-    # ── Conflict-rate cap ──────────────────────────────────────────────────────
-    print('Computing conflict-conditional attendance rates...')
-    for username, rate in _compute_conflict_rates(cut_usernames, account_groups).items():
-        if username not in p.index:
-            continue
-        ewma = p[username]
-        p[username] = min(ewma, rate)
-        print(f'  {username}: EWMA={ewma:.3f}  conflict={rate:.3f}  -> p_participate={p[username]:.3f}')
+    # ── Hard cut: unavoidable conflicts → p_participate = 0 ───────────────────
+    for username in cut_usernames:
+        if username in p.index:
+            print(f'  {username}: cut (unavoidable conflict) -> p_participate=0.000')
+            p[username] = 0.0
+
+    # ── Conflict-rate cap for scheduling_conflict players ─────────────────────
+    if sc_usernames:
+        print('Computing conflict-conditional attendance rates...')
+        for username, rate in _compute_conflict_rates(sc_usernames, account_groups).items():
+            if username not in p.index:
+                continue
+            ewma = p[username]
+            p[username] = min(ewma, rate)
+            print(f'  {username}: EWMA={ewma:.3f}  conflict={rate:.3f}  -> p_participate={p[username]:.3f}')
 
     # ── Opportunism boost ──────────────────────────────────────────────────────
+    all_conflicted = list(dict.fromkeys(sc_usernames + cut_usernames))
+
     conn = sqlite3.connect(DB_PATH)
     try:
         pred_rows = conn.execute(
@@ -373,7 +401,7 @@ def apply_schedule_adjustments(
         print('Opportunism: skipping (no prior latest_model_predictions found)')
         return p
 
-    n_top_conflicted = sum(1 for u in cut_usernames if u in top_usernames)
+    n_top_conflicted = sum(1 for u in all_conflicted if u in top_usernames)
     print(f'Opportunism: n_top_conflicted={n_top_conflicted}  '
           f'({len(top_usernames)} top players, threshold P_top10>{top_player_threshold})')
 
@@ -390,10 +418,11 @@ def apply_schedule_adjustments(
     df_slopes = _shrink_slopes(df_slopes)
     slope_map = dict(zip(df_slopes['username'], df_slopes['shrunk_slope']))
 
+    all_conflicted_set = set(all_conflicted)
     if n_top_conflicted > 0:
         n_adj = 0
         for username in p.index:
-            if username in cut_usernames:
+            if username in all_conflicted_set:
                 continue
             shrunk = slope_map.get(username, 0.0)
             if shrunk < 1e-9:

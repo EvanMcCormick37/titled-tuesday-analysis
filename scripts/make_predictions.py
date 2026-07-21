@@ -28,19 +28,21 @@ from src.simulation import build_player_pool_score, run_simulation_score, build_
 
 PRED_N_VALUES = [1, 3, 5, 8, 10]
 
-# Players with a broadcast round on the next TT Tuesday.
+# Players with a broadcast round on the next TT Tuesday (scheduling conflict).
 # Names must match player_information.player_name exactly.
+SCHEDULING_CONFLICT = []
+# Players with an unavoidable conflict; p_participate is set to 0.
 CUT_PLAYERS = [
+    'Hikaru Nakamura',
+    'Fabiano Caruana',
+    'Wesley So',
     'Levon Aronian',
-    'Yagiz Kaan Erdogmus',
-    'Le Quang Liem',
-    'Hans Niemann',
-    'Arjun Erigaisi',
-    'Pranesh Munirethinam',
-    'Dmitry Andreikin',
-    'Nihal Sarin',
-    'Alireza Firouzja',
-    'Nodirbek Abdusattorov',
+    'Leinier Dominguez Perez',
+    'Javokhir Sindarov',
+    'Nodirbek Abdussatorov',
+    'Nodirbek Yakubboev',
+    'Shamsiddin Vokhidov',
+    'Mukhiddin Madaminov'
 ]
 KEEP_PLAYERS = []
 
@@ -66,6 +68,7 @@ def main():
     print(f'Predicting for tournament date: {tourn_date}')
 
     df, p_participate, app_counts = load_and_prepare(
+        scheduling_conflict=SCHEDULING_CONFLICT,
         cut_players=CUT_PLAYERS,
         keep_players=KEEP_PLAYERS,
         canonical_accounts=CANONICAL_ACCOUNTS,

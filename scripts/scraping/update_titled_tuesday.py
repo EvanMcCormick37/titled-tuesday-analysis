@@ -23,7 +23,7 @@ import sys
 import time
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 import pandas as pd
@@ -205,7 +205,7 @@ def process(slug: str) -> None:
     conn.execute('DELETE FROM titled_tuesday_standings WHERE tournament_slug = ?', (slug,))
 
     new_rows = pd.DataFrame([{
-        'date':            date,
+        'date':            f'{date} 00:00:00' if date else None,
         'tournament_slug': slug,
         'session':         session,
         'rank':            p['rank'],
@@ -229,7 +229,7 @@ def process(slug: str) -> None:
     conn.execute('DELETE FROM titled_tuesday_tournaments WHERE slug = ?', (slug,))
 
     new_tourn = {
-        'date':        date,
+        'date':        f'{date} 00:00:00' if date else None,
         'time_local':  existing.iloc[0]['time_local'] if not existing.empty else None,
         'title':       title,
         'session':     existing.iloc[0]['session'] if not existing.empty else session,
