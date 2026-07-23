@@ -166,6 +166,8 @@ def fetch_standings(slug: str) -> list[dict]:
             wins, draws, byes = parse_round_cells(cells, round_indices)
             score     = cells[score_col].get_text(strip=True) if score_col < len(cells) else None
             tie_break = cells[tb1_col].get_text(strip=True)   if tb1_col  < len(cells) else None
+            if rank is None:
+                rank = len(players) + 1
             players.append({
                 'rank': rank, 'title': title, 'username': username, 'rating': rating,
                 'score': score, 'tie_break': tie_break,

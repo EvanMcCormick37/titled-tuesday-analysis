@@ -30,7 +30,13 @@ PRED_N_VALUES = [1, 3, 5, 8, 10]
 
 # Players with a broadcast round on the next TT Tuesday (scheduling conflict).
 # Names must match player_information.player_name exactly.
-SCHEDULING_CONFLICT = []
+SCHEDULING_CONFLICT = [
+    'Andrey Esipenko',
+    'Zhamsaran Tsydypov',
+    'David Paravyan',
+    'Maxim Matlakov',
+    'Arseniy Nesterov'
+]
 # Players with an unavoidable conflict; p_participate is set to 0.
 CUT_PLAYERS = [
     'Hikaru Nakamura',
@@ -42,7 +48,9 @@ CUT_PLAYERS = [
     'Nodirbek Abdussatorov',
     'Nodirbek Yakubboev',
     'Shamsiddin Vokhidov',
-    'Mukhiddin Madaminov'
+    'Mukhiddin Madaminov',
+    'Christopher Yoo',
+    'Grigory Oparin',
 ]
 KEEP_PLAYERS = []
 
