@@ -153,10 +153,31 @@ def get_username_mappings() -> tuple[dict, dict]:
 
 # ── Main data loader ──────────────────────────────────────────────────────────
 
+def apply_db_adjustments(p_participate: pd.Series, tourn_date: str) -> pd.Series:
+    """Apply active nudges and overrides from attendance_adjustments for tourn_date.
+
+    Nudges are applied first (log-odds shift), then overrides (exact value).
+    Returns a new Series; the input is not mutated.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    nudges, overrides = _load_active_adjustments(conn, tourn_date)
+    conn.close()
+    p = p_participate
+    if nudges:
+        print(f'  Applying {len(nudges)} nudge(s) (log-odds delta)...')
+        p = _apply_nudges(p, nudges)
+    if overrides:
+        n_cuts = sum(1 for v in overrides.values() if v == 0.0)
+        print(f'  Applying {len(overrides)} override(s) '
+              f'({n_cuts} cut(s) to 0, {len(overrides) - n_cuts} value(s))...')
+        p = _apply_overrides(p, overrides)
+    return p
+
+
 def load_and_prepare(scheduling_conflict=None, cut_players=None, keep_players=None,
                      canonical_accounts=None, account_groups=None,
                      top_player_threshold=0.10, min_obs_opportunism=20,
-                     as_of=None, tourn_date=None):
+                     as_of=None, tourn_date=None, apply_adjustments=True):
     """
     Load standings from DB and compute per-player MC inputs.
 
@@ -230,18 +251,8 @@ def load_and_prepare(scheduling_conflict=None, cut_players=None, keep_players=No
     print('  p_participate: decay-weighted EWMA with isotonic floor (p < 0.05)')
 
     if tourn_date:
-        # ── DB-driven adjustment path (new) ──────────────────────────────────
-        nudges, overrides = _load_active_adjustments(conn, tourn_date)
-        n_nudges = len(nudges)
-        n_overrides = len(overrides)
-        n_cuts = sum(1 for v in overrides.values() if v == 0.0)
-        if nudges:
-            print(f'  Applying {n_nudges} nudge(s) (log-odds delta)...')
-            p_participate = _apply_nudges(p_participate, nudges)
-        if overrides:
-            print(f'  Applying {n_overrides} override(s) '
-                  f'({n_cuts} cut(s) to 0, {n_overrides - n_cuts} value(s))...')
-            p_participate = _apply_overrides(p_participate, overrides)
+        if apply_adjustments:
+            p_participate = apply_db_adjustments(p_participate, tourn_date)
     else:
         # ── Legacy scheduling-param path (backward compat) ───────────────────
         from .attendance import apply_schedule_adjustments
