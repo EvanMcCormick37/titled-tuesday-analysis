@@ -38,13 +38,11 @@ def main():
         INSERT OR REPLACE INTO historical_predictions
             (tourn_date, username, p_participate,
              P_top1_given_play, P_top3_given_play, P_top5_given_play,
-             P_top8_given_play, P_top10_given_play,
-             cut_players, keep_players)
+             P_top8_given_play, P_top10_given_play)
         SELECT
             tourn_date, username, p_participate,
             P_top1_given_play, P_top3_given_play, P_top5_given_play,
-            P_top8_given_play, P_top10_given_play,
-            cut_players, keep_players
+            P_top8_given_play, P_top10_given_play
         FROM latest_model_predictions
     ''')
     n_written = conn.execute(

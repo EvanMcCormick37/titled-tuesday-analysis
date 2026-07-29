@@ -1,5 +1,6 @@
 """
-Update Titled Tuesday standings and tournaments in the SQLite DB with new events.
+Update Titled Tuesday standings and tournaments in the SQLite DB with new events,
+then enrich any new player usernames via the chess.com PubAPI.
 
 Scrapes Chess.com tournament standings pages directly using BeautifulSoup,
 paginating through all player pages:
@@ -17,10 +18,14 @@ Usage:
 Be polite: sleeps between requests and sends a User-Agent header.
 """
 
+import json
+import random
 import re
 import sqlite3
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -45,6 +50,169 @@ MONTH_MAP = {
     'may': 5, 'june': 6, 'july': 7, 'august': 8,
     'september': 9, 'october': 10, 'november': 11, 'december': 12,
 }
+
+# ── Chess.com PubAPI enrichment ────────────────────────────────────────────────
+
+_API = "https://api.chess.com/pub/player"
+_UA  = {"User-Agent": "TT-attendance-research (personal project; contact via chess.com messages)"}
+
+_ENRICH_NEW_COLS = {
+    "status":               "TEXT",
+    "chess_com_blitz_best": "INTEGER",
+    "profile_url":          "TEXT",
+    "fetch_error":          "TEXT",
+}
+
+_tls         = threading.local()
+_pause_until = 0.0
+_pause_lock  = threading.Lock()
+
+
+def _session() -> requests.Session:
+    if not hasattr(_tls, "s"):
+        _tls.s = requests.Session()
+        _tls.s.headers.update(_UA)
+    return _tls.s
+
+
+def _backoff(seconds: float):
+    global _pause_until
+    with _pause_lock:
+        _pause_until = max(_pause_until, time.time() + seconds)
+
+
+def _wait_if_paused():
+    while True:
+        delta = _pause_until - time.time()
+        if delta <= 0:
+            return
+        time.sleep(min(delta, 1.0))
+
+
+def _get_json(url: str, cache: Path) -> dict | None:
+    key = cache / (re.sub(r"[^A-Za-z0-9._-]", "_", url.split("/pub/")[-1]) + ".json")
+    if key.exists():
+        return json.loads(key.read_text() or "null")
+    for attempt in range(6):
+        _wait_if_paused()
+        try:
+            r = _session().get(url, timeout=30)
+            if r.status_code == 404:
+                key.write_text("null")
+                return None
+            if r.status_code in (429, 403):
+                wait = 15 * (attempt + 1)
+                print(f"    HTTP {r.status_code}, global backoff {wait}s", file=sys.stderr)
+                _backoff(wait)
+                continue
+            r.raise_for_status()
+            data = r.json()
+            key.write_text(json.dumps(data))
+            return data
+        except (requests.RequestException, json.JSONDecodeError):
+            time.sleep(3 * (attempt + 1))
+    return None
+
+
+def _enrich_one(username: str, cache: Path) -> dict:
+    time.sleep(random.uniform(0, 1.0))
+    row = {"username": username, "name": "", "title": "", "country": "",
+           "status": "", "fide": "", "blitz_last": "", "blitz_best": "",
+           "profile_url": "", "error": ""}
+    prof = _get_json(f"{_API}/{username}", cache)
+    if prof is None:
+        row["error"] = "not_found_or_uncached"
+        return row
+    row["name"]        = prof.get("name", "")
+    row["title"]       = prof.get("title", "")
+    row["country"]     = (prof.get("country") or "").rsplit("/", 1)[-1]
+    row["status"]      = prof.get("status", "")
+    row["profile_url"] = prof.get("url", "")
+    stats    = _get_json(f"{_API}/{username}/stats", cache) or {}
+    fide_val = stats.get("fide", "")
+    row["fide"] = fide_val if (isinstance(fide_val, int) and fide_val <= 2882) else ""
+    try:
+        row["blitz_last"] = stats["chess_blitz"]["last"]["rating"]
+    except (KeyError, TypeError):
+        pass
+    try:
+        row["blitz_best"] = stats["chess_blitz"]["best"]["rating"]
+    except (KeyError, TypeError):
+        pass
+    return row
+
+
+def _ensure_enrich_columns(conn: sqlite3.Connection):
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(player_information)")}
+    for col, dtype in _ENRICH_NEW_COLS.items():
+        if col not in existing:
+            conn.execute(f"ALTER TABLE player_information ADD COLUMN {col} {dtype}")
+    conn.commit()
+
+
+def _write_enriched_row(conn: sqlite3.Connection, row: dict):
+    def _v(val):
+        return val if val not in ("", None) else None
+
+    conn.execute(
+        """
+        UPDATE player_information SET
+            player_name            = COALESCE(player_name, ?),
+            title                  = ?,
+            country                = ?,
+            status                 = ?,
+            fide_rating            = ?,
+            chess_com_blitz_rating = ?,
+            chess_com_blitz_best   = ?,
+            profile_url            = ?,
+            fetch_error            = ?
+        WHERE username = ?
+        """,
+        [
+            _v(row.get("name")),
+            _v(row.get("title")),
+            _v(row.get("country")),
+            _v(row.get("status")),
+            _v(row.get("fide")),
+            _v(row.get("blitz_last")),
+            _v(row.get("blitz_best")),
+            _v(row.get("profile_url")),
+            _v(row.get("error")),
+            row["username"],
+        ],
+    )
+
+
+def _insert_new_players(conn: sqlite3.Connection, usernames: list[str]) -> list[str]:
+    """Insert usernames not yet in player_information; return the newly inserted ones."""
+    new = []
+    for u in usernames:
+        if not u:
+            continue
+        if conn.execute("SELECT 1 FROM player_information WHERE username = ?", (u,)).fetchone() is None:
+            conn.execute("INSERT INTO player_information (username) VALUES (?)", (u,))
+            new.append(u)
+    conn.commit()
+    return new
+
+
+def enrich_players(conn: sqlite3.Connection, usernames: list[str], workers: int = 4) -> None:
+    """Fetch chess.com profile data for each username and write it to player_information."""
+    if not usernames:
+        return
+    _ensure_enrich_columns(conn)
+    cache = PROJECT_ROOT / "data" / "api_cache"
+    cache.mkdir(parents=True, exist_ok=True)
+    print(f"  Enriching {len(usernames)} new player(s) via chess.com API…")
+    write_lock = threading.Lock()
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = [pool.submit(_enrich_one, u, cache) for u in usernames]
+        for fut in as_completed(futures):
+            row = fut.result()
+            with write_lock:
+                _write_enriched_row(conn, row)
+                conn.commit()
+    print(f"  Enrichment done.")
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -226,24 +394,30 @@ def process(slug: str) -> None:
 
     # tournaments: delete old row, insert new
     existing = pd.read_sql_query(
-        'SELECT * FROM titled_tuesday_tournaments WHERE slug = ?', conn, params=(slug,)
+        'SELECT * FROM titled_tuesday_tournaments WHERE tournament_slug = ?', conn, params=(slug,)
     )
-    conn.execute('DELETE FROM titled_tuesday_tournaments WHERE slug = ?', (slug,))
+    conn.execute('DELETE FROM titled_tuesday_tournaments WHERE tournament_slug = ?', (slug,))
 
     new_tourn = {
-        'date':        f'{date} 00:00:00' if date else None,
-        'time_local':  existing.iloc[0]['time_local'] if not existing.empty else None,
-        'title':       title,
-        'session':     existing.iloc[0]['session'] if not existing.empty else session,
-        'num_players': len(players),
-        'winner':      winner,
-        'slug':        slug,
-        'url':         url,
+        'date':            f'{date} 00:00:00' if date else None,
+        'time_local':      existing.iloc[0]['time_local'] if not existing.empty else None,
+        'title':           title,
+        'session':         existing.iloc[0]['session'] if not existing.empty else session,
+        'num_players':     len(players),
+        'winner':          winner,
+        'tournament_slug': slug,
+        'url':             url,
     }
     pd.DataFrame([new_tourn]).to_sql('titled_tuesday_tournaments', conn, if_exists='append', index=False)
     print(f'  tournaments: num_players={len(players)}, winner={winner}')
 
     conn.commit()
+
+    # enrich any usernames not yet in player_information
+    all_usernames = [p['username'] for p in players if p['username']]
+    new_usernames = _insert_new_players(conn, all_usernames)
+    enrich_players(conn, new_usernames)
+
     conn.close()
 
 

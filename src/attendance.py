@@ -1,25 +1,19 @@
 """
-Schedule-conflict and opportunism adjustments for TT attendance.
+Opportunism adjustment for TT attendance — SIDE MODULE.
 
-The single attendance model is decay-weighted EWMA + isotonic floor,
-computed in src.data.load_and_prepare().  This module adds three further
-adjustments via apply_schedule_adjustments():
+This module is no longer called from the main prediction pipeline.
+Attendance adjustments (cuts, conflict caps, nudges) are now stored in the
+attendance_adjustments DB table and applied by src.data.load_and_prepare()
+when a tourn_date is provided.
 
-  1. Hard cut (cut_players):
-     For each player with an unavoidable conflict on TT day, set p_participate
-     to 0.
+This module is preserved for ad-hoc analysis.  Call
+apply_schedule_adjustments() directly from a notebook if you want to
+experiment with the opportunism boost on top of the main predictions.
 
-  2. Conflict-rate cap (scheduling_conflict players):
-     For each player with a broadcast round on TT day, cap p_participate at
-     their historical TT attendance rate on past conflict dates.
-     Only lowers — never raises — their attendance probability.
-
-  3. Opportunism boost (non-conflicted players):
-     Fit an OLS slope of (attended ~ n_top_conflicted) per player on their
-     non-conflict TT dates, shrink via DerSimonian-Laird empirical Bayes,
-     and add  shrunk_slope × n_top_conflicted  to p_participate.
-     n_top_conflicted counts top players across both cut_players and
-     scheduling_conflict.  Only positive slopes are applied.
+Original three-step logic:
+  1. Hard cut (cut_players)         → p_participate = 0
+  2. Conflict-rate cap              → p = min(ewma, historical_conflict_rate)
+  3. Opportunism boost              → p += shrunk_slope × n_top_conflicted
 """
 
 import sqlite3
@@ -327,7 +321,8 @@ def apply_schedule_adjustments(
     account_groups       Maps canonical username → list of all chess.com accounts
                          for the same player (for attendance aggregation).
     top_player_threshold P_top10_given_play threshold to count as a 'top player'
-                         for n_top_conflicted (read from latest_model_predictions).
+                         for n_top_conflicted (read from latest_model_predictions_raw;
+                         run make_predictions.py first or this will raise).
     min_obs_opportunism  Minimum non-conflict TT dates required to estimate a slope.
 
     Returns a modified copy of p_participate.
@@ -388,17 +383,15 @@ def apply_schedule_adjustments(
     all_conflicted = list(dict.fromkeys(sc_usernames + cut_usernames))
 
     conn = sqlite3.connect(DB_PATH)
-    try:
-        pred_rows = conn.execute(
-            'SELECT username, P_top10_given_play FROM latest_model_predictions'
-        ).fetchall()
-        top_usernames = {u for u, pv in pred_rows if pv is not None and pv >= top_player_threshold}
-    except Exception:
-        top_usernames = set()
+    pred_rows = conn.execute(
+        'SELECT username, P_top10_given_play FROM latest_model_predictions_raw'
+    ).fetchall()
     conn.close()
 
+    top_usernames = {u for u, pv in pred_rows if pv is not None and pv >= top_player_threshold}
+
     if not top_usernames:
-        print('Opportunism: skipping (no prior latest_model_predictions found)')
+        print('Opportunism: skipping (latest_model_predictions_raw is empty)')
         return p
 
     n_top_conflicted = sum(1 for u in all_conflicted if u in top_usernames)
