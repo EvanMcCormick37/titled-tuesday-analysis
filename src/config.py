@@ -1,4 +1,5 @@
 """Central configuration for all Titled Tuesday analysis modules."""
+import os
 from pathlib import Path
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
@@ -20,6 +21,11 @@ MIN_APPEARANCES      = 0
 CHUNK                = 10_000
 SEED                 = 42
 _SCORE_COMPOSITE_SCALE = 10_000.0    # score*scale + tiebreak -> single sortable float
+
+# ── Kalshi API ────────────────────────────────────────────────────────────────
+KALSHI_API_KEY_ID       = os.environ.get("KALSHI_API_KEY_ID", "")
+KALSHI_PRIVATE_KEY_PATH = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "")
+KALSHI_ENV              = os.environ.get("KALSHI_ENV", "prod")  # "demo" | "prod"
 
 # ── Attendance model ──────────────────────────────────────────────────────────
 DATA_START = '2025-09-02'   # single-session era start; pre-era data excluded from ML training

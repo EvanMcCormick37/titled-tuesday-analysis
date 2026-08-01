@@ -2,12 +2,9 @@
 """
 Generate official MC model predictions for the next Titled Tuesday.
 
-Attendance adjustments (cuts, conflict caps, nudges, overrides) are now
-stored in the attendance_adjustments DB table.  Populate or update that
-table before running this script:
-
-    python scripts/migrate_adjustments.py      # one-time seed
-    # or manage rows from notebooks/command-center.ipynb
+Attendance adjustments (cut_players, keep_players, p_participate_overrides)
+are passed directly to run_predictions().  Edit this file or use
+notebooks/command-center.ipynb to set them before running.
 
 Usage
 -----
@@ -25,7 +22,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 warnings.filterwarnings('ignore')
 
-from src.pipeline import run_predictions, save_predictions, next_tourn_date
+from src.pipeline import run_predictions, next_tourn_date
 
 
 def main():
@@ -35,8 +32,7 @@ def main():
     args = parser.parse_args()
 
     tourn_date = args.date or next_tourn_date()
-    run = run_predictions(tourn_date)
-    save_predictions(run, tourn_date)
+    run_predictions(tourn_date, save_official=True)
 
 
 if __name__ == '__main__':

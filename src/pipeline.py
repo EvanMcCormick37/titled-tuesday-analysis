@@ -1,16 +1,18 @@
 """
 Top-level pipeline entry point for Titled Tuesday MC predictions.
 
-run_predictions(tourn_date) is the single function called by make_predictions.py
-and the command-center notebook.  It chains:
-  load_and_prepare (no adjustments) → build_player_pool_score → run_simulation_score (raw)
-  apply_db_adjustments              → run_simulation_score (adjusted)
+run_predictions() is the single function called by the command-center notebook
+and make_predictions.py.  It chains:
 
-Both runs share the same player pool (hist_composites, hist_wts) built once from
-historical data.  Only p_play differs between the two runs.
+  load_and_prepare() (raw, no adjustments)
+  → build_player_pool_score
+  → run_simulation_score          (raw)
+  → apply cut_players / keep_players / p_participate_overrides in memory
+  → run_simulation_score          (adjusted)
+  → optionally save to DB         (save_official=True)
 
-Returns a PredictionRun namedtuple with both result sets and the raw simulation
-arrays needed for portfolio P&L analysis.
+Both simulations share the same player pool built once from historical data.
+Only p_play differs between the two runs.
 """
 
 import sqlite3
@@ -19,39 +21,51 @@ from typing import NamedTuple
 import numpy as np
 import pandas as pd
 
-from .config import DB_PATH, N_SIMS, N_VALUES
-from .data import load_and_prepare, apply_db_adjustments
+from .config import DB_PATH, N_SIMS
+from .data import load_and_prepare, get_username_mappings
 from .simulation import build_player_pool_score, run_simulation_score, build_results
 
 PRED_N_VALUES = [1, 3, 5, 8, 10]
 
 
 class PredictionRun(NamedTuple):
-    """Output of run_predictions().  Carries both result sets and simulation arrays."""
-    results:         pd.DataFrame   # adjusted predictions (P_top{N}, P_top{N}_given_play, etc.)
-    results_raw:     pd.DataFrame   # unadjusted predictions (no schedule overrides/nudges)
-    players:         list           # player list in simulation order
+    """Output of run_predictions(). Carries both result sets and simulation arrays."""
+    results:         pd.DataFrame   # adjusted predictions
+    results_raw:     pd.DataFrame   # unadjusted predictions (pure model estimates)
+    players:         list
     p_play:          np.ndarray     # adjusted p_participate per player
-    hist_composites: list           # per-player historical (score, tiebreak) composite arrays
-    hist_wts:        list           # per-player skill-decay weights
+    hist_composites: list
+    hist_wts:        list
 
 
-def run_predictions(tourn_date: str, n_sims: int = N_SIMS) -> PredictionRun:
-    """Run the full MC pipeline for tourn_date, producing adjusted and raw predictions.
+def run_predictions(
+    tourn_date: str,
+    cut_players: list[str] | None = None,
+    keep_players: list[str] | None = None,
+    p_participate_overrides: dict[str, float] | None = None,
+    save_official: bool = False,
+    n_sims: int = N_SIMS,
+) -> PredictionRun:
+    """Run the full MC pipeline for tourn_date.
 
-    Two simulations are run back-to-back sharing the same player pool:
-      1. Raw — no attendance adjustments; reflects pure skill-based attendance rates.
-         Saved to latest_model_predictions_raw.
-      2. Adjusted — active nudges and overrides from attendance_adjustments applied.
-         Saved to latest_model_predictions.
+    Attendance adjustments are applied via three in-memory parameters (all take
+    player_information.player_name strings, not chess.com usernames):
 
-    The raw results are used to sort cut/override players by baseline P_top1 strength
-    in the adjustment editor, where the adjusted values would all be zero for cut players.
+      cut_players              → p_participate = 0.0
+      p_participate_overrides  → p_participate = specified value (overrides cuts)
+      keep_players             → p_participate = 1.0 (highest priority)
+
+    save_official=True writes results to the DB and records which players had
+    their attendance manually adjusted (attendance_altered column).
     """
+    cut_players             = cut_players or []
+    keep_players            = keep_players or []
+    p_participate_overrides = p_participate_overrides or {}
+
     print(f'Predicting for tournament date: {tourn_date}')
 
-    # ── Load base data WITHOUT adjustments ────────────────────────────────────
-    df, p_raw, app_counts = load_and_prepare(tourn_date=tourn_date, apply_adjustments=False)
+    # ── Load base data (no adjustments) ──────────────────────────────────────
+    df, p_raw, app_counts = load_and_prepare()
     players, p_play_raw, hist_composites, hist_wts = build_player_pool_score(
         df, p_raw, app_counts, min_appearances=5
     )
@@ -67,10 +81,45 @@ def run_predictions(tourn_date: str, n_sims: int = N_SIMS) -> PredictionRun:
         n_sims=n_sims, n_values=PRED_N_VALUES,
     )
 
-    # ── Apply adjustments, re-simulate ───────────────────────────────────────
-    p_adjusted = apply_db_adjustments(p_raw, tourn_date)
-    p_play_adj = p_adjusted.loc[players].to_numpy(dtype=np.float64)
+    # ── Resolve player names → usernames, build override map ─────────────────
+    _, PLAYER_TO_USERNAME = get_username_mappings()
+    overrides: dict[str, float] = {}
 
+    for name in cut_players:
+        u = PLAYER_TO_USERNAME.get(name)
+        if u is None:
+            print(f'  Warning: cut_players entry {name!r} not found in player_information')
+        else:
+            overrides[u] = 0.0
+
+    for name, val in p_participate_overrides.items():
+        u = PLAYER_TO_USERNAME.get(name)
+        if u is None:
+            print(f'  Warning: p_participate_overrides key {name!r} not found in player_information')
+        else:
+            overrides[u] = float(val)
+
+    for name in keep_players:
+        u = PLAYER_TO_USERNAME.get(name)
+        if u is None:
+            print(f'  Warning: keep_players entry {name!r} not found in player_information')
+        else:
+            overrides[u] = 1.0
+
+    # ── Apply overrides ───────────────────────────────────────────────────────
+    p_adjusted = p_raw.copy()
+    altered: set[str] = set()
+    for username, val in overrides.items():
+        if username in p_adjusted.index:
+            p_adjusted[username] = val
+            altered.add(username)
+
+    if altered:
+        n_cuts = sum(1 for u in altered if p_adjusted[u] == 0.0)
+        print(f'  Applying {len(altered)} override(s) ({n_cuts} cut(s) to 0, {len(altered) - n_cuts} value(s))...')
+
+    # ── Adjusted simulation ───────────────────────────────────────────────────
+    p_play_adj = p_adjusted.loc[players].to_numpy(dtype=np.float64)
     print(f'  Simulating {n_sims:,} tournaments (adjusted)...')
     plays_ct_adj, topn_ct_adj = run_simulation_score(
         players, p_play_adj, hist_composites, hist_wts,
@@ -81,21 +130,25 @@ def run_predictions(tourn_date: str, n_sims: int = N_SIMS) -> PredictionRun:
         n_sims=n_sims, n_values=PRED_N_VALUES,
     )
 
+    if save_official:
+        _save_to_db(results, results_raw, tourn_date, altered)
+
     return PredictionRun(results, results_raw, players, p_play_adj, hist_composites, hist_wts)
 
 
-def save_predictions(run: PredictionRun, tourn_date: str) -> None:
-    """Write both prediction runs to the DB.
-
-    latest_model_predictions     — adjusted (with schedule overrides/nudges)
-    latest_model_predictions_raw — unadjusted (pure skill-based attendance rates)
-    """
+def _save_to_db(
+    results: pd.DataFrame,
+    results_raw: pd.DataFrame,
+    tourn_date: str,
+    altered: set[str],
+) -> None:
     keep_cols = ['p_participate'] + [f'P_top{k}_given_play' for k in PRED_N_VALUES]
 
-    out = run.results[keep_cols].reset_index()
+    out = results[keep_cols].reset_index()
     out['tourn_date'] = tourn_date
+    out['attendance_altered'] = out['username'].isin(altered).astype(int)
 
-    out_raw = run.results_raw[keep_cols].reset_index()
+    out_raw = results_raw[keep_cols].reset_index()
     out_raw['tourn_date'] = tourn_date
 
     conn = sqlite3.connect(DB_PATH)
@@ -103,8 +156,23 @@ def save_predictions(run: PredictionRun, tourn_date: str) -> None:
     out_raw.to_sql('latest_model_predictions_raw', conn, if_exists='replace', index=False)
     conn.close()
 
-    print(f'Saved {len(out):,} rows -> latest_model_predictions (adjusted)')
+    n_altered = int(out['attendance_altered'].sum())
+    print(f'Saved {len(out):,} rows -> latest_model_predictions ({n_altered} attendance_altered)')
     print(f'Saved {len(out_raw):,} rows -> latest_model_predictions_raw (unadjusted)')
+
+
+def drop_attendance_adjustments_table() -> None:
+    """One-time migration: drop the attendance_adjustments table.
+
+    This table is no longer used. Adjustments are now passed directly to
+    run_predictions() as cut_players / keep_players / p_participate_overrides.
+    Call this once after verifying you no longer need the historical rows.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute('DROP TABLE IF EXISTS attendance_adjustments')
+    conn.commit()
+    conn.close()
+    print('Dropped attendance_adjustments table.')
 
 
 def next_tourn_date() -> str:

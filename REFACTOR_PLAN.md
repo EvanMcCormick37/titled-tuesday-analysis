@@ -72,6 +72,7 @@ CREATE TABLE scheduling_config (
 ### 1.4 Migration script: `scripts/migrate_overrides.py`
 
 One-time script that:
+
 1. Creates the two new tables
 2. Reads current hardcoded `CUT_PLAYERS` / `KEEP_PLAYERS` from `make_predictions.py` and seeds `scheduling_config` with them
 3. Prints a summary of what was migrated
@@ -87,15 +88,18 @@ One-time script that:
 Sections:
 
 **Section 1 — Data freshness check**
+
 - Query DB for latest `titled_tuesday_tournaments.date` and compare to today
 - Warn if latest tournament data is more than 8 days old
 - Show last 3 imported tournaments as a sanity check
 
 **Section 2 — Run predictions**
+
 - Call `make_predictions.py` as a subprocess (or import and call its main function directly if refactored to support that)
 - Show the prediction timestamp and player count
 
 **Section 3 — Attendance override editor**
+
 - Load `attendance_overrides` from DB and display current active overrides as a DataFrame
 - A cell below with a helper function:
   ```python
@@ -105,17 +109,20 @@ Sections:
 - Another cell to clear overrides for a given player
 
 **Section 4 — Top predictions table**
+
 - Load `latest_model_predictions` from DB
 - Display sorted by `P_top3` (or a configurable threshold)
 - Highlight rows where an override was applied (join against `attendance_overrides`)
 - Show `p_participate`, `P_top1_given_play`, `P_top3`, `P_top5`, `P_top10` in a clean table
 
 **Section 5 — Portfolio analysis**
+
 - Load Kalshi portfolio from DB
 - Run `run_portfolio_mc_score()` and `pnl_summary()`
 - Show expected P&L distribution with quartiles
 
 **Section 6 — Best new trades**
+
 - Compare model probabilities against Kalshi market prices (requires fetching live prices — see Phase 4)
 - Until the Kalshi API is wired up, accept a manually-updated `current_prices.csv` as input
 - Show edge = `(model_prob - market_yes_ask) / market_yes_ask` for each position
@@ -133,25 +140,30 @@ Sections:
 Sections:
 
 **Section 1 — Player lookup**
+
 - Input cell: `PLAYER = "MagnusCarlsen"`
 - Show: username, aliases, title, rating history from `standings`
 
 **Section 2 — Attendance history**
+
 - Bar chart: attended / did-not-attend per month, last 52 weeks
 - Rolling 8-week attendance rate overlaid
 - Mark dates where you have a scheduling conflict logged in DB
 
 **Section 3 — Performance when present**
+
 - Percentile rank distribution histogram (last 2 years)
 - Score and tiebreak trends
 - "Best finishes" table
 
 **Section 4 — Model vs. reality**
+
 - Load `historical_predictions` and `titled_tuesday_standings`
 - For this player, show: model's `P_top3` prediction vs. actual finish each week
 - Calibration plot: how accurate are the model's probability estimates?
 
 **Section 5 — Peer comparison**
+
 - Input: `PEERS = ["Hikaru", "Firouzja2003", "lachesisq"]`
 - Side-by-side attendance rate and top-3 finish rate comparison
 
@@ -164,6 +176,7 @@ Sections:
 ### File: `src/kalshi_api.py`
 
 **Authentication:**
+
 ```python
 class KalshiClient:
     def __init__(self, api_key_id: str, private_key_path: str, env: str = "prod")
@@ -175,6 +188,7 @@ class KalshiClient:
 Kalshi uses RSA-signed JWT for authentication. Store `KALSHI_API_KEY_ID` and path to the private key PEM in environment variables (not in config.py), loaded via `python-dotenv`.
 
 **Market data:**
+
 ```python
 def get_market(self, ticker: str) -> dict         # single market price + metadata
 def get_markets_by_event(self, event_ticker: str) -> list[dict]
@@ -182,12 +196,14 @@ def get_titled_tuesday_markets(self, date: str) -> list[dict]  # convenience wra
 ```
 
 **Portfolio:**
+
 ```python
 def get_positions(self) -> pd.DataFrame           # all current positions
 def get_fills(self, ticker: str) -> list[dict]    # fill history for a market
 ```
 
 **Order placement (with guard rails):**
+
 ```python
 def place_order(
     self,
@@ -202,6 +218,7 @@ def place_order(
 The `dry_run=True` default is critical — you should have to explicitly pass `dry_run=False` to actually place an order.
 
 **Config additions to `src/config.py`:**
+
 ```python
 KALSHI_API_KEY_ID = os.environ.get("KALSHI_API_KEY_ID", "")
 KALSHI_PRIVATE_KEY_PATH = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "")
@@ -236,6 +253,7 @@ Add a `.env.example` file to the repo root documenting the required variables.
 **Goal:** A live-updating view of the model's top trade recommendations, visible without opening Jupyter.
 
 **Technology choice — Streamlit** (simplest to build, runs locally):
+
 - `dashboard/app.py` — single-file Streamlit app
 - Reads directly from `titled_tuesday.db`
 - Pages: (1) Top trades, (2) Player attendance table with override controls, (3) Portfolio P&L, (4) Backtest results
@@ -248,20 +266,21 @@ No deployment needed initially — local only. If you later want it accessible r
 
 ## Implementation Order
 
-| Phase | What | Effort | Priority |
-|-------|------|--------|----------|
-| 1 | Attendance override table + load_and_prepare() patch + scheduling_config | ~3h | **This week** |
-| 2 | Command center notebook | ~2h | **This week** |
-| 3 | Player performance notebook | ~2h | Next |
-| 4 | `src/kalshi_api.py` (auth + market data + order stub) | ~3h | Next |
-| 5 | Live price fetch + recommend_trades script | ~2h | After 4 |
-| 6 | Streamlit dashboard | ~4h | Eventually |
+| Phase | What                                                                     | Effort | Priority      |
+| ----- | ------------------------------------------------------------------------ | ------ | ------------- |
+| 1     | Attendance override table + load_and_prepare() patch + scheduling_config | ~3h    | **This week** |
+| 2     | Command center notebook                                                  | ~2h    | **This week** |
+| 3     | Player performance notebook                                              | ~2h    | Next          |
+| 4     | `src/kalshi_api.py` (auth + market data + order stub)                    | ~3h    | Next          |
+| 5     | Live price fetch + recommend_trades script                               | ~2h    | After 4       |
+| 6     | Streamlit dashboard                                                      | ~4h    | Eventually    |
 
 ---
 
 ## Files changed / created (summary)
 
 **New files:**
+
 - `scripts/migrate_overrides.py` — DB migration (new tables + seed from hardcoded lists)
 - `notebooks/command-center.ipynb` — primary weekly workflow
 - `notebooks/player-performance.ipynb` — player research tool
@@ -272,11 +291,13 @@ No deployment needed initially — local only. If you later want it accessible r
 - `.env.example` — documents required environment variables
 
 **Modified files:**
+
 - `src/data.py` — add `_load_active_overrides()` + apply at end of `load_and_prepare()`
 - `src/config.py` — add Kalshi API env var refs
 - `scripts/make_predictions.py` — read `scheduling_config` from DB instead of hardcoded lists
 
 **Unchanged:**
+
 - `src/simulation.py`, `src/attendance.py`, `src/portfolio.py`
 - `scripts/run_backtest.py`, `scripts/backtest_pnl.py`
 - All existing notebooks (kept as-is; command-center replaces the ad-hoc workflow)

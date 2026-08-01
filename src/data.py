@@ -17,61 +17,6 @@ from .config import (
 )
 
 
-# ── Attendance adjustment helpers ─────────────────────────────────────────────
-
-def _load_active_adjustments(conn: sqlite3.Connection, tourn_date: str) -> tuple[dict, dict]:
-    """Load active nudges and overrides from attendance_adjustments for tourn_date.
-
-    Returns (nudges, overrides):
-      nudges   = {username: log_odds_delta}  applied before overrides
-      overrides = {username: probability}    final value, applied last
-    """
-    exists = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='attendance_adjustments'"
-    ).fetchone()
-    if not exists:
-        return {}, {}
-
-    rows = conn.execute(
-        "SELECT username, type, value FROM attendance_adjustments "
-        "WHERE tourn_date = ? AND is_active = 1",
-        (tourn_date,),
-    ).fetchall()
-
-    nudges: dict[str, float] = {}
-    overrides: dict[str, float] = {}
-    for username, adj_type, value in rows:
-        if adj_type == 'nudge':
-            nudges[username] = float(value)
-        else:
-            overrides[username] = float(value)
-    return nudges, overrides
-
-
-def _apply_nudges(p: pd.Series, nudges: dict) -> pd.Series:
-    """Shift p_participate in log-odds space by per-player deltas."""
-    if not nudges:
-        return p
-    p = p.copy()
-    for username, delta in nudges.items():
-        if username not in p.index:
-            continue
-        pv = float(np.clip(p[username], 1e-7, 1.0 - 1e-7))
-        logit = np.log(pv / (1.0 - pv))
-        p[username] = float(1.0 / (1.0 + np.exp(-np.clip(logit + delta, -30, 30))))
-    return p
-
-
-def _apply_overrides(p: pd.Series, overrides: dict) -> pd.Series:
-    """Set p_participate to exact values, bypassing all model estimates."""
-    if not overrides:
-        return p
-    p = p.copy()
-    for username, value in overrides.items():
-        if username in p.index:
-            p[username] = float(value)
-    return p
-
 # ── Username / player-name mapping ────────────────────────────────────────────
 
 # Alternative player names used on betting lines that differ from player_information.
@@ -153,49 +98,20 @@ def get_username_mappings() -> tuple[dict, dict]:
 
 # ── Main data loader ──────────────────────────────────────────────────────────
 
-def apply_db_adjustments(p_participate: pd.Series, tourn_date: str) -> pd.Series:
-    """Apply active nudges and overrides from attendance_adjustments for tourn_date.
-
-    Nudges are applied first (log-odds shift), then overrides (exact value).
-    Returns a new Series; the input is not mutated.
-    """
-    conn = sqlite3.connect(DB_PATH)
-    nudges, overrides = _load_active_adjustments(conn, tourn_date)
-    conn.close()
-    p = p_participate
-    if nudges:
-        print(f'  Applying {len(nudges)} nudge(s) (log-odds delta)...')
-        p = _apply_nudges(p, nudges)
-    if overrides:
-        n_cuts = sum(1 for v in overrides.values() if v == 0.0)
-        print(f'  Applying {len(overrides)} override(s) '
-              f'({n_cuts} cut(s) to 0, {len(overrides) - n_cuts} value(s))...')
-        p = _apply_overrides(p, overrides)
-    return p
-
-
 def load_and_prepare(scheduling_conflict=None, cut_players=None, keep_players=None,
                      canonical_accounts=None, account_groups=None,
                      top_player_threshold=0.10, min_obs_opportunism=20,
-                     as_of=None, tourn_date=None, apply_adjustments=True):
+                     as_of=None):
     """
     Load standings from DB and compute per-player MC inputs.
 
-    When tourn_date is provided, attendance adjustments are read from the
-    attendance_adjustments DB table:
-      - 'nudge' rows    : shift p_participate in log-odds space (applied first)
-      - 'override' rows : set p_participate to an exact value (applied last)
-
-    When tourn_date is not provided, falls back to the legacy scheduling
-    parameters (scheduling_conflict, cut_players, keep_players) which call
-    src.attendance.apply_schedule_adjustments().  This path is preserved for
-    backward compatibility with the backtest pipeline and old notebooks.
+    Attendance adjustments (cut_players, keep_players, p_participate_overrides)
+    are handled by the caller (run_predictions in pipeline.py) after this
+    function returns.  The legacy scheduling parameters below are kept for
+    backward compatibility with the backtest pipeline.
 
     Parameters
     ----------
-    tourn_date           ISO date string for the tournament being predicted.
-                         When set, adjustments come from the DB; legacy params
-                         are ignored.
     scheduling_conflict  [legacy] Player names with a broadcast conflict.
     cut_players          [legacy] Player names forced to p_participate = 0.
     keep_players         [legacy] Player names forced to p_participate = 1.0.
@@ -250,24 +166,20 @@ def load_and_prepare(scheduling_conflict=None, cut_players=None, keep_players=No
 
     print('  p_participate: decay-weighted EWMA with isotonic floor (p < 0.05)')
 
-    if tourn_date:
-        if apply_adjustments:
-            p_participate = apply_db_adjustments(p_participate, tourn_date)
-    else:
-        # ── Legacy scheduling-param path (backward compat) ───────────────────
-        from .attendance import apply_schedule_adjustments
-        _, PLAYER_TO_USERNAME = get_username_mappings()
-        keep_users = [PLAYER_TO_USERNAME[p] for p in keep_players if p in PLAYER_TO_USERNAME]
-        p_participate[p_participate.index.isin(keep_users)] = 1.0
-        p_participate = apply_schedule_adjustments(
-            p_participate,
-            scheduling_conflict,
-            cut_players=cut_players,
-            canonical_accounts=canonical_accounts,
-            account_groups=account_groups,
-            top_player_threshold=top_player_threshold,
-            min_obs_opportunism=min_obs_opportunism,
-        )
+    # ── Legacy scheduling-param path (backward compat for backtest) ──────────
+    from .attendance import apply_schedule_adjustments
+    _, PLAYER_TO_USERNAME = get_username_mappings()
+    keep_users = [PLAYER_TO_USERNAME[p] for p in keep_players if p in PLAYER_TO_USERNAME]
+    p_participate[p_participate.index.isin(keep_users)] = 1.0
+    p_participate = apply_schedule_adjustments(
+        p_participate,
+        scheduling_conflict,
+        cut_players=cut_players,
+        canonical_accounts=canonical_accounts,
+        account_groups=account_groups,
+        top_player_threshold=top_player_threshold,
+        min_obs_opportunism=min_obs_opportunism,
+    )
 
     conn.close()
     app_counts = df.groupby('username')['tournament_slug'].nunique().rename('appearances')

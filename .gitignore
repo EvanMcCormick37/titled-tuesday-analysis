@@ -12,3 +12,7 @@ models
 
 # Data
 data
+
+# Sensitive Info: .env file and portfolio API key
+.env
+portfolio-key.txt
