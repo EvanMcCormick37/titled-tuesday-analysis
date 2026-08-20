@@ -443,7 +443,7 @@ def main() -> int:
     print(f"\n{len(uniq)} player/tournament pair(s) to review manually:\n")
 
     for c in uniq:
-        print(f"  {c['input_name']:<32}  (match: {c['score']:.2f})  {c['matched_player']}")
+        print(f"  {c['input_name']:<32}  (match: {c['score']:.2f})  {c['player']}")
         print(f"    {c['tournament']}")
         print(f"    ends: {c['end_date'] or 'unknown':<12}  {c['url']}")
 

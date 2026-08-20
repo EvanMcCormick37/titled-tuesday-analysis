@@ -106,7 +106,7 @@ def load_and_prepare(scheduling_conflict=None, cut_players=None, keep_players=No
     Load standings from DB and compute per-player MC inputs.
 
     Attendance adjustments (cut_players, keep_players, p_participate_overrides)
-    are handled by the caller (run_predictions in pipeline.py) after this
+    are handled by the caller (run_adjusted in pipeline.py) after this
     function returns.  The legacy scheduling parameters below are kept for
     backward compatibility with the backtest pipeline.
 

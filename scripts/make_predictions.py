@@ -3,7 +3,7 @@
 Generate official MC model predictions for the next Titled Tuesday.
 
 Attendance adjustments (cut_players, keep_players, p_participate_overrides)
-are passed directly to run_predictions().  Edit this file or use
+are passed directly to run_adjusted().  Edit this file or use
 notebooks/command-center.ipynb to set them before running.
 
 Usage
@@ -22,7 +22,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 warnings.filterwarnings('ignore')
 
-from src.pipeline import run_predictions, next_tourn_date
+from src.pipeline import run_raw, run_adjusted, next_tourn_date
 
 
 def main():
@@ -32,7 +32,8 @@ def main():
     args = parser.parse_args()
 
     tourn_date = args.date or next_tourn_date()
-    run_predictions(tourn_date, save_official=True)
+    raw_run = run_raw(tourn_date, save_to_db=True)
+    run_adjusted(tourn_date, raw_run=raw_run, save_official=True)
 
 
 if __name__ == '__main__':
