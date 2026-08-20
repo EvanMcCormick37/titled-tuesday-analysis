@@ -6,10 +6,10 @@ and make_predictions.py.  It chains:
 
   load_and_prepare() (raw, no adjustments)
   → build_player_pool_score
-  → run_simulation_score          (raw)
-  → apply cut_players / keep_players / p_participate_overrides in memory
-  → run_simulation_score          (adjusted)
-  → optionally save to DB         (save_official=True)
+  → run_simulation_score                           (raw)
+  → apply p_nudges / cut_players / keep_players / p_participate_overrides in memory
+  → run_simulation_score                           (adjusted)
+  → optionally save to DB                          (save_official=True)
 
 Both simulations share the same player pool built once from historical data.
 Only p_play differs between the two runs.
@@ -43,17 +43,19 @@ def run_predictions(
     cut_players: list[str] | None = None,
     keep_players: list[str] | None = None,
     p_participate_overrides: dict[str, float] | None = None,
+    p_nudges: dict[str, float] | None = None,
     save_official: bool = False,
     n_sims: int = N_SIMS,
 ) -> PredictionRun:
     """Run the full MC pipeline for tourn_date.
 
-    Attendance adjustments are applied via three in-memory parameters (all take
+    Attendance adjustments are applied in priority order (all take
     player_information.player_name strings, not chess.com usernames):
 
-      cut_players              → p_participate = 0.0
+      p_nudges                 → shift p_participate in log-odds space (applied first)
+      cut_players              → p_participate = 0.0  (overrides nudges)
       p_participate_overrides  → p_participate = specified value (overrides cuts)
-      keep_players             → p_participate = 1.0 (highest priority)
+      keep_players             → p_participate = 1.0  (highest priority)
 
     save_official=True writes results to the DB and records which players had
     their attendance manually adjusted (attendance_altered column).
@@ -61,6 +63,7 @@ def run_predictions(
     cut_players             = cut_players or []
     keep_players            = keep_players or []
     p_participate_overrides = p_participate_overrides or {}
+    p_nudges                = p_nudges or {}
 
     print(f'Predicting for tournament date: {tourn_date}')
 
@@ -81,10 +84,18 @@ def run_predictions(
         n_sims=n_sims, n_values=PRED_N_VALUES,
     )
 
-    # ── Resolve player names → usernames, build override map ─────────────────
+    # ── Resolve player names → usernames ─────────────────────────────────────
     _, PLAYER_TO_USERNAME = get_username_mappings()
-    overrides: dict[str, float] = {}
 
+    nudges: dict[str, float] = {}
+    for name, delta in p_nudges.items():
+        u = PLAYER_TO_USERNAME.get(name)
+        if u is None:
+            print(f'  Warning: p_nudges key {name!r} not found in player_information')
+        else:
+            nudges[u] = float(delta)
+
+    overrides: dict[str, float] = {}
     for name in cut_players:
         u = PLAYER_TO_USERNAME.get(name)
         if u is None:
@@ -106,17 +117,27 @@ def run_predictions(
         else:
             overrides[u] = 1.0
 
-    # ── Apply overrides ───────────────────────────────────────────────────────
+    # ── Apply adjustments (nudges first, then hard overrides) ─────────────────
     p_adjusted = p_raw.copy()
     altered: set[str] = set()
+
+    for username, delta in nudges.items():
+        if username in p_adjusted.index:
+            pv = float(np.clip(p_adjusted[username], 1e-7, 1.0 - 1e-7))
+            logit = np.log(pv / (1.0 - pv))
+            p_adjusted[username] = float(1.0 / (1.0 + np.exp(-np.clip(logit + delta, -30, 30))))
+            altered.add(username)
+
     for username, val in overrides.items():
         if username in p_adjusted.index:
             p_adjusted[username] = val
             altered.add(username)
 
-    if altered:
-        n_cuts = sum(1 for u in altered if p_adjusted[u] == 0.0)
-        print(f'  Applying {len(altered)} override(s) ({n_cuts} cut(s) to 0, {len(altered) - n_cuts} value(s))...')
+    if nudges:
+        print(f'  Applying {len(nudges)} nudge(s) (log-odds shift)...')
+    if overrides:
+        n_cuts = sum(1 for v in overrides.values() if v == 0.0)
+        print(f'  Applying {len(overrides)} hard override(s) ({n_cuts} cut(s) to 0, {len(overrides) - n_cuts} value(s))...')
 
     # ── Adjusted simulation ───────────────────────────────────────────────────
     p_play_adj = p_adjusted.loc[players].to_numpy(dtype=np.float64)

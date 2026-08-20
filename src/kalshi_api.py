@@ -4,10 +4,12 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional, Union
+from urllib.parse import urlparse
 
 import pandas as pd
 import requests
@@ -55,6 +57,7 @@ class KalshiClient:
     ):
         self.api_key_id = api_key_id or os.environ.get("KALSHI_API_KEY_ID", "")
         self.base = _PROD_BASE if env == "prod" else _DEMO_BASE
+        self._base_path = urlparse(self.base).path  # e.g. "/trade-api/v2"
         self._session = requests.Session()
 
         _key_path = private_key_path or os.environ.get("KALSHI_PRIVATE_KEY_PATH", "")
@@ -75,7 +78,7 @@ class KalshiClient:
         if not self._private_key or not self.api_key_id:
             raise RuntimeError("API key ID and private key are required for authenticated requests.")
         ts_ms = str(int(time.time() * 1000))
-        msg = (ts_ms + method.upper() + path).encode("utf-8")
+        msg = (ts_ms + method.upper() + self._base_path + path).encode("utf-8")
         sig = self._private_key.sign(
             msg,
             padding.PSS(
@@ -104,6 +107,12 @@ class KalshiClient:
         if auth:
             headers.update(self._sign_request("POST", path, body_str))
         resp = self._session.post(self.base + path, data=body_str, headers=headers)
+        resp.raise_for_status()
+        return resp.json()
+
+    def _delete(self, path: str, auth: bool = True) -> dict:
+        headers = self._sign_request("DELETE", path) if auth else {}
+        resp = self._session.delete(self.base + path, headers=headers)
         resp.raise_for_status()
         return resp.json()
 
@@ -189,9 +198,108 @@ class KalshiClient:
                 break
         return pd.DataFrame(positions)
 
+    def get_tt_positions_df(
+        self,
+        event_date: Union[date, str, None] = None,
+        sleep: float = 0.05,
+    ) -> pd.DataFrame:
+        """Fetch current Titled Tuesday positions for event_date from the Kalshi API.
+
+        Returns a DataFrame with columns ready for build_portfolio():
+            ticker      — market ticker
+            marketTitle — player display name
+            n           — top-N threshold (1, 3, 5, 8 …)
+            position    — 'Yes' or 'No'
+            volume      — net contracts held
+            cost        — total market exposure ($)
+            avg_price   — cost / volume ($ per contract)
+
+        Raises KeyError if the positions response is missing expected fields.
+        If market_exposure appears to be in cents (values >> expected), divide by 100.
+        """
+        date_str = _to_kalshi_date(event_date)
+
+        positions_df = self.get_positions()
+        if positions_df.empty:
+            return pd.DataFrame()
+
+        # Filter to TT markets for this date, active positions only
+        tt_pat = re.compile(
+            rf"(?:KXTITLEDTUESDAY-{date_str}|KXTITLEDTUESTOP-{date_str}T\d+)-"
+        )
+        mask = positions_df["ticker"].apply(lambda t: bool(tt_pat.search(t)))
+        tt = positions_df[mask].copy()
+        if tt.empty:
+            return pd.DataFrame()
+
+        pos_col = "position_fp"
+        exp_col = "market_exposure_dollars"
+        for col in (pos_col, exp_col):
+            if col not in tt.columns:
+                raise KeyError(f"Expected '{col}' in positions; got {list(tt.columns)}")
+
+        tt = tt[tt[pos_col].astype(float) != 0].copy()
+        if tt.empty:
+            return pd.DataFrame()
+
+        # Parse N from ticker
+        def _n(ticker: str) -> Optional[int]:
+            if f"KXTITLEDTUESDAY-{date_str}-" in ticker:
+                return 1
+            m = re.search(rf"KXTITLEDTUESTOP-{date_str}T(\d+)-", ticker)
+            return int(m.group(1)) if m else None
+
+        tt["n"] = tt["ticker"].apply(_n)
+        tt = tt[tt["n"].notna()].copy()
+        tt["n"] = tt["n"].astype(int)
+
+        # Direction and volume from signed position (positive=YES, negative=NO)
+        signed = tt[pos_col].astype(float)
+        tt["position"] = signed.apply(lambda p: "Yes" if p > 0 else "No")
+        tt["volume"] = signed.abs()
+
+        # Cost from market_exposure_dollars
+        tt["cost"] = tt[exp_col].astype(float)
+        tt["avg_price"] = tt["cost"] / tt["volume"]
+
+        # Fetch player display name per ticker
+        market_titles: dict[str, str] = {}
+        for ticker in tt["ticker"]:
+            try:
+                mkt = self.get_market(ticker).get("market", {})
+                market_titles[ticker] = mkt.get("yes_sub_title", "")
+            except Exception as e:
+                print(f"  Warning: could not fetch {ticker}: {e}")
+                market_titles[ticker] = ""
+            if sleep:
+                time.sleep(sleep)
+
+        tt["marketTitle"] = tt["ticker"].map(market_titles)
+
+        return tt[["ticker", "marketTitle", "n", "position", "volume", "cost", "avg_price"]].reset_index(drop=True)
+
     def get_fills(self, ticker: str) -> list[dict]:
         data = self._get("/portfolio/fills", params={"ticker": ticker}, auth=True)
         return data.get("fills", [])
+
+    def get_open_orders(self) -> list[dict]:
+        """Return all resting (open) orders across the portfolio."""
+        orders = []
+        cursor = None
+        while True:
+            params = {"status": "resting", "limit": 200}
+            if cursor:
+                params["cursor"] = cursor
+            data = self._get("/portfolio/orders", params=params, auth=True)
+            orders.extend(data.get("orders", []))
+            cursor = data.get("cursor")
+            if not cursor:
+                break
+        return orders
+
+    def cancel_order(self, order_id: str) -> dict:
+        """Cancel a resting order by ID."""
+        return self._delete(f"/portfolio/events/orders/{order_id}")
 
     # ── Order placement ───────────────────────────────────────────────────────────
 
@@ -201,9 +309,16 @@ class KalshiClient:
         side: str,
         count: int,
         price: int,
+        expiration_ts: Optional[int] = None,
         dry_run: bool = True,
     ) -> dict:
-        """Place a limit order. dry_run=True (default) only prints — does not submit."""
+        """Place a resting limit order via the Kalshi V2 orders endpoint.
+
+        side:          'yes' (bid) or 'no' (ask — sell YES = buy NO)
+        price:         bid price in cents (1–99); for NO side this is the NO price,
+                       converted internally to YES ask price sent to the API
+        expiration_ts: Unix timestamp in seconds for GTC expiry. None = no expiry.
+        """
         if side not in ("yes", "no"):
             raise ValueError(f"side must be 'yes' or 'no', got {side!r}")
         if not (1 <= price <= 99):
@@ -211,17 +326,67 @@ class KalshiClient:
         if count < 1:
             raise ValueError(f"count must be >= 1, got {count}")
 
-        body = {
-            "action": "buy",
-            "count":  count,
-            "ticker": ticker,
-            "type":   "limit",
-            ("yes_price" if side == "yes" else "no_price"): price,
+        # V2: prices are decimal-dollar strings; NO bid → YES ask at (1 - no_price)
+        v2_side  = "bid" if side == "yes" else "ask"
+        v2_price = f"{price/100:.4f}" if side == "yes" else f"{(100 - price)/100:.4f}"
+
+        body: dict = {
+            "ticker":                    ticker,
+            "side":                      v2_side,
+            "count":                     f"{count:.2f}",
+            "price":                     v2_price,
+            "time_in_force":             "good_till_canceled",
+            "self_trade_prevention_type": "taker_at_cross",
+            "post_only":                 True,
         }
+        if expiration_ts is not None:
+            body["expiration_time"] = expiration_ts  # seconds
 
         if dry_run:
             print(f"[DRY RUN] place_order: ticker={ticker!r}, side={side!r}, count={count}, price={price}¢")
-            print(f"          Would POST to {self.base}/portfolio/orders")
+            if expiration_ts:
+                print(f"          expiration_time={expiration_ts}s")
+            print(f"          Would POST to {self.base}/portfolio/events/orders")
             return {"dry_run": True, **body}
 
-        return self._post("/portfolio/orders", body)
+        return self._post("/portfolio/events/orders", body)
+
+    def take_order(
+        self,
+        ticker: str,
+        side: str,
+        count: int,
+        price: int,
+        dry_run: bool = True,
+    ) -> dict:
+        """Place an immediate taker limit order (fill_or_kill, post_only=False).
+
+        side:  'yes' (buy YES) or 'no' (buy NO)
+        price: ask price in cents (1–99); the max we'll pay for the given side
+        """
+        if side not in ("yes", "no"):
+            raise ValueError(f"side must be 'yes' or 'no', got {side!r}")
+        if not (1 <= price <= 99):
+            raise ValueError(f"price must be 1–99 cents, got {price}")
+        if count < 1:
+            raise ValueError(f"count must be >= 1, got {count}")
+
+        v2_side  = "bid" if side == "yes" else "ask"
+        v2_price = f"{price/100:.4f}" if side == "yes" else f"{(100 - price)/100:.4f}"
+
+        body: dict = {
+            "ticker":                    ticker,
+            "side":                      v2_side,
+            "count":                     f"{count:.2f}",
+            "price":                     v2_price,
+            "time_in_force":             "fill_or_kill",
+            "self_trade_prevention_type": "taker_at_cross",
+            "post_only":                 False,
+        }
+
+        if dry_run:
+            print(f"[DRY RUN] take_order: ticker={ticker!r}, side={side!r}, count={count}, price={price}¢")
+            print(f"          Would POST to {self.base}/portfolio/events/orders")
+            return {"dry_run": True, **body}
+
+        return self._post("/portfolio/events/orders", body)

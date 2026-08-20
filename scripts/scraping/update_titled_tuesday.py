@@ -234,7 +234,7 @@ def slug_to_title(slug: str) -> str:
 
 def known_slugs() -> set:
     conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute('SELECT slug FROM titled_tuesday_tournaments').fetchall()
+    rows = conn.execute('SELECT tournament_slug FROM titled_tuesday_tournaments').fetchall()
     conn.close()
     return {r[0] for r in rows}
 

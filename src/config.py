@@ -11,7 +11,7 @@ BACKTEST_DIR = PROJECT_ROOT / 'data' / 'backtest'
 
 # ── Monte Carlo hyperparameters ───────────────────────────────────────────────
 DATA_CUTOFF          = '2020-01-01'   # earliest date used for rank-pct history
-SKILL_DECAY          = 0.96
+SKILL_DECAY          = 0.975
 PARTICIPATION_DECAY  = 0.85
 MIN_PARTICIPATION_RATE = 0.005
 N_SIMS               = 100_000
