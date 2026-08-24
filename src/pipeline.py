@@ -210,6 +210,66 @@ def _save_adjusted_to_db(
     print(f'Saved {len(out):,} rows -> latest_model_predictions ({n_altered} attendance_altered)')
 
 
+def load_adj_run_from_db(tourn_date: str | None = None) -> AdjustedRun:
+    """Reconstruct AdjustedRun from saved DB predictions without re-simulating.
+
+    Reads p_participate and P_top{N}_given_play from latest_model_predictions,
+    then rebuilds pool arrays (players, hist_composites, hist_wts) from standings
+    — fast (~5s), no MC simulation required.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    saved = pd.read_sql_query('SELECT * FROM latest_model_predictions', conn)
+    conn.close()
+
+    if saved.empty:
+        raise RuntimeError('No rows in latest_model_predictions — run run_adjusted() first.')
+
+    saved_date = saved['tourn_date'].iloc[0]
+    if tourn_date and saved_date != tourn_date:
+        print(f'Warning: saved predictions are for {saved_date}, not {tourn_date}')
+
+    df, p_raw, app_counts = load_and_prepare()
+    players, _, hist_composites, hist_wts = build_player_pool_score(
+        df, p_raw, app_counts, min_appearances=5
+    )
+
+    results = saved.set_index('username')
+    for n in PRED_N_VALUES:
+        results[f'P_top{n}'] = results['p_participate'] * results[f'P_top{n}_given_play']
+        results[f'ip_adv_top{n}'] = results[f'P_top{n}_given_play'] / results[f'P_top{n}']
+
+    p_saved = results['p_participate']
+    p_play = np.array([float(p_saved.get(u, 0.0)) for u in players], dtype=np.float64)
+
+    print(f'Loaded {len(results):,} predictions from DB (tournament: {saved_date})')
+    return AdjustedRun(results, players, p_play, hist_composites, hist_wts)
+
+
+def load_raw_results_from_db(tourn_date: str | None = None) -> pd.DataFrame:
+    """Load raw (unadjusted) predictions from latest_model_predictions_raw.
+
+    Returns DataFrame indexed by username with P_top{N} and ip_adv_top{N} columns added.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    saved = pd.read_sql_query('SELECT * FROM latest_model_predictions_raw', conn)
+    conn.close()
+
+    if saved.empty:
+        raise RuntimeError('No rows in latest_model_predictions_raw — run run_raw() first.')
+
+    saved_date = saved['tourn_date'].iloc[0]
+    if tourn_date and saved_date != tourn_date:
+        print(f'Warning: raw predictions are for {saved_date}, not {tourn_date}')
+
+    results_raw = saved.set_index('username')
+    for n in PRED_N_VALUES:
+        results_raw[f'P_top{n}'] = results_raw['p_participate'] * results_raw[f'P_top{n}_given_play']
+        results_raw[f'ip_adv_top{n}'] = results_raw[f'P_top{n}_given_play'] / results_raw[f'P_top{n}']
+
+    print(f'Loaded {len(results_raw):,} raw predictions from DB (tournament: {saved_date})')
+    return results_raw
+
+
 def next_tourn_date() -> str:
     """Return the ISO date of the next Titled Tuesday (one week after the latest in DB)."""
     conn = sqlite3.connect(DB_PATH)
