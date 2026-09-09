@@ -30,6 +30,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.kalshi_api import KalshiClient
 from src.trading import place_bids
+from src.config import TOURN_DATE
 
 
 def main() -> None:
@@ -38,7 +39,7 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "--date", required=True,
+        "--date", default=TOURN_DATE,
         help="Tournament date in YYYY-MM-DD format (e.g. 2026-08-04)",
     )
     parser.add_argument(
@@ -46,15 +47,15 @@ def main() -> None:
         help="Actually submit orders. Without this flag, runs in dry-run mode.",
     )
     parser.add_argument(
-        "--count", type=int, default=1,
+        "--count", type=int, default=200,
         help="Number of contracts per bid (default: 1)",
     )
     parser.add_argument(
-        "--markup", type=float, default=1.5,
+        "--markup", type=float, default=1.6,
         help="Bid = fair / markup. Default 1.5 → bid = 2/3 fair.",
     )
     parser.add_argument(
-        "--max_discount", type=float, default=10,
+        "--max-discount", type=float, default=10,
         help="Maximum discount from fair price in dollars (default: 0.10).",
     )
     parser.add_argument(

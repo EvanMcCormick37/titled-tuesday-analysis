@@ -10,8 +10,9 @@ DATA_DIR     = PROJECT_ROOT / 'data'
 BACKTEST_DIR = PROJECT_ROOT / 'data' / 'backtest'
 
 # ── Monte Carlo hyperparameters ───────────────────────────────────────────────
+TOURN_DATE = "2026-09-08"   # Next Tuesday's date (YYYY-MM-DD)
 DATA_CUTOFF          = '2020-01-01'   # earliest date used for rank-pct history
-SKILL_DECAY          = 0.975
+SKILL_DECAY          = 0.96
 PARTICIPATION_DECAY  = 0.85
 MIN_PARTICIPATION_RATE = 0.005
 N_SIMS               = 100_000
@@ -30,6 +31,13 @@ KALSHI_ENV              = os.environ.get("KALSHI_ENV", "prod")  # "demo" | "prod
 # ── Attendance model ──────────────────────────────────────────────────────────
 DATA_START = '2025-09-02'   # single-session era start; pre-era data excluded from ML training
 MIN_APP    = 3              # minimum weeks attended to appear in training set
+
+# ── Season-shift discount ─────────────────────────────────────────────────────
+# Tournaments before this date have their participation weight multiplied by
+# SEASON_SHIFT_FACTOR, downweighting pre-shift history relative to the new CCT
+# season era.  Set SEASON_SHIFT_DATE = None to disable.
+SEASON_SHIFT_DATE   = '2026-09-01 00:00:00'
+SEASON_SHIFT_FACTOR = 0.5
 
 # FEATURE_COLS = [
 #     'month_sin', 'month_cos',

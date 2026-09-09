@@ -12,7 +12,7 @@ Typical usage
 
     _, PLAYER_TO_USERNAME = get_username_mappings()
     portfolio = build_portfolio(df_kalshi, players, PLAYER_TO_USERNAME)
-    pnl = run_portfolio_mc(players, p_play, hist_pcts, hist_wts, portfolio)
+    pnl, p_win = run_portfolio_mc(players, p_play, hist_pcts, hist_wts, portfolio)
     pnl_summary(pnl)
 """
 
@@ -68,7 +68,7 @@ def build_portfolio(df_tt, players, player_to_username):
 
 def run_portfolio_mc(players, p_play, hist_pcts, hist_wts,
                      portfolio, n_sims=N_SIMS, chunk=CHUNK, seed=SEED):
-    """Run rank-percentile MC and return per-tournament P&L array (n_sims,)."""
+    """Run rank-percentile MC. Returns (pnl_per_sim, p_win) where p_win is per-position win probability."""
     rng   = np.random.default_rng(seed)
     n     = len(players)
     max_N = int(portfolio['n_values'].max())
@@ -80,8 +80,9 @@ def run_portfolio_mc(players, p_play, hist_pcts, hist_wts,
     port_costs   = portfolio['costs']
     known        = port_idx >= 0
 
-    total_cost  = port_costs.sum()
-    pnl_per_sim = np.empty(n_sims, dtype=np.float64)
+    total_cost   = port_costs.sum()
+    pnl_per_sim  = np.empty(n_sims, dtype=np.float64)
+    outcome_sum  = np.zeros(len(port_idx), dtype=np.float64)
 
     t0 = time.time()
     for start in range(0, n_sims, chunk):
@@ -111,17 +112,18 @@ def run_portfolio_mc(players, p_play, hist_pcts, hist_wts,
         outcome           = np.where(port_is_yes[None, :], in_top, ~in_top).astype(np.float32)
         outcome[:, ~known] = 0.0
 
+        outcome_sum                  += outcome.sum(axis=0)
         revenue                      = (outcome * port_volumes[None, :]).sum(axis=1)
         pnl_per_sim[start:start + c] = revenue - total_cost
 
         print(f'  {start + c:>7,} / {n_sims:,}  ({time.time() - t0:.1f}s)')
 
-    return pnl_per_sim
+    return pnl_per_sim, outcome_sum / n_sims
 
 
 def run_portfolio_mc_score(players, p_play, hist_composites, hist_wts,
                            portfolio, n_sims=N_SIMS, chunk=CHUNK, seed=SEED):
-    """Like run_portfolio_mc but ranks by (score, tiebreak) composite."""
+    """Rank by (score, tiebreak) composite. Returns (pnl_per_sim, p_win) where p_win is per-position win probability."""
     rng   = np.random.default_rng(seed)
     n     = len(players)
     max_N = int(portfolio['n_values'].max())
@@ -133,8 +135,9 @@ def run_portfolio_mc_score(players, p_play, hist_composites, hist_wts,
     port_costs   = portfolio['costs']
     known        = port_idx >= 0
 
-    total_cost  = port_costs.sum()
-    pnl_per_sim = np.empty(n_sims, dtype=np.float64)
+    total_cost   = port_costs.sum()
+    pnl_per_sim  = np.empty(n_sims, dtype=np.float64)
+    outcome_sum  = np.zeros(len(port_idx), dtype=np.float64)
 
     t0 = time.time()
     for start in range(0, n_sims, chunk):
@@ -164,12 +167,13 @@ def run_portfolio_mc_score(players, p_play, hist_composites, hist_wts,
         outcome           = np.where(port_is_yes[None, :], in_top, ~in_top).astype(np.float32)
         outcome[:, ~known] = 0.0
 
+        outcome_sum                  += outcome.sum(axis=0)
         revenue                      = (outcome * port_volumes[None, :]).sum(axis=1)
         pnl_per_sim[start:start + c] = revenue - total_cost
 
         print(f'  {start + c:>7,} / {n_sims:,}  ({time.time() - t0:.1f}s)')
 
-    return pnl_per_sim
+    return pnl_per_sim, outcome_sum / n_sims
 
 
 # ── Hedge correlation analysis ────────────────────────────────────────────────

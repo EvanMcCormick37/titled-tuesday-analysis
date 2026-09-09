@@ -6,7 +6,7 @@ In loop mode the script runs indefinitely:
     (winner / top-3 / top-5 / top-8), then waits --interval minutes.
   - If a sweep finds no qualifying trades it backs off for --fallback-wait hours
     before trying again.
-  - The loop exits only on KeyboardInterrupt (Ctrl-C).
+  - The loop exits on KeyboardInterrupt (Ctrl-C) or when --budget is exhausted.
 
 Usage
 -----
@@ -18,6 +18,9 @@ Usage
 
     # Live, continuous loop — check every 15 min, back off 1 h when dry
     python scripts/take_trades.py --date 2026-08-05 --live --loop
+
+    # Live loop with $50 total exposure cap
+    python scripts/take_trades.py --date 2026-08-05 --live --loop --budget 50
 
     # Custom thresholds + loop
     python scripts/take_trades.py --date 2026-08-05 --live --loop \\
@@ -41,8 +44,8 @@ def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _run_once(client: KalshiClient, args: argparse.Namespace) -> int:
-    """Run one sweep. Returns edge_count (qualifying trades found, regardless of dry_run)."""
+def _run_once(client: KalshiClient, args: argparse.Namespace, budget_remaining: float | None) -> dict:
+    """Run one sweep. Returns the full result dict from take_trades."""
     result = take_trades(
         client,
         tourn_date=args.date,
@@ -51,11 +54,12 @@ def _run_once(client: KalshiClient, args: argparse.Namespace) -> int:
         max_qty=args.max_qty,
         best_per_event=True,
         dry_run=not args.live,
+        budget_remaining=budget_remaining,
     )
     if result["unmatched"]:
         print(f"\nNote: {len(result['unmatched'])} player name(s) could not be matched.")
         print("Add aliases to player_information to resolve them.")
-    return result["edge_count"]
+    return result
 
 
 def main() -> None:
@@ -73,7 +77,12 @@ def main() -> None:
     )
     parser.add_argument(
         "--loop", action="store_true",
-        help="Run continuously until interrupted (Ctrl-C).",
+        help="Run continuously until interrupted (Ctrl-C) or budget is exhausted.",
+    )
+    parser.add_argument(
+        "--budget", type=float, default=None,
+        help="Maximum total exposure in dollars across all loop iterations. "
+             "A batch that would exceed the remaining budget is cancelled and the loop halts.",
     )
     parser.add_argument(
         "--min-roi", type=float, default=1.5,
@@ -100,26 +109,40 @@ def main() -> None:
     client = KalshiClient()
 
     if not args.loop:
-        _run_once(client, args)
+        budget_remaining = args.budget  # None or the full cap for a one-shot run
+        _run_once(client, args, budget_remaining)
         return
 
-    print(f"[{_now()}] Starting continuous loop (interval={args.interval}m, fallback={args.fallback_wait}h).")
+    total_spent = 0.0
+    budget_label = f"${args.budget:.2f}" if args.budget is not None else "unlimited"
+    print(f"[{_now()}] Starting continuous loop (interval={args.interval}m, fallback={args.fallback_wait}h, budget={budget_label}).")
     print("Press Ctrl-C to stop.\n")
     try:
         while True:
-            print(f"[{_now()}] === Sweep ===")
-            edge_count = _run_once(client, args)
+            budget_remaining = None if args.budget is None else args.budget - total_spent
+            if args.budget is not None:
+                print(f"[{_now()}] === Sweep (spent=${total_spent:.2f} / budget=${args.budget:.2f}) ===")
+            else:
+                print(f"[{_now()}] === Sweep ===")
 
-            if edge_count > 0:
+            result = _run_once(client, args, budget_remaining)
+
+            if result.get("budget_exceeded"):
+                print(f"\n[{_now()}] Budget cap reached. Total spent: ${total_spent:.2f}. Stopping.")
+                break
+
+            total_spent += result.get("exposure", 0.0)
+
+            if result["edge_count"] > 0:
                 wait_s = args.interval * 60
-                print(f"\n[{_now()}] {edge_count} qualifying trade(s) found. Waiting {args.interval:.0f}m...")
+                print(f"\n[{_now()}] {result['edge_count']} qualifying trade(s) found. Waiting {args.interval:.0f}m...")
             else:
                 wait_s = args.fallback_wait * 3600
                 print(f"\n[{_now()}] No qualifying trades. Backing off {args.fallback_wait:.1f}h...")
 
             time.sleep(wait_s)
     except KeyboardInterrupt:
-        print(f"\n[{_now()}] Loop stopped by user.")
+        print(f"\n[{_now()}] Loop stopped by user. Total spent: ${total_spent:.2f}.")
 
 
 if __name__ == "__main__":

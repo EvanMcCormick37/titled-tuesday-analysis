@@ -81,6 +81,7 @@ def run_adjusted(
     keep_players: list[str] | None = None,
     p_participate_overrides: dict[str, float] | None = None,
     p_nudges: dict[str, float] | None = None,
+    global_nudge: float = 0.0,
     raw_run: RawRun | None = None,
     save_official: bool = False,
     n_sims: int = N_SIMS,
@@ -88,7 +89,8 @@ def run_adjusted(
     """Apply attendance adjustments and run the adjusted simulation.
 
     Attendance adjustment priority (all accept player_information.player_name strings):
-      p_nudges                → shift p_participate in log-odds space (applied first)
+      global_nudge            → log-odds shift applied to every player (applied first)
+      p_nudges                → per-player log-odds shift (additive on top of global_nudge)
       cut_players             → p_participate = 0.0  (overrides nudges)
       p_participate_overrides → p_participate = specified value (overrides cuts)
       keep_players            → p_participate = 1.0  (highest priority)
@@ -144,6 +146,12 @@ def run_adjusted(
     # ── Apply adjustments ─────────────────────────────────────────────────────
     p_adjusted = p_raw.copy()
     altered: set[str] = set()
+
+    if global_nudge != 0.0:
+        clipped = p_adjusted.clip(lower=1e-7, upper=1.0 - 1e-7)
+        logits = np.log(clipped / (1.0 - clipped))
+        p_adjusted = 1.0 / (1.0 + np.exp(-np.clip(logits + global_nudge, -30, 30)))
+        print(f'  Applying global log-odds nudge: {global_nudge:+.2f}')
 
     for username, delta in nudges.items():
         if username in p_adjusted.index:

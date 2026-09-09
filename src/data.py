@@ -14,6 +14,7 @@ import pandas as pd
 from .config import (
     DB_PATH, MODELS_DIR,
     DATA_CUTOFF, SKILL_DECAY, PARTICIPATION_DECAY, MIN_PARTICIPATION_RATE,
+    SEASON_SHIFT_DATE, SEASON_SHIFT_FACTOR,
 )
 
 
@@ -23,6 +24,7 @@ from .config import (
 # Maps alias → canonical player_name in player_information.
 _PLAYER_ALIASES: dict[str, str] = {
     'Jose Martinez': 'Jose Martinez Alcantara',
+    'Liem Le': 'Le Quang Liem',
 }
 
 _USERNAME_TO_PLAYER: dict | None = None
@@ -146,11 +148,24 @@ def load_and_prepare(scheduling_conflict=None, cut_players=None, keep_players=No
     df['skill_w'] = SKILL_DECAY          ** time_diff
     df['part_w']  = PARTICIPATION_DECAY  ** time_diff
 
+    if SEASON_SHIFT_DATE is not None:
+        shift_ts = pd.Timestamp(SEASON_SHIFT_DATE)
+        df.loc[df['date'] < shift_ts, 'part_w'] *= SEASON_SHIFT_FACTOR
+
     n_in_event  = df.groupby('tournament_slug')['username'].transform('count')
     df['rank_pct'] = 1.0 - (df['rank'].astype(float) - 1) / (n_in_event - 1)
 
-    # EWMA baseline participation rate
-    Z_part        = sum(PARTICIPATION_DECAY ** k for k in range(N))
+    # EWMA baseline participation rate — normalise to what a perfect-attendance
+    # player would accumulate under the same weighting scheme (incl. shift).
+    if SEASON_SHIFT_DATE is not None:
+        shift_ts   = pd.Timestamp(SEASON_SHIFT_DATE)
+        n_post     = max(0, int((ref - shift_ts) / pd.Timedelta(weeks=1)))
+        Z_part     = (
+            sum(PARTICIPATION_DECAY ** k for k in range(n_post))
+            + SEASON_SHIFT_FACTOR * sum(PARTICIPATION_DECAY ** k for k in range(n_post, N))
+        )
+    else:
+        Z_part     = sum(PARTICIPATION_DECAY ** k for k in range(N))
     p_participate = (
         df.groupby('username')['part_w'].sum() / Z_part
     ).clip(lower=MIN_PARTICIPATION_RATE).rename('p_participate')

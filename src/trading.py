@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from .config import DB_PATH
+from .config import DB_PATH, TOURN_DATE
 from .data import get_username_mappings
 from .kalshi_api import KalshiClient, _TT_EVENT_TEMPLATES, _to_kalshi_date
 
@@ -67,8 +67,8 @@ def _load_predictions() -> pd.DataFrame:
 
 def place_bids(
     client: KalshiClient,
-    tourn_date: str,
-    count: int = 1,
+    tourn_date: str = TOURN_DATE,
+    count: int = 200,
     markup: float = 1.5,
     max_discount: float = 10,
     side_filter: str | None = None,
@@ -179,11 +179,11 @@ def place_bids(
                         "skip_reason": None,
                     })
                 else:
-                    # Existing order is more conservative (lower price) → leave it
+                    # Existing order is more conservative (lower price) → leave it but place a new order.
                     plan.append({
                         "ticker": ticker, "side": side,
                         "bid_c": bid_c, "cancel": [],
-                        "skip_reason": f"existing order at {min_existing}¢ < new {bid_c}¢, keeping",
+                        "skip_reason": None,
                     })
             else:
                 plan.append({
@@ -270,6 +270,8 @@ def _kalshi_order_price(ask: float) -> float:
 
 
 def _parse_n(title: str) -> int:
+    if re.search('win the Titled Tuesday weekly chess competition, originally scheduled for', title or '') is not None:
+            return 1
     m = re.search(r'\b(Top\s+)?(\d+)\b', title or '')
     if not m:
         return 1
@@ -286,6 +288,7 @@ def take_trades(
     sleep_read: float = 0.05,
     best_per_event: bool = True,
     dry_run: bool = True,
+    budget_remaining: float | None = None,
 ) -> dict:
     """Fetch live asks, compute EV, and fire qualifying taker orders.
 
@@ -297,9 +300,12 @@ def take_trades(
 
     min_qty: levels with fewer available contracts are skipped as too thin.
     max_qty: cap on contracts purchased per level; actual count = min(available, max_qty).
+    budget_remaining: if set, the batch is cancelled and budget_exceeded=True is returned
+        if proposed exposure would exceed this value.
 
-    Returns a summary dict: {placed, failed, skipped, unmatched, edge_count}.
+    Returns a summary dict: {placed, failed, skipped, unmatched, edge_count, exposure, budget_exceeded}.
     edge_count reflects qualifying trades found regardless of dry_run.
+    exposure is the proposed dollar cost of the batch (ask_price × qty summed across orders).
     """
     _, PLAYER_TO_USERNAME = get_username_mappings()
 
@@ -361,6 +367,7 @@ def take_trades(
             .copy()
         )
     edge["order_qty"] = edge["Quantity Available"].clip(upper=max_qty).astype(int)
+    proposed_exposure = float((edge["Ask Price ($)"] * edge["order_qty"]).sum())
 
     mode_label = "best-per-event" if best_per_event else "all-qualifying"
     print(f"\n{'[DRY RUN] ' if dry_run else ''}Taker trade plan for {tourn_date} (ROI > {min_roi}, mode={mode_label}):")
@@ -376,9 +383,9 @@ def take_trades(
 
     if edge.empty:
         print("  No trades to place.")
-        return {"placed": 0, "failed": 0, "skipped": len(df), "unmatched": unmatched, "edge_count": 0}
+        return {"placed": 0, "failed": 0, "skipped": len(df), "unmatched": unmatched, "edge_count": 0, "exposure": 0.0, "budget_exceeded": False}
 
-    print(f"\n  Planned taker orders:")
+    print(f"\n  Planned taker orders (proposed exposure: ${proposed_exposure:.2f}):")
     for _, row in edge.sort_values("ROI", ascending=False).iterrows():
         ask_c = round(row["Ask Price ($)"] * 100)
         print(
@@ -387,9 +394,13 @@ def take_trades(
             f"  qty={row['order_qty']} (avail={int(row['Quantity Available'])})"
         )
 
+    if budget_remaining is not None and proposed_exposure > budget_remaining:
+        print(f"\n  Budget check: proposed ${proposed_exposure:.2f} exceeds remaining ${budget_remaining:.2f}. Cancelling batch.")
+        return {"placed": 0, "failed": 0, "skipped": len(df) - len(edge), "unmatched": unmatched, "edge_count": len(edge), "exposure": 0.0, "budget_exceeded": True}
+
     if dry_run:
         print("\n[DRY RUN] No orders placed.")
-        return {"placed": 0, "failed": 0, "skipped": len(df) - len(edge), "unmatched": unmatched, "edge_count": len(edge)}
+        return {"placed": 0, "failed": 0, "skipped": len(df) - len(edge), "unmatched": unmatched, "edge_count": len(edge), "exposure": proposed_exposure, "budget_exceeded": False}
 
     # Fire all simultaneously
     def _take_one(row: pd.Series) -> tuple[bool, str, str, int]:
@@ -413,4 +424,4 @@ def take_trades(
     placed = sum(1 for ok, *_ in results if ok)
     failed = len(results) - placed
     print(f"\nDone. Placed {placed}, failed {failed}, skipped {len(df) - len(edge)}.")
-    return {"placed": placed, "failed": failed, "skipped": len(df) - len(edge), "unmatched": unmatched, "edge_count": len(edge)}
+    return {"placed": placed, "failed": failed, "skipped": len(df) - len(edge), "unmatched": unmatched, "edge_count": len(edge), "exposure": proposed_exposure, "budget_exceeded": False}
