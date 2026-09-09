@@ -10,7 +10,7 @@ DATA_DIR     = PROJECT_ROOT / 'data'
 BACKTEST_DIR = PROJECT_ROOT / 'data' / 'backtest'
 
 # ── Monte Carlo hyperparameters ───────────────────────────────────────────────
-TOURN_DATE = "2026-09-08"   # Next Tuesday's date (YYYY-MM-DD)
+TOURN_DATE = "2026-09-15"   # Next Tuesday's date (YYYY-MM-DD)
 DATA_CUTOFF          = '2020-01-01'   # earliest date used for rank-pct history
 SKILL_DECAY          = 0.96
 PARTICIPATION_DECAY  = 0.85
@@ -18,7 +18,7 @@ MIN_PARTICIPATION_RATE = 0.005
 N_SIMS               = 100_000
 N_VALUES             = [1, 3, 5, 8, 10]
 MIN_P                = 0.0
-MIN_APPEARANCES      = 0
+MIN_APPEARANCES      = 5
 CHUNK                = 10_000
 SEED                 = 42
 _SCORE_COMPOSITE_SCALE = 10_000.0    # score*scale + tiebreak -> single sortable float

@@ -22,16 +22,39 @@ from .config import (
 
 # Alternative player names used on betting lines that differ from player_information.
 # Maps alias → canonical player_name in player_information.
-_PLAYER_ALIASES: dict[str, str] = {
-    'Jose Martinez': 'Jose Martinez Alcantara',
-    'Liem Le': 'Le Quang Liem',
+_PLAYER_ALIASES:dict[str, str] = {
+    'Jose Martinez':'Jose Martinez Alcantara',
+    'Liem Le':'Le Quang Liem',
+    'Le Minh Tuan':'Le Tuan Minh',
+    'Tuan Minh Le':'Le Tuan Minh',
+    'Alexey Sarana':'Aleksei Sarana',
+    'Aleksej Sarana':'Aleksei Sarana',
+    'Hans Moke Niemann':'Hans Niemann',
+    'R Praggnanandhaa':'Praggnanandhaa Rameshbabu',
+    'Tobias Koelle':'Tobias Kölle',
+    'Jagadeesh Siddharth':'Siddarth Jagadeesh',
+    'Sarin Nihal':'Nihal Sarin',
+    'Liren Ding':'Ding Liren',
+    'Haik M. Martirosyan':'Haik Martirosyan',
+    'A.R. Saleh Salem':'Salem Saleh',
+    'Saleh Salem':'Salem Saleh',
+    'David Anton Guijarro':'David Anton',
+    'Khuong Duy Dau':'Dau Khuong Duy',
+    'Bilguun Sumiya':'Sumiya Bilguun',
+    'M. Amin Tabatabaei':'Seyyed Mohammad Amin Tabatabaei',
+    'Mohammad Amin Tabatabaei':'Seyyed Mohammad Amin Tabatabaei',
+    'Amin Tabatabaei':'Seyyed Mohammad Amin Tabatabaei',
+    'Christopher Yoo':'Christopher Woojin Yoo',
+    'Chris Yoo':'Christopher Woojin Yoo',
+    'V Pranav':'Pranav Venkatesh',
+    'Pranesh M':'Pranesh Munirethinam'
 }
 
-_USERNAME_TO_PLAYER: dict | None = None
-_PLAYER_TO_USERNAME: dict | None = None
+_USERNAME_TO_PLAYER:dict | None = None
+_PLAYER_TO_USERNAME:dict | None = None
 
 
-def _populate_is_default(conn: sqlite3.Connection) -> None:
+def _populate_is_default(conn:sqlite3.Connection) -> None:
     """Set is_default=1 for each player's most-recently-seen TT username, 0 for all others."""
     conn.execute('UPDATE player_information SET is_default = 0')
     latest = dict(conn.execute(
@@ -40,7 +63,7 @@ def _populate_is_default(conn: sqlite3.Connection) -> None:
     rows = conn.execute(
         'SELECT username, player_name FROM player_information WHERE player_name IS NOT NULL'
     ).fetchall()
-    groups: dict[str, list] = {}
+    groups:dict[str, list] = {}
     for u, p in rows:
         groups.setdefault(p, []).append(u)
     for p, usernames in groups.items():
@@ -50,7 +73,7 @@ def _populate_is_default(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def _ensure_is_default(conn: sqlite3.Connection) -> None:
+def _ensure_is_default(conn:sqlite3.Connection) -> None:
     """Add is_default column to player_information and populate it if not present."""
     cols = {row[1] for row in conn.execute('PRAGMA table_info(player_information)')}
     if 'is_default' not in cols:
@@ -70,6 +93,42 @@ def refresh_default_usernames() -> None:
     _PLAYER_TO_USERNAME = None
 
 
+def resolve_player_names(names: list[str] | dict[str, float]) -> list[str] | dict[str, float]:
+    """Resolve player names to their canonical DB forms.
+
+    Resolution order for each name:
+      1. Exact match in _PLAYER_ALIASES → return the alias target.
+      2. Already recognised by player_to_username → return unchanged.
+      3. Word-set match: find canonical DB names whose words are all present
+         in the input name (any order, case-insensitive, input may have extra
+         words).  Picks the most specific match (most words); warns on ties.
+    """
+    username_to_player, player_to_username = get_username_mappings()
+    canonical_names = set(username_to_player.values())
+
+    def _resolve_one(name: str) -> str:
+        if name in _PLAYER_ALIASES:
+            return _PLAYER_ALIASES[name]
+        if name in player_to_username:
+            return name
+        input_words = frozenset(name.lower().split())
+        matches = [cn for cn in canonical_names if frozenset(cn.lower().split()) <= input_words]
+        if not matches:
+            return name
+        best_len = max(len(cn.split()) for cn in matches)
+        best = [cn for cn in matches if len(cn.split()) == best_len]
+        if len(best) > 1:
+            print(f'  Warning: {name!r} matches multiple DB names {best} — returning unchanged')
+            return name
+        if best[0] != name:
+            print(f'  Resolved {name!r} → {best[0]!r} (word-set match)')
+        return best[0]
+
+    if isinstance(names, dict):
+        return {_resolve_one(k): v for k, v in names.items()}
+    return [_resolve_one(n) for n in names]
+
+
 def get_username_mappings() -> tuple[dict, dict]:
     """Return (username→player_name, player_name→default_username) dicts, loaded lazily from DB.
 
@@ -85,8 +144,8 @@ def get_username_mappings() -> tuple[dict, dict]:
             'SELECT username, player_name, is_default FROM player_information WHERE player_name IS NOT NULL'
         ).fetchall()
         conn.close()
-        _USERNAME_TO_PLAYER = {u: p for u, p, _ in rows}
-        # Build PLAYER_TO_USERNAME: prefer is_default=1; fall back to last row for the name
+        _USERNAME_TO_PLAYER = {u:p for u, p, _ in rows}
+        # Build PLAYER_TO_USERNAME:prefer is_default=1; fall back to last row for the name
         _PLAYER_TO_USERNAME = {}
         for u, p, is_def in rows:
             if p not in _PLAYER_TO_USERNAME or is_def:
@@ -179,7 +238,7 @@ def load_and_prepare(scheduling_conflict=None, cut_players=None, keep_players=No
         p_participate = pd.Series(iso_floor, index=p_participate.index,
                                   name='p_participate')
 
-    print('  p_participate: decay-weighted EWMA with isotonic floor (p < 0.05)')
+    print('  p_participate:decay-weighted EWMA with isotonic floor (p < 0.05)')
 
     # ── Legacy scheduling-param path (backward compat for backtest) ──────────
     from .attendance import apply_schedule_adjustments
@@ -250,7 +309,7 @@ def load_player_usernames() -> pd.DataFrame:
     return df
 
 
-def load_backtest_results(model: str | None = None) -> pd.DataFrame:
+def load_backtest_results(model:str | None = None) -> pd.DataFrame:
     """Load backtest results from DB. Pass model='decay' etc. to filter by model."""
     conn = sqlite3.connect(DB_PATH)
     q    = 'SELECT * FROM backtest_results'

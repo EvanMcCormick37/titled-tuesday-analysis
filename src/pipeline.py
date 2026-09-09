@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 
 from .config import DB_PATH, N_SIMS
-from .data import load_and_prepare, get_username_mappings
+from .data import load_and_prepare, get_username_mappings, resolve_player_names
 from .simulation import build_player_pool_score, run_simulation_score, build_results
 
 PRED_N_VALUES = [1, 3, 5, 8, 10]
@@ -98,10 +98,10 @@ def run_adjusted(
     Accepts an optional raw_run to reuse an already-built player pool.
     save_official=True writes adjusted results to latest_model_predictions.
     """
-    cut_players             = cut_players or []
-    keep_players            = keep_players or []
-    p_participate_overrides = p_participate_overrides or {}
-    p_nudges                = p_nudges or {}
+    cut_players             = resolve_player_names(cut_players or [])
+    keep_players            = resolve_player_names(keep_players or [])
+    p_participate_overrides = resolve_player_names(p_participate_overrides or {})
+    p_nudges                = resolve_player_names(p_nudges or {})
 
     if raw_run is None:
         raw_run = run_raw(tourn_date, save_to_db=False, n_sims=n_sims)
