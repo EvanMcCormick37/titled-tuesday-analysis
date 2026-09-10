@@ -26,7 +26,8 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.kalshi_api import KalshiClient, _TT_EVENT_TEMPLATES, _to_kalshi_date
+from kalshi_core import KalshiClient, _to_kalshi_date
+from src.kalshi_tt import _TT_EVENT_TEMPLATES
 
 
 def _build_orders(client: KalshiClient, tourn_date: str, player_filter: str, limit: int) -> list[dict]:

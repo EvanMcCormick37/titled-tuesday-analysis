@@ -5,7 +5,8 @@ Typical usage
 -------------
     from src.data import load_and_prepare, get_username_mappings
     from src.simulation import build_player_pool
-    from src.portfolio import build_portfolio, run_portfolio_mc, pnl_summary
+    from src.portfolio import build_portfolio, run_portfolio_mc
+    from kalshi_core import pnl_summary
 
     df, p_participate, app_counts = load_and_prepare()
     players, p_play, hist_pcts, hist_wts = build_player_pool(df, p_participate, app_counts)
@@ -20,6 +21,7 @@ import time
 import numpy as np
 import pandas as pd
 
+from kalshi_core import pnl_summary, portfolio_kelly, kalshi_order_price  # noqa: F401 — re-exported for callers
 from .config import N_SIMS, CHUNK, SEED
 
 
@@ -312,22 +314,6 @@ def show_best_hedges(df_corr, top_k=20, username_to_player=None):
           .to_string(index=False, float_format=lambda x: f'{x:.4f}'))
 
 
-# ── Summary statistics ────────────────────────────────────────────────────────
-
-def pnl_summary(pnl, label='Portfolio'):
-    p = np.asarray(pnl)
-    print(f'\n── {label} ({len(p):,} simulated tournaments) ──────────────')
-    print(f'  Mean        : ${p.mean():+.2f}')
-    print(f'  Std dev     : ${p.std():.2f}')
-    print(f'  5th pctile  : ${np.percentile(p,  5):+.2f}')
-    print(f'  25th pctile : ${np.percentile(p, 25):+.2f}')
-    print(f'  Median      : ${np.median(p):+.2f}')
-    print(f'  75th pctile : ${np.percentile(p, 75):+.2f}')
-    print(f'  95th pctile : ${np.percentile(p, 95):+.2f}')
-    print(f'  Worst case  : ${p.min():+.2f}')
-    print(f'  Best case   : ${p.max():+.2f}')
-
-
 # ── Kelly sizing ──────────────────────────────────────────────────────────────
 
 def run_payoff_matrix(players, p_play, hist_pcts, hist_wts,
@@ -390,60 +376,3 @@ def run_payoff_matrix(players, p_play, hist_pcts, hist_wts,
 
     return payoff_matrix, cps
 
-
-def portfolio_kelly(payoff_matrix, cost_per_share, bankroll,
-                    kelly_fraction=0.5, verbose=True):
-    """
-    Numerically optimise Kelly bet sizes for a portfolio of correlated bets.
-    Maximises E[log(bankroll + PnL)] subject to long-only and budget constraints.
-
-    Returns (shares, scipy OptimizeResult).
-    """
-    from scipy.optimize import minimize
-
-    n_sims, P  = payoff_matrix.shape
-    max_budget = kelly_fraction * bankroll
-
-    ev_per_share = payoff_matrix.mean(axis=0)
-    init_kelly_f = (ev_per_share / (1.0 - cost_per_share)).clip(0)
-    total_f = init_kelly_f.sum()
-    if total_f > 1.0:
-        init_kelly_f /= total_f
-    x0 = (init_kelly_f * bankroll / cost_per_share.clip(1e-8)).clip(0)
-
-    def neg_E_log(shares):
-        pnl = bankroll + payoff_matrix @ shares
-        return -np.mean(np.log(np.maximum(pnl, 1e-8)))
-
-    def grad(shares):
-        pnl = bankroll + payoff_matrix @ shares
-        return -(payoff_matrix / np.maximum(pnl, 1e-8)[:, None]).mean(axis=0)
-
-    constraints = [{
-        'type': 'ineq',
-        'fun':  lambda x: max_budget - cost_per_share @ x,
-        'jac':  lambda x: -cost_per_share,
-    }]
-
-    result = minimize(neg_E_log, x0, jac=grad, method='SLSQP',
-                      bounds=[(0.0, None)] * P, constraints=constraints,
-                      options={'ftol': 1e-10, 'maxiter': 1000})
-
-    shares_opt = result.x
-    total_cost = cost_per_share @ shares_opt
-    if verbose:
-        pnl = bankroll + payoff_matrix @ shares_opt
-        print(f"Converged: {result.success}  |  "
-              f"Exposure ${total_cost:.2f} ({total_cost/bankroll*100:.1f}% of bankroll)  |  "
-              f"E[log-return]: {-result.fun - np.log(bankroll):.4f}")
-
-    return np.round(shares_opt).astype(int), result
-
-
-# ── Kalshi pricing ────────────────────────────────────────────────────────────
-
-def kalshi_order_price(price, make=False):
-    if make:
-        return price + (0.0175 * price * (1.0 - price))
-    else:
-        return price + (0.07 * price * (1.0 - price))
