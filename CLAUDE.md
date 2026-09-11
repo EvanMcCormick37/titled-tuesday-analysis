@@ -2,6 +2,8 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+@../kalshi-core/CLAUDE.md
+
 ## Project Purpose
 
 Production Python trading system for betting on chess.com's weekly **Titled Tuesday** blitz tournament using Kalshi prediction markets. The system:
@@ -52,7 +54,7 @@ Chess.com → scripts/scraping/update_titled_tuesday.py → SQLite DB (data/titl
                                 src/trading.py                        notebooks/
                             (place_bids / take_trades)             (analysis, backtest)
                                             ↓
-                                       Kalshi API
+                                 kalshi_core.KalshiClient
 ```
 
 ### Key Modules
@@ -69,13 +71,15 @@ Runs in NumPy-vectorized chunks (`CHUNK=10_000` sims per batch). Returns `P_top{
 
 **`src/pipeline.py`** — `run_predictions()` chains the full pipeline: load → build pool → raw simulation → apply in-memory adjustments (nudges/cuts/overrides/keeps) → adjusted simulation → optionally save to DB. The adjustment priority order is: `p_nudges` → `cut_players` → `p_participate_overrides` → `keep_players`.
 
-**`src/kalshi_api.py`** — REST client for Kalshi. Uses RSA-PSS (SHA-256) signatures. Loads key from `.env` (`KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_PATH`, `KALSHI_ENV`). Supports `prod` and `demo` environments.
+**`src/kalshi_tt.py`** — Titled Tuesday-specific Kalshi helpers built on top of `kalshi_core.KalshiClient`. Contains `_TT_EVENT_TEMPLATES`, `_next_tuesday()`, and three standalone functions: `get_tt_markets()`, `get_tt_asks()`, `get_tt_positions_df()`. Import `KalshiClient` from `kalshi_core`, not from here.
 
 **`src/trading.py`** — Two strategies:
 - `place_bids()`: computes fair price = `p_participate × P_top{N}_given_play`, bids at `max(fair/markup, fair - max_discount)`, cancels stale orders if new bid is lower, pulls back if market ask is at or below the computed bid
-- `take_trades()`: fetches live asks concurrently, filters by ROI threshold and minimum quantity (to avoid iceberg decoys), fires fill-or-kill orders via `ThreadPoolExecutor`
+- `take_trades()`: fetches live asks via `get_tt_asks()`, filters by ROI threshold and minimum quantity (to avoid iceberg decoys), fires fill-or-kill orders via `ThreadPoolExecutor`
 
-**`src/portfolio.py`** — Reads `kalshi_portfolio` table (populated from Kalshi API snapshots), runs portfolio-level MC for P&L simulation and Kelly sizing.
+Bid math (`bid_cents`, `best_ask`, `apply_pullback`, `kalshi_order_price`) imported from `kalshi_core`.
+
+**`src/portfolio.py`** — Runs portfolio-level MC for P&L simulation and Kelly sizing. `build_portfolio()` converts a positions DataFrame into numpy arrays for vectorized simulation. `pnl_summary`, `portfolio_kelly`, and `kalshi_order_price` are imported from `kalshi_core` and re-exported here for backward compatibility.
 
 ### Database Schema (SQLite, `data/titled_tuesday.db`)
 
@@ -96,7 +100,11 @@ Chess.com usernames (in standings) are mapped to display names via `player_infor
 
 ### Kalshi Market Tickers
 
-Markets follow the pattern `TTUES-{date}-{EVENT}-{PLAYER}` where `EVENT` encodes the top-N threshold (e.g., `TOP1`, `TOP3`). The ticker parsing logic in `trading.py` and `backtest_pnl.py` extracts N and player name from these tickers.
+TT markets use two event ticker patterns, defined in `src/kalshi_tt.py`:
+- `KXTITLEDTUESDAY-{date}-{PLAYER}` — winner market (N=1)
+- `KXTITLEDTUESTOP-{date}T{N}-{PLAYER}` — top-N markets (N=3, 5, 8)
+
+`{date}` is in Kalshi's `YYMONDD` format (e.g. `26SEP16`), produced by `_to_kalshi_date()` from `kalshi_core`. The ticker parsing logic in `trading.py` and `backtest_pnl.py` extracts N and player name from these patterns.
 
 ### API Cache
 
@@ -104,11 +112,11 @@ Chess.com API responses are cached in `data/api_cache/` (JSON files keyed by use
 
 ## Environment Setup
 
-Requires a `.env` file at the project root:
+Kalshi credentials live in `~/.kalshi/` (not in this repo):
 ```
-KALSHI_API_KEY_ID=<uuid>
-KALSHI_PRIVATE_KEY_PATH=trading-key.txt
-KALSHI_ENV=prod   # or demo
+~/.kalshi/
+    .env              ← KALSHI_API_KEY_ID, KALSHI_PRIVATE_KEY_PATH, KALSHI_ENV
+    trading-key.txt   ← RSA private key for API signing
 ```
 
-`trading-key.txt` holds the RSA private key for API signing. Both files are gitignored.
+`kalshi_core.KalshiClient` loads from this location automatically. No `.env` file is needed in the project directory.
