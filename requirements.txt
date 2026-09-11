@@ -9,4 +9,4 @@ zstandard
 cryptography
 python-dotenv
 tzdata
-kalshi-core @ file:///C:/Users/EvanM/Documents/Projects/GitHub/kalshi-core
+# kalshi-core (local package) — install separately: pip install -e /path/to/kalshi-core
