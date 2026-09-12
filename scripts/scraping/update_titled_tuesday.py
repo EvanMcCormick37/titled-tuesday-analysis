@@ -300,11 +300,37 @@ def parse_round_cells(cells, round_indices: list) -> tuple[int, int, int]:
     return wins, draws, byes
 
 
+def _ensure_aroc_column(conn: sqlite3.Connection):
+    existing = {row[1] for row in conn.execute("PRAGMA table_info(titled_tuesday_standings)")}
+    for col in ('aroc_1', 'performance_rating'):
+        if col not in existing:
+            conn.execute(f"ALTER TABLE titled_tuesday_standings ADD COLUMN {col} REAL")
+    conn.commit()
+
+
+def _parse_float(text: str | None) -> float | None:
+    if not text or text in ('-', ''):
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _perf_rating(score: str | float | None, aroc_1: float | None) -> float | None:
+    if aroc_1 is None:
+        return None
+    score_f = _parse_float(str(score)) if not isinstance(score, float) else score
+    if score_f is None:
+        return None
+    return round(aroc_1 + 800 * (score_f / 11 - 0.5), 1)
+
+
 def fetch_standings(slug: str) -> list[dict]:
     players     = []
     page        = 1
     n_rounds    = None
-    score_col   = tb1_col = None
+    score_col   = tb1_col = aroc1_col = None
 
     while True:
         url  = TOURN_URL.format(slug=slug, page=page)
@@ -319,6 +345,7 @@ def fetch_standings(slug: str) -> list[dict]:
             col_names     = [th.get_text(strip=True) for th in table.find_all('th')]
             score_col     = col_names.index('Pts.')
             tb1_col       = col_names.index('TB1')
+            aroc1_col     = col_names.index('TB7') if 'TB7' in col_names else None
             n_rounds      = score_col - 1
             round_indices = list(range(1, n_rounds + 1))
 
@@ -334,11 +361,13 @@ def fetch_standings(slug: str) -> list[dict]:
             wins, draws, byes = parse_round_cells(cells, round_indices)
             score     = cells[score_col].get_text(strip=True) if score_col < len(cells) else None
             tie_break = cells[tb1_col].get_text(strip=True)   if tb1_col  < len(cells) else None
+            aroc_1    = _parse_float(cells[aroc1_col].get_text(strip=True)) if (aroc1_col is not None and aroc1_col < len(cells)) else None
             if rank is None:
                 rank = len(players) + 1
             players.append({
                 'rank': rank, 'title': title, 'username': username, 'rating': rating,
-                'score': score, 'tie_break': tie_break,
+                'score': score, 'tie_break': tie_break, 'aroc_1': aroc_1,
+                'performance_rating': _perf_rating(score, aroc_1),
                 'wins': wins, 'draws': draws, 'byes': byes,
             })
 
@@ -367,6 +396,7 @@ def process(slug: str) -> None:
     winner  = next((p['username'] for p in players if p['rank'] == 1), None)
 
     conn = sqlite3.connect(DB_PATH)
+    _ensure_aroc_column(conn)
 
     # standings: delete old rows, insert new
     old_n = conn.execute(
@@ -383,9 +413,11 @@ def process(slug: str) -> None:
         'title':           p['title'],
         'country':         None,
         'rating':          p['rating'],
-        'score':           p['score'],
-        'tie_break':       p['tie_break'],
-        'wins':            p['wins'],
+        'score':               p['score'],
+        'tie_break':           p['tie_break'],
+        'aroc_1':              p['aroc_1'],
+        'performance_rating':  p['performance_rating'],
+        'wins':                p['wins'],
         'draws':           p['draws'],
         'byes':            p['byes'],
     } for p in players])
