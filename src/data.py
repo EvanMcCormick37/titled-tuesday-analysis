@@ -162,7 +162,7 @@ def get_username_mappings() -> tuple[dict, dict]:
 def load_and_prepare(scheduling_conflict=None, cut_players=None, keep_players=None,
                      canonical_accounts=None, account_groups=None,
                      top_player_threshold=0.10, min_obs_opportunism=20,
-                     as_of=None):
+                     as_of=None, attendance_start='2025-09-02'):
     """
     Load standings from DB and compute per-player MC inputs.
 
@@ -174,11 +174,17 @@ def load_and_prepare(scheduling_conflict=None, cut_players=None, keep_players=No
     Parameters
     ----------
     scheduling_conflict  [legacy] Player names with a broadcast conflict.
-    cut_players          [legacy] Player names forced to p_participate = 0.
-    keep_players         [legacy] Player names forced to p_participate = 1.0.
+    cut_players          Player names forced to p_participate = 0.
+    keep_players         Player names forced to p_participate = 1.0.
     canonical_accounts   Maps closed/alt username → active canonical username.
     account_groups       Maps canonical username → list of all accounts.
     as_of                If set, restrict data to before this date (backtest).
+    attendance_start     If set, p_participate is computed only from rows with
+                         date >= attendance_start (skill history keeps full
+                         DATA_CUTOFF range).  Disables SEASON_SHIFT scaling and
+                         the isotonic floor, which were tuned for production.
+                         Used by the joint backtest to isolate the single-
+                         session era (2025-09-02+).
     """
     if scheduling_conflict is None:
         scheduling_conflict = []
@@ -207,38 +213,57 @@ def load_and_prepare(scheduling_conflict=None, cut_players=None, keep_players=No
     df['skill_w'] = SKILL_DECAY          ** time_diff
     df['part_w']  = PARTICIPATION_DECAY  ** time_diff
 
-    if SEASON_SHIFT_DATE is not None:
+    if attendance_start is None and SEASON_SHIFT_DATE is not None:
         shift_ts = pd.Timestamp(SEASON_SHIFT_DATE)
         df.loc[df['date'] < shift_ts, 'part_w'] *= SEASON_SHIFT_FACTOR
 
     n_in_event  = df.groupby('tournament_slug')['username'].transform('count')
     df['rank_pct'] = 1.0 - (df['rank'].astype(float) - 1) / (n_in_event - 1)
 
-    # EWMA baseline participation rate — normalise to what a perfect-attendance
-    # player would accumulate under the same weighting scheme (incl. shift).
-    if SEASON_SHIFT_DATE is not None:
-        shift_ts   = pd.Timestamp(SEASON_SHIFT_DATE)
-        n_post     = max(0, int((ref - shift_ts) / pd.Timedelta(weeks=1)))
-        Z_part     = (
-            sum(PARTICIPATION_DECAY ** k for k in range(n_post))
-            + SEASON_SHIFT_FACTOR * sum(PARTICIPATION_DECAY ** k for k in range(n_post, N))
+    # ── Participation calculation ────────────────────────────────────────────
+    if attendance_start is not None:
+        # Backtest mode: participation rate is derived exclusively from the
+        # post-attendance_start window (skill history is unrestricted above).
+        att_ref = pd.Timestamp(attendance_start)
+        att_mask = df['date'] >= att_ref
+        N_att = max(1, int((ref - att_ref) / pd.Timedelta(weeks=1)))
+        Z_part = sum(PARTICIPATION_DECAY ** k for k in range(N_att))
+        p_participate = (
+            df.loc[att_mask].groupby('username')['part_w'].sum() / Z_part
+        ).clip(lower=MIN_PARTICIPATION_RATE).rename('p_participate')
+        # Ensure every player in the skill dataset has a p_participate entry
+        p_participate = p_participate.reindex(
+            df['username'].unique(), fill_value=MIN_PARTICIPATION_RATE
         )
+        print(f'  p_participate: EWMA over {N_att} weeks since {attendance_start} '
+              f'(no season-shift, no isotonic floor)')
     else:
-        Z_part     = sum(PARTICIPATION_DECAY ** k for k in range(N))
-    p_participate = (
-        df.groupby('username')['part_w'].sum() / Z_part
-    ).clip(lower=MIN_PARTICIPATION_RATE).rename('p_participate')
+        # EWMA baseline participation rate — normalise to what a perfect-attendance
+        # player would accumulate under the same weighting scheme (incl. shift).
+        if SEASON_SHIFT_DATE is not None:
+            shift_ts   = pd.Timestamp(SEASON_SHIFT_DATE)
+            n_post     = max(0, int((ref - shift_ts) / pd.Timedelta(weeks=1)))
+            print(f"n_post={n_post}")
+            Z_part     = (
+                sum(PARTICIPATION_DECAY ** k for k in range(n_post))
+                + SEASON_SHIFT_FACTOR * sum(PARTICIPATION_DECAY ** k for k in range(n_post, N))
+            )
+        else:
+            Z_part     = sum(PARTICIPATION_DECAY ** k for k in range(N))
+        p_participate = (
+            df.groupby('username')['part_w'].sum() / Z_part
+        ).clip(lower=MIN_PARTICIPATION_RATE).rename('p_participate')
 
-    # Isotonic regression floor for low-participation players
-    iso_path = MODELS_DIR / 'isotonic_regression.joblib'
-    if iso_path.exists():
-        iso_reg = joblib.load(iso_path)
-        p_np    = p_participate.to_numpy()
-        iso_floor = np.where(p_np > 0.05, p_np, iso_reg.predict(p_np))
-        p_participate = pd.Series(iso_floor, index=p_participate.index,
-                                  name='p_participate')
-
-    print('  p_participate:decay-weighted EWMA with isotonic floor (p < 0.05)')
+    # Isotonic regression floor for low-participation players (production only)
+    if attendance_start is None:
+        iso_path = MODELS_DIR / 'isotonic_regression.joblib'
+        if iso_path.exists():
+            iso_reg = joblib.load(iso_path)
+            p_np    = p_participate.to_numpy()
+            iso_floor = np.where(p_np > 0.05, p_np, iso_reg.predict(p_np))
+            p_participate = pd.Series(iso_floor, index=p_participate.index,
+                                      name='p_participate')
+        print('  p_participate: decay-weighted EWMA with isotonic floor (p < 0.05)')
 
     # ── Legacy scheduling-param path (backward compat for backtest) ──────────
     from .attendance import apply_schedule_adjustments
@@ -309,12 +334,17 @@ def load_player_usernames() -> pd.DataFrame:
     return df
 
 
-def load_backtest_results(model:str | None = None) -> pd.DataFrame:
-    """Load backtest results from DB. Pass model='decay' etc. to filter by model."""
+def load_backtest(model:str | None = None, since:str | None = None) -> pd.DataFrame:
+    """Load joint backtest results (score vs perf-rating). model='score' or 'perf'."""
     conn = sqlite3.connect(DB_PATH)
-    q    = 'SELECT * FROM backtest_results'
+    q = 'SELECT * FROM backtest'
+    wheres = []
     if model:
-        q += f" WHERE model = '{model}'"
-    df = pd.read_sql_query(q, conn, parse_dates=['date'])
+        wheres.append(f"model = '{model}'")
+    if since:
+        wheres.append(f"tourn_date >= '{since}'")
+    if wheres:
+        q += ' WHERE ' + ' AND '.join(wheres)
+    df = pd.read_sql_query(q, conn, parse_dates=['tourn_date'])
     conn.close()
     return df

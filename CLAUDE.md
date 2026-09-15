@@ -29,11 +29,8 @@ python scripts/place_bids.py
 # Fire taker orders for high-ROI opportunities
 python scripts/take_trades.py
 
-# Walk-forward backtest (writes to backtest_predictions table)
+# Walk-forward joint backtest of score vs perf-rating MC (writes to `backtest` table)
 python scripts/run_backtest.py
-
-# Simulate historical P&L from backtest predictions vs Kalshi market closes
-python scripts/backtest_pnl.py
 ```
 
 The `notebooks/command-center.ipynb` notebook is the primary interactive control surface for adjusting predictions before each tournament (nudges, cuts, overrides).
@@ -63,11 +60,12 @@ Chess.com → scripts/scraping/update_titled_tuesday.py → SQLite DB (data/titl
 
 **`src/data.py`** — `load_and_prepare()` reads standings from SQLite, computes decay-weighted skill history and EWMA participation rates, and applies an isotonic regression floor (`models/isotonic_regression.joblib`) to smooth low-attendance players.
 
-**`src/simulation.py`** — Two Monte Carlo modes:
-- `run_simulation()` + `build_player_pool()`: rank-percentile based (legacy)
-- `run_simulation_score()` + `build_player_pool_score()`: composite score (score×10000 + tiebreak), the current default
+**`src/simulation.py`** — Monte Carlo kernels + three player-pool builders (one per skill signal):
+- `build_player_pool()` + `run_simulation()`: rank-percentile (legacy, float32)
+- `build_player_pool_score()`: composite `score * 10000 + tiebreak` (production default)
+- `build_player_pool_perf()`: `performance_rating` (aroc-based Elo estimate; used by backtest)
 
-Runs in NumPy-vectorized chunks (`CHUNK=10_000` sims per batch). Returns `P_top{1,3,5,8,10}_given_play` (conditional on attendance) and `p_participate`.
+The score and perf pools feed a shared generic kernel `run_simulation_ranked` (also exposed as `run_simulation_score` for back-compat). Runs in NumPy-vectorized chunks (`CHUNK=10_000` sims per batch). Returns `P_top{1,3,5,8,10}_given_play` (conditional on attendance) and `p_participate`.
 
 **`src/pipeline.py`** — `run_predictions()` chains the full pipeline: load → build pool → raw simulation → apply in-memory adjustments (nudges/cuts/overrides/keeps) → adjusted simulation → optionally save to DB. The adjustment priority order is: `p_nudges` → `cut_players` → `p_participate_overrides` → `keep_players`.
 
@@ -90,7 +88,7 @@ Core tables:
 - `latest_model_predictions` — current adjusted predictions (overwritten each run)
 - `latest_model_predictions_raw` — pre-adjustment predictions (for comparison)
 - `historical_predictions` — archived past predictions
-- `backtest_predictions` — walk-forward backtest output
+- `backtest` — joint walk-forward backtest output; row = (tourn_date, model, username) with `model` in {`score`, `perf`}, includes `played` and `actual_rank` for calibration analysis
 - `kalshi_market_snapshots` — historical Kalshi ask/bid closes for backtesting P&L
 - `other_events` / `other_event_participants` — concurrent OTB tournaments (used for attendance modeling)
 

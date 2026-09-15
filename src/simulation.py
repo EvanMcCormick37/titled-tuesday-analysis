@@ -1,11 +1,15 @@
 """
 Core Monte Carlo simulation engine.
 
-Two modes:
-  rank-percentile  – build_player_pool       → run_simulation
-  score/tiebreak   – build_player_pool_score → run_simulation_score
+Three player-pool builders — one per skill signal:
+  build_player_pool         rank-percentile (legacy)
+  build_player_pool_score   score*10000 + tiebreak (production default)
+  build_player_pool_perf    performance_rating (aroc-based Elo estimate)
 
-Both produce (plays_ct, topn_ct) arrays consumed by build_results / print_top.
+All three feed into a single kernel:
+  run_simulation_ranked (also exposed as run_simulation_score for back-compat)
+
+The rank-percentile mode has its own kernel `run_simulation` for legacy callers.
 """
 
 import time
@@ -20,15 +24,17 @@ from .config import (
 
 # ── Player pool construction ──────────────────────────────────────────────────
 
+def _eligible_players(p_participate, app_counts, min_appearances, min_p):
+    idx = p_participate[p_participate >= min_p].index
+    if min_appearances > 0:
+        idx = idx.intersection(app_counts[app_counts >= min_appearances].index)
+    return idx
+
+
 def build_player_pool(df, p_participate, app_counts,
                       min_appearances=MIN_APPEARANCES, min_p=MIN_P):
-    """Return arrays for rank-percentile simulation, filtered to eligible players."""
-    eligible = p_participate[p_participate >= min_p].index
-    if min_appearances > 0:
-        eligible = eligible.intersection(
-            app_counts[app_counts >= min_appearances].index
-        )
-
+    """Return arrays for rank-percentile simulation (legacy)."""
+    eligible = _eligible_players(p_participate, app_counts, min_appearances, min_p)
     players = list(eligible)
     p_play  = p_participate.loc[players].to_numpy(dtype=np.float64)
 
@@ -48,38 +54,64 @@ def build_player_pool(df, p_participate, app_counts,
 
 def build_player_pool_score(df, p_participate, app_counts,
                             min_appearances=MIN_APPEARANCES, min_p=MIN_P):
-    """Like build_player_pool but stores (score, tiebreak) composites instead of rank_pct."""
-    eligible = p_participate[p_participate >= min_p].index
-    if min_appearances > 0:
-        eligible = eligible.intersection(
-            app_counts[app_counts >= min_appearances].index
-        )
-
+    """Composite (score*scale + tiebreak) player pool — production default."""
+    eligible = _eligible_players(p_participate, app_counts, min_appearances, min_p)
     players = list(eligible)
     p_play  = p_participate.loc[players].to_numpy(dtype=np.float64)
 
     grp = df.groupby('username')
-    hist_composites, hist_wts = [], []
+    hist_signals, hist_wts = [], []
     for u in players:
         g = grp.get_group(u)
-        composite = (
+        signal = (
             g['score'].to_numpy(dtype=np.float64) * _SCORE_COMPOSITE_SCALE
             + g['tie_break'].fillna(0).to_numpy(dtype=np.float64)
         )
         w = g['skill_w'].to_numpy(dtype=np.float64, copy=True)
         w /= w.sum()
-        hist_composites.append(composite)
+        hist_signals.append(signal)
         hist_wts.append(w)
 
-    print(f'  Player pool: {len(players):,}')
-    return players, p_play, hist_composites, hist_wts
+    print(f'  Player pool (score): {len(players):,}')
+    return players, p_play, hist_signals, hist_wts
+
+
+def build_player_pool_perf(df, p_participate, app_counts,
+                           min_appearances=MIN_APPEARANCES, min_p=MIN_P):
+    """Performance-rating player pool. Drops rows with NaN performance_rating.
+
+    A player is only eligible if they satisfy min_appearances *among rows with
+    performance_rating present*. Weights are renormalised over the retained
+    subset, so a player missing perf on some historical events is still usable
+    (their remaining history is upweighted).
+    """
+    df_valid = df[df['performance_rating'].notna()]
+    perf_app_counts = df_valid.groupby('username')['tournament_slug'].nunique()
+
+    eligible = _eligible_players(p_participate, perf_app_counts,
+                                 min_appearances, min_p)
+    players = list(eligible)
+    p_play  = p_participate.loc[players].to_numpy(dtype=np.float64)
+
+    grp = df_valid.groupby('username')
+    hist_signals, hist_wts = [], []
+    for u in players:
+        g = grp.get_group(u)
+        signal = g['performance_rating'].to_numpy(dtype=np.float64)
+        w = g['skill_w'].to_numpy(dtype=np.float64, copy=True)
+        w /= w.sum()
+        hist_signals.append(signal)
+        hist_wts.append(w)
+
+    print(f'  Player pool (perf-rating): {len(players):,}')
+    return players, p_play, hist_signals, hist_wts
 
 
 # ── Simulation kernels ────────────────────────────────────────────────────────
 
 def run_simulation(players, p_play, hist_pcts, hist_wts,
                    n_sims=N_SIMS, n_values=N_VALUES, chunk=CHUNK, seed=SEED):
-    """Rank-percentile MC. Returns (plays_ct, topn_ct)."""
+    """Rank-percentile MC (legacy, float32 signals). Returns (plays_ct, topn_ct)."""
     rng   = np.random.default_rng(seed)
     n     = len(players)
     max_N = max(n_values)
@@ -87,7 +119,6 @@ def run_simulation(players, p_play, hist_pcts, hist_wts,
     plays_ct = np.zeros(n, dtype=np.int64)
     topn_ct  = {k: np.zeros(n, dtype=np.int64) for k in n_values}
 
-    t0 = time.time()
     for start in range(0, n_sims, chunk):
         c = min(chunk, n_sims - start)
 
@@ -112,9 +143,9 @@ def run_simulation(players, p_play, hist_pcts, hist_wts,
     return plays_ct, topn_ct
 
 
-def run_simulation_score(players, p_play, hist_composites, hist_wts,
-                         n_sims=N_SIMS, n_values=N_VALUES, chunk=CHUNK, seed=SEED):
-    """Score/tiebreak MC. Returns (plays_ct, topn_ct)."""
+def run_simulation_ranked(players, p_play, hist_signals, hist_wts,
+                          n_sims=N_SIMS, n_values=N_VALUES, chunk=CHUNK, seed=SEED):
+    """Generic ranked-signal MC (float64). Works for score-composite or perf-rating pools."""
     rng   = np.random.default_rng(seed)
     n     = len(players)
     max_N = max(n_values)
@@ -127,8 +158,8 @@ def run_simulation_score(players, p_play, hist_composites, hist_wts,
 
         scores = np.empty((c, n), dtype=np.float64)
         for i in range(n):
-            idx = rng.choice(len(hist_composites[i]), size=c, p=hist_wts[i], replace=True)
-            scores[:, i] = hist_composites[i][idx]
+            idx = rng.choice(len(hist_signals[i]), size=c, p=hist_wts[i], replace=True)
+            scores[:, i] = hist_signals[i][idx]
 
         present = rng.random((c, n)) < p_play
         plays_ct += present.sum(axis=0)
@@ -144,6 +175,10 @@ def run_simulation_score(players, p_play, hist_composites, hist_wts,
             np.add.at(topn_ct[k], top_k[valid], 1)
 
     return plays_ct, topn_ct
+
+
+# Back-compat alias — existing callers (pipeline.py, notebooks) pass the same args.
+run_simulation_score = run_simulation_ranked
 
 
 # ── Output helpers ────────────────────────────────────────────────────────────
