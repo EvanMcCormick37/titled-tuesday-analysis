@@ -18,7 +18,7 @@ import pandas as pd
 
 from .config import (
     N_SIMS, N_VALUES, CHUNK, SEED, MIN_P, MIN_APPEARANCES,
-    _SCORE_COMPOSITE_SCALE,
+    SCORE_COMPOSITE_SCALE,
 )
 
 
@@ -64,7 +64,7 @@ def build_player_pool_score(df, p_participate, app_counts,
     for u in players:
         g = grp.get_group(u)
         signal = (
-            g['score'].to_numpy(dtype=np.float64) * _SCORE_COMPOSITE_SCALE
+            g['score'].to_numpy(dtype=np.float64) * SCORE_COMPOSITE_SCALE
             + g['tie_break'].fillna(0).to_numpy(dtype=np.float64)
         )
         w = g['skill_w'].to_numpy(dtype=np.float64, copy=True)
@@ -144,8 +144,14 @@ def run_simulation(players, p_play, hist_pcts, hist_wts,
 
 
 def run_simulation_ranked(players, p_play, hist_signals, hist_wts,
-                          n_sims=N_SIMS, n_values=N_VALUES, chunk=CHUNK, seed=SEED):
-    """Generic ranked-signal MC (float64). Works for score-composite or perf-rating pools."""
+                          n_sims=N_SIMS, n_values=N_VALUES, chunk=CHUNK, seed=SEED,
+                          noise_sigma=0.0):
+    """Generic ranked-signal MC (float64). Works for score-composite or perf-rating pools.
+
+    noise_sigma > 0 adds i.i.d. N(0, noise_sigma) noise to each sampled signal
+    (units match the caller's signal). Defaults to 0 (no smoothing); callers
+    who want smoothing pass a value from ``src.config`` explicitly.
+    """
     rng   = np.random.default_rng(seed)
     n     = len(players)
     max_N = max(n_values)
@@ -160,6 +166,9 @@ def run_simulation_ranked(players, p_play, hist_signals, hist_wts,
         for i in range(n):
             idx = rng.choice(len(hist_signals[i]), size=c, p=hist_wts[i], replace=True)
             scores[:, i] = hist_signals[i][idx]
+
+        if noise_sigma > 0.0:
+            scores += rng.normal(0.0, noise_sigma, size=scores.shape)
 
         present = rng.random((c, n)) < p_play
         plays_ct += present.sum(axis=0)

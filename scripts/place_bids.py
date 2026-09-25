@@ -51,11 +51,11 @@ def main() -> None:
         help="Number of contracts per bid (default: 1)",
     )
     parser.add_argument(
-        "--markup", type=float, default=1.6,
+        "--markup", type=float, default=1.5,
         help="Bid = fair / markup. Default 1.5 → bid = 2/3 fair.",
     )
     parser.add_argument(
-        "--max-discount", type=float, default=10,
+        "--max-discount", type=float, default=15,
         help="Maximum discount from fair price in dollars (default: 0.10).",
     )
     parser.add_argument(

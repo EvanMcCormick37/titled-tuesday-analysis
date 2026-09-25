@@ -45,9 +45,9 @@ def _load_predictions() -> pd.DataFrame:
 
 
 def _parse_n(title: str) -> int:
-    if re.search("win the Titled Tuesday weekly chess competition, originally scheduled for", title or "") is not None:
+    if re.search("Winner", title or "") is not None:
         return 1
-    m = re.search(r"\b(Top\s+)?(\d+)\b", title or "")
+    m = re.search(r"\b(Top\s+)(\d+)\b", title or "")
     if not m:
         return 1
     val = int(m.group(2))

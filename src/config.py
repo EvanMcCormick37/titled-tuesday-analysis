@@ -10,10 +10,10 @@ DATA_DIR     = PROJECT_ROOT / 'data'
 BACKTEST_DIR = PROJECT_ROOT / 'data' / 'backtest'
 
 # ── Monte Carlo hyperparameters ───────────────────────────────────────────────
-TOURN_DATE = "2026-09-15"   # Next Tuesday's date (YYYY-MM-DD)
+TOURN_DATE = "2026-09-29"   # Next Tuesday's date (YYYY-MM-DD)
 DATA_CUTOFF          = '2020-01-01'   # earliest date used for rank-pct history
 SKILL_DECAY          = 0.96
-PARTICIPATION_DECAY  = 0.85
+PARTICIPATION_DECAY  = 0.75
 MIN_PARTICIPATION_RATE = 0.005
 N_SIMS               = 100_000
 N_VALUES             = [1, 3, 5, 8, 10]
@@ -21,7 +21,10 @@ MIN_P                = 0.0
 MIN_APPEARANCES      = 5
 CHUNK                = 10_000
 SEED                 = 42
-_SCORE_COMPOSITE_SCALE = 10_000.0    # score*scale + tiebreak -> single sortable float
+SCORE_COMPOSITE_SCALE = 10_000.0    # score*scale + tiebreak -> single sortable float
+# Gaussian smoothing sigmas (composite-signal units — i.e. after multiplication by SCORE_COMPOSITE_SCALE).
+SCORE_GAUSSIAN_KERNEL_SIGMA_WIDE   = 5000.0    # 0.5 score-points; smooths across whole score buckets
+SCORE_GAUSSIAN_KERNEL_SIGMA_NARROW = 100.0     # ~2x tiebreak magnitude; smooths tiebreaks, keeps score ranks intact
 
 # ── Kalshi API ────────────────────────────────────────────────────────────────
 KALSHI_API_KEY_ID       = os.environ.get("KALSHI_API_KEY_ID", "")
@@ -36,7 +39,7 @@ MIN_APP    = 3              # minimum weeks attended to appear in training set
 # Tournaments before this date have their participation weight multiplied by
 # SEASON_SHIFT_FACTOR, downweighting pre-shift history relative to the new CCT
 # season era.  Set SEASON_SHIFT_DATE = None to disable.
-SEASON_SHIFT_DATE   = '2026-09-01 00:00:00'
+SEASON_SHIFT_DATE   = '2026-08-30 00:00:00'
 SEASON_SHIFT_FACTOR = 0.5
 
 # FEATURE_COLS = [

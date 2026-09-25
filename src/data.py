@@ -47,7 +47,8 @@ _PLAYER_ALIASES:dict[str, str] = {
     'Christopher Yoo':'Christopher Woojin Yoo',
     'Chris Yoo':'Christopher Woojin Yoo',
     'V Pranav':'Pranav Venkatesh',
-    'Pranesh M':'Pranesh Munirethinam'
+    'Pranesh M':'Pranesh Munirethinam',
+    "D Gukesh": "Gukesh D",
 }
 
 _USERNAME_TO_PLAYER:dict | None = None
