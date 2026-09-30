@@ -158,6 +158,50 @@ def get_username_mappings() -> tuple[dict, dict]:
     return _USERNAME_TO_PLAYER, _PLAYER_TO_USERNAME
 
 
+# ── Attendance-conflict Z_part reduction ──────────────────────────────────────
+
+def _conflict_z_deduction(conn: sqlite3.Connection, ref: pd.Timestamp,
+                          use_season_shift: bool,
+                          min_date: str | None) -> dict[str, float]:
+    """Return dict[username → weight to subtract from Z_part].
+
+    For each (username, conflict_date) in attendance_conflicts, compute the
+    same participation weight the numerator would have received had the player
+    attended: PARTICIPATION_DECAY**k with an optional SEASON_SHIFT_FACTOR
+    multiplier for pre-shift dates.  Summed across conflicts per user.
+    """
+    try:
+        rows = conn.execute(
+            'SELECT username, date FROM attendance_conflicts'
+        ).fetchall()
+    except sqlite3.OperationalError:
+        print('  Warning: attendance_conflicts table missing — run '
+              'scripts/build_attendance_conflicts.py to enable conflict-aware p_participate')
+        return {}
+
+    if not rows:
+        return {}
+
+    shift_ts = (pd.Timestamp(SEASON_SHIFT_DATE)
+                if use_season_shift and SEASON_SHIFT_DATE is not None else None)
+    min_ts = pd.Timestamp(min_date) if min_date else None
+    cutoff_ts = pd.Timestamp(DATA_CUTOFF)
+
+    dedu: dict[str, float] = {}
+    for username, dstr in rows:
+        d = pd.Timestamp(dstr)
+        if d >= ref or d < cutoff_ts:
+            continue
+        if min_ts is not None and d < min_ts:
+            continue
+        k = (ref - d) // pd.Timedelta(weeks=1)
+        w = PARTICIPATION_DECAY ** k
+        if shift_ts is not None and d < shift_ts:
+            w *= SEASON_SHIFT_FACTOR
+        dedu[username] = dedu.get(username, 0.0) + w
+    return dedu
+
+
 # ── Main data loader ──────────────────────────────────────────────────────────
 
 def load_and_prepare(scheduling_conflict=None, cut_players=None, keep_players=None,
@@ -221,6 +265,18 @@ def load_and_prepare(scheduling_conflict=None, cut_players=None, keep_players=No
     n_in_event  = df.groupby('tournament_slug')['username'].transform('count')
     df['rank_pct'] = 1.0 - (df['rank'].astype(float) - 1) / (n_in_event - 1)
 
+    # ── Conflict-week weights (per-user Z_part reduction) ────────────────────
+    # attendance_conflicts holds (date, player_name, username) rows for TT dates
+    # where a player had an unavoidable OTB broadcast round.  Those weeks are
+    # excluded from BOTH numerator (already absent from standings) and
+    # denominator (subtracted from Z_part below), so p_participate reflects the
+    # rate of attendance on weeks with no scheduling conflict.
+    conflict_deduction = _conflict_z_deduction(
+        conn, ref,
+        use_season_shift=(attendance_start is None),
+        min_date=attendance_start,
+    )
+
     # ── Participation calculation ────────────────────────────────────────────
     if attendance_start is not None:
         # Backtest mode: participation rate is derived exclusively from the
@@ -229,15 +285,17 @@ def load_and_prepare(scheduling_conflict=None, cut_players=None, keep_players=No
         att_mask = df['date'] >= att_ref
         N_att = max(1, int((ref - att_ref) / pd.Timedelta(weeks=1)))
         Z_part = sum(PARTICIPATION_DECAY ** k for k in range(N_att))
-        p_participate = (
-            df.loc[att_mask].groupby('username')['part_w'].sum() / Z_part
-        ).clip(lower=MIN_PARTICIPATION_RATE).rename('p_participate')
+        num = df.loc[att_mask].groupby('username')['part_w'].sum()
+        Z_user = (Z_part - num.index.to_series().map(conflict_deduction)
+                            .fillna(0.0)).clip(lower=1e-6)
+        p_participate = (num / Z_user).clip(lower=MIN_PARTICIPATION_RATE, upper=1.0).rename('p_participate')
         # Ensure every player in the skill dataset has a p_participate entry
         p_participate = p_participate.reindex(
             df['username'].unique(), fill_value=MIN_PARTICIPATION_RATE
         )
+        n_adj = int((num.index.to_series().map(conflict_deduction).fillna(0.0) > 0).sum())
         print(f'  p_participate: EWMA over {N_att} weeks since {attendance_start} '
-              f'(no season-shift, no isotonic floor)')
+              f'(no season-shift, no isotonic floor); {n_adj:,} players had conflict-week deductions')
     else:
         # EWMA baseline participation rate — normalise to what a perfect-attendance
         # player would accumulate under the same weighting scheme (incl. shift).
@@ -251,9 +309,12 @@ def load_and_prepare(scheduling_conflict=None, cut_players=None, keep_players=No
             )
         else:
             Z_part     = sum(PARTICIPATION_DECAY ** k for k in range(N))
-        p_participate = (
-            df.groupby('username')['part_w'].sum() / Z_part
-        ).clip(lower=MIN_PARTICIPATION_RATE).rename('p_participate')
+        num = df.groupby('username')['part_w'].sum()
+        Z_user = (Z_part - num.index.to_series().map(conflict_deduction)
+                            .fillna(0.0)).clip(lower=1e-6)
+        p_participate = (num / Z_user).clip(lower=MIN_PARTICIPATION_RATE, upper=1.0).rename('p_participate')
+        n_adj = int((num.index.to_series().map(conflict_deduction).fillna(0.0) > 0).sum())
+        print(f'  p_participate: {n_adj:,} players had conflict-week deductions applied to Z_part')
 
     # Isotonic regression floor for low-participation players (production only)
     if attendance_start is None:

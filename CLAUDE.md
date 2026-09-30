@@ -20,6 +20,12 @@ pip install -r requirements.txt
 # Scrape latest Titled Tuesday results into DB
 python scripts/scraping/update_titled_tuesday.py
 
+# Weekly: fetch Lichess broadcast dumps + rebuild attendance_conflicts
+python scripts/scraping/update_broadcasts.py
+
+# (Optional) rebuild only attendance_conflicts from existing other_event_* tables
+python scripts/build_attendance_conflicts.py
+
 # Run predictions for the upcoming tournament
 python scripts/make_predictions.py
 
@@ -90,7 +96,12 @@ Core tables:
 - `historical_predictions` — archived past predictions
 - `backtest` — joint walk-forward backtest output; row = (tourn_date, model, username) with `model` in {`score`, `perf`}, includes `played` and `actual_rank` for calibration analysis
 - `kalshi_market_snapshots` — historical Kalshi ask/bid closes for backtesting P&L
-- `other_events` / `other_event_participants` — concurrent OTB tournaments (used for attendance modeling)
+- `other_events` / `other_event_rounds` / `other_event_participants` — concurrent OTB tournaments parsed from monthly Lichess broadcast PGN dumps (`data/lichess_dumps/lichess_db_broadcast_YYYY-MM.pgn.zst`)
+- `attendance_conflicts` — (date, player_name, username) rows for TT dates when a player had an unavoidable broadcast-round conflict; rebuilt automatically at the end of `scripts/scraping/update_broadcasts.py` (weekly pipeline), or standalone via `scripts/build_attendance_conflicts.py`. Consumed by `src/data.load_and_prepare()` to subtract those weeks from each player's EWMA denominator so `p_participate` reflects the attendance rate on conflict-free weeks.
+
+### Broadcast Pipeline
+
+`scripts/scraping/update_broadcasts.py` is the weekly refresh entry point. It sweeps every month from `2020-01` through the current month, downloading any missing `lichess_db_broadcast_YYYY-MM.pgn.zst` and force-redownloading the last `--refresh-recent` months (default 2) since Lichess updates the current month continuously and finalises the previous month a few days into the new one. It then re-parses **all** local dumps (streaming, headers-only) so `other_events` aggregates stay correct for events whose games span month boundaries, upserts the three broadcast tables, and rebuilds `attendance_conflicts`. Use `--full-rebuild` to force re-download of everything.
 
 ### Username / Player Name Mapping
 
