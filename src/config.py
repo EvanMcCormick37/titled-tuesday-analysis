@@ -10,7 +10,7 @@ DATA_DIR     = PROJECT_ROOT / 'data'
 BACKTEST_DIR = PROJECT_ROOT / 'data' / 'backtest'
 
 # ── Monte Carlo hyperparameters ───────────────────────────────────────────────
-TOURN_DATE = "2026-09-29"   # Next Tuesday's date (YYYY-MM-DD)
+TOURN_DATE = "2026-10-06"   # Next Tuesday's date (YYYY-MM-DD)
 DATA_CUTOFF          = '2020-01-01'   # earliest date used for rank-pct history
 SKILL_DECAY          = 0.96
 PARTICIPATION_DECAY  = 0.75
