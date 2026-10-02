@@ -9,8 +9,11 @@
 #   1. Railway → New Service → GitHub Repo → EvanMcCormick37/titled-tuesday-analysis (branch: mobile-production)
 #   2. For each service, override the start command in the UI:
 #        tt-cron → python scripts/weekly_pipeline.py
-#        tt-app  → streamlit run app/dashboard.py --server.port=$PORT --server.address=0.0.0.0
+#        tt-app  → python -m streamlit run app/dashboard.py --server.port=$PORT --server.address=0.0.0.0
 #        tt-bot  → python app/telegram_bot.py
+#      Use `python -m streamlit` (not bare `streamlit`) — the module form is
+#      PATH-independent and avoids "executable not found" errors on PaaS hosts
+#      that run start commands through a stripped-down shell.
 #   3. For tt-cron only: set the cron schedule in the UI (Deploy tab → Cron Schedule).
 #      Expression: 0 15 * * TUE   (Tuesdays at 15:00 — local time, since TZ is set)
 #   4. Set the shared env vars listed below on each service (or on the project).
