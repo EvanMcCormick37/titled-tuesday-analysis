@@ -21,9 +21,8 @@
 [build]
 builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
-# GH_TOKEN is injected at build time via Railway's build-arg mechanism.
-# Set it on the service: Settings → Variables → RAILWAY_DOCKERFILE_BUILD_ARG_GH_TOKEN
-# (Railway maps any env var prefixed with RAILWAY_DOCKERFILE_BUILD_ARG_ to a Dockerfile ARG.)
+# kalshi-core is installed at container start by docker-entrypoint.sh, which
+# reads $GH_TOKEN (set as a regular service env var — not a build arg).
 
 [deploy]
 # Default start command — Railway cron overrides nothing here, it just invokes
@@ -39,7 +38,7 @@ restartPolicyType = "NEVER"
 #   KALSHI_PRIVATE_KEY_B64    = <base64 of ~/.kalshi/trading-key.txt>
 #   KALSHI_ENV                = prod
 #   TZ                        = America/New_York                  # so cron fires at 15:00 ET year-round
-#   RAILWAY_DOCKERFILE_BUILD_ARG_GH_TOKEN = <GitHub PAT with repo scope>
+#   GH_TOKEN                  = <GitHub PAT with repo scope>      # read by entrypoint to install kalshi-core
 #
 # tt-app only:
 #   PORT                      = (auto-provided by Railway)
