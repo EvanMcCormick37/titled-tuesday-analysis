@@ -11,5 +11,7 @@ python-dotenv
 tzdata
 sqlalchemy>=2.0
 psycopg[binary]>=3.1
+streamlit>=1.37
+plotly>=5.22
 # kalshi-core (local package) — install separately: pip install -e /path/to/kalshi-core
 # On Railway: baked in at Docker build time via pip install git+https://${GH_TOKEN}@github.com/EvanMcCormick37/kalshi-core.git@main
