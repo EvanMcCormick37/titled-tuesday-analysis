@@ -1,0 +1,30 @@
+# Keep the image slim: skip anything the pipeline doesn't need at runtime.
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.ipynb_checkpoints
+
+# Local-only artefacts
+notebooks
+logs
+
+# Historical cache we're deleting in Phase 0 anyway — never belongs in the image
+data/lichess_dumps
+
+# The DB itself is a runtime volume mount, not an image artefact
+data/titled_tuesday.db
+data/titled_tuesday.db-journal
+data/titled_tuesday.db-wal
+data/titled_tuesday.db-shm
+
+# API cache is runtime-only too (rebuilt from scratch)
+data/api_cache
+
+# Secrets never go in the image
+trading-key.txt
+.env

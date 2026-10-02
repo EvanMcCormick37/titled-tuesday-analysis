@@ -45,6 +45,34 @@ TT_SLUG_RE = re.compile(
     r'/tournament/live/((?:early-|late-)?titled-tuesday-blitz-[a-z]+-\d{2}-\d{4}-\d+)'
 )
 
+# Bare-slug form, no leading '/tournament/live/' — for validating a user-pasted slug.
+_TT_BARE_SLUG_RE = re.compile(
+    r'^((?:early-|late-)?titled-tuesday-blitz-[a-z]+-\d{2}-\d{4}-\d+)$'
+)
+
+
+class ListingMissingSlugError(RuntimeError):
+    """Raised when the chess.com listing page has no new TT slug yet.
+
+    The pipeline uses this signal to prompt the user for a direct URL.
+    """
+
+
+def _slug_from_url(url_or_slug: str) -> str:
+    """Extract a TT slug from a chess.com tournament URL, or validate a bare slug.
+
+    Accepts either a full URL (https://www.chess.com/tournament/live/<slug>?...)
+    or a bare slug string. Raises ValueError if neither pattern matches.
+    """
+    s = url_or_slug.strip()
+    m = TT_SLUG_RE.search(s)
+    if m:
+        return m.group(1)
+    m = _TT_BARE_SLUG_RE.match(s)
+    if m:
+        return m.group(1)
+    raise ValueError(f'Not a recognisable TT slug or URL: {url_or_slug!r}')
+
 MONTH_MAP = {
     'january': 1, 'february': 2, 'march': 3, 'april': 4,
     'may': 5, 'june': 6, 'july': 7, 'august': 8,
@@ -455,7 +483,7 @@ def process(slug: str) -> None:
 
 def main() -> None:
     if len(sys.argv) > 1:
-        process(sys.argv[1])
+        process(_slug_from_url(sys.argv[1]))
         return
 
     known = known_slugs()

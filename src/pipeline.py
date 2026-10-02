@@ -286,3 +286,65 @@ def next_tourn_date() -> str:
     ).fetchone()[0]
     conn.close()
     return (pd.Timestamp(last) + pd.Timedelta(weeks=1)).date().isoformat()
+
+
+def load_adjustments(tourn_date: str) -> dict:
+    """Read manual_adjustments for `tourn_date` and shape them for run_adjusted().
+
+    Returns a dict with the kwarg names run_adjusted() expects:
+        cut_players, keep_players, p_participate_overrides, p_nudges, global_nudge.
+
+    If a player has multiple rows of the same type, the most recently created
+    row wins (ORDER BY created_at). This is the user's running "last edit wins"
+    expectation from the notebook workflow.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        rows = conn.execute(
+            """
+            SELECT player_name, adjustment_type, value
+              FROM manual_adjustments
+             WHERE tourn_date = ?
+             ORDER BY created_at ASC
+            """,
+            (tourn_date,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    cut: dict[str, None] = {}        # dicts preserve insertion order so last-write-wins is natural
+    keep: dict[str, None] = {}
+    overrides: dict[str, float] = {}
+    nudges: dict[str, float] = {}
+    global_nudge: float = 0.0
+
+    for name, kind, value in rows:
+        if kind == 'cut':
+            cut[name] = None
+            keep.pop(name, None); overrides.pop(name, None); nudges.pop(name, None)
+        elif kind == 'keep':
+            keep[name] = None
+            cut.pop(name, None); overrides.pop(name, None); nudges.pop(name, None)
+        elif kind == 'override':
+            if value is None:
+                raise ValueError(f"manual_adjustments: 'override' row for {name!r} has NULL value")
+            overrides[name] = float(value)
+            cut.pop(name, None); keep.pop(name, None)
+        elif kind == 'nudge':
+            if value is None:
+                raise ValueError(f"manual_adjustments: 'nudge' row for {name!r} has NULL value")
+            nudges[name] = float(value)
+        elif kind == 'global_nudge':
+            if value is None:
+                raise ValueError("manual_adjustments: 'global_nudge' row has NULL value")
+            global_nudge = float(value)
+        else:
+            raise ValueError(f"manual_adjustments: unknown adjustment_type {kind!r}")
+
+    return {
+        'cut_players':             list(cut),
+        'keep_players':            list(keep),
+        'p_participate_overrides': overrides,
+        'p_nudges':                nudges,
+        'global_nudge':            global_nudge,
+    }

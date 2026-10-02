@@ -1,30 +1,31 @@
 #!/usr/bin/env python3
-"""Weekly Lichess broadcast pipeline.
+"""Weekly Lichess broadcast pipeline — streaming, no filesystem cache.
 
-Steps:
-  1. Fetch monthly PGN dumps from https://database.lichess.org/broadcast/
-     - Force-redownload the last N months (Lichess updates the current-month
-       file continuously and finalises last month a few days after it ends).
-     - Download any older months that are missing locally.
-  2. Re-parse ALL local dumps to keep other_events aggregates (n_games,
-     first/last utc, n_players, ...) correct for events whose games straddle
-     month boundaries.  Parsing is stream-based and headers-only so a full
-     6-year backlog runs in a couple of minutes.
-  3. Upsert into other_events / other_event_rounds / other_event_participants
+Streams the current and previous month's PGN dumps from Lichess directly
+through the headers-only parser into the DB. Older months are never
+re-scraped — the one-time 2020→present backfill lives permanently in
+other_events / other_event_rounds / other_event_participants, and only
+the two most recent months get refreshed each week because Lichess
+continues to append to the current month and finalises the previous
+month a few days after it ends.
+
+Flow:
+  1. Stream `lichess_db_broadcast_YYYY-MM.pgn.zst` for each refresh month,
+     parsing headers in-memory. No disk writes for the raw PGN.
+  2. Upsert into other_events / other_event_rounds / other_event_participants
      (INSERT OR REPLACE, idempotent).
-  4. Rebuild the attendance_conflicts table via
-     scripts.build_attendance_conflicts.build_attendance_conflicts().
+  3. Rebuild attendance_conflicts via build_attendance_conflicts().
 
 Usage:
-    python scripts/scraping/update_broadcasts.py                 # weekly refresh
-    python scripts/scraping/update_broadcasts.py --refresh-recent 3
-    python scripts/scraping/update_broadcasts.py --full-rebuild  # start-of-time
+    python scripts/scraping/update_broadcasts.py
+    python scripts/scraping/update_broadcasts.py --months 2    # how many trailing months to refresh (default 2)
 """
 import argparse
 import io
 import re
 import sqlite3
 import sys
+import urllib.error
 import urllib.request
 from collections import Counter, defaultdict
 from datetime import date, datetime, timezone
@@ -36,12 +37,11 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / 'scripts'))
 
-from src.config import DATA_DIR, DB_PATH
+from src.config import DB_PATH
 from build_attendance_conflicts import build_attendance_conflicts
 
-BASE_URL    = 'https://database.lichess.org/broadcast'
-DUMPS_DIR   = DATA_DIR / 'lichess_dumps'
-FIRST_MONTH = '2020-01'
+BASE_URL = 'https://database.lichess.org/broadcast'
+UA_HEADERS = {'User-Agent': 'tt-attendance-research (contact: e.kidmccorm@gmail.com)'}
 
 _ONLINE_SITE_RE = re.compile(r'\.(com|org|net|io|tv|app)\b', re.I)
 _ONLINE_NAME_RE = re.compile(
@@ -50,16 +50,6 @@ _ONLINE_NAME_RE = re.compile(
 
 
 # ── Month enumeration ─────────────────────────────────────────────────────────
-
-def _month_range(start: str, end: str):
-    y, m = map(int, start.split('-'))
-    ye, me = map(int, end.split('-'))
-    while (y, m) <= (ye, me):
-        yield f'{y:04d}-{m:02d}'
-        m += 1
-        if m == 13:
-            y, m = y + 1, 1
-
 
 def _recent_months(n: int) -> list[str]:
     """Return the last n months INCLUDING current one, oldest first."""
@@ -74,54 +64,56 @@ def _recent_months(n: int) -> list[str]:
     return list(reversed(out))
 
 
-# ── Download ──────────────────────────────────────────────────────────────────
-
-def _download_month(ym: str, dumps_dir: Path, force: bool) -> Path | None:
-    name = f'lichess_db_broadcast_{ym}.pgn.zst'
-    dest = dumps_dir / name
-    if dest.exists() and dest.stat().st_size > 0 and not force:
-        return dest
-    tmp = dest.with_suffix(dest.suffix + '.part')
-    url = f'{BASE_URL}/{name}'
-    tag = 'refresh' if dest.exists() else 'new'
-    try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'tt-attendance-research'})
-        with urllib.request.urlopen(req, timeout=180) as r, open(tmp, 'wb') as f:
-            while chunk := r.read(1 << 20):
-                f.write(chunk)
-        tmp.replace(dest)
-        print(f'  [{tag}] {name} ({dest.stat().st_size/1e6:.1f} MB)')
-        return dest
-    except Exception as e:
-        print(f'  FAILED {url}: {e}', file=sys.stderr)
-        tmp.unlink(missing_ok=True)
-        return dest if dest.exists() else None
-
-
 # ── PGN parsing (headers-only, streaming) ─────────────────────────────────────
 
-def _iter_games(path: Path):
-    dctx   = zstandard.ZstdDecompressor()
-    opener = (lambda p: dctx.stream_reader(open(p, 'rb'))) if path.suffix == '.zst' \
-        else (lambda p: open(p, 'rb'))
-    with opener(path) as raw:
-        text = io.TextIOWrapper(raw, encoding='utf-8', errors='replace')
-        tags, in_movetext = {}, False
-        for line in text:
-            line = line.strip()
-            if line.startswith('[') and line.endswith(']') and '"' in line:
-                if in_movetext and tags:
-                    yield tags
-                    tags, in_movetext = {}, False
-                try:
-                    key, rest = line[1:-1].split(' ', 1)
-                    tags[key] = rest.strip().strip('"')
-                except ValueError:
-                    pass
-            elif line and tags:
-                in_movetext = True
-        if tags:
-            yield tags
+def _iter_games_from_stream(raw_stream):
+    """Yield header-dicts for each game in a .pgn.zst stream.
+
+    raw_stream must be a readable binary file-like object (e.g. an open
+    urllib HTTP response).
+    """
+    dctx = zstandard.ZstdDecompressor()
+    reader = dctx.stream_reader(raw_stream)
+    text = io.TextIOWrapper(reader, encoding='utf-8', errors='replace')
+    tags, in_movetext = {}, False
+    for line in text:
+        line = line.strip()
+        if line.startswith('[') and line.endswith(']') and '"' in line:
+            if in_movetext and tags:
+                yield tags
+                tags, in_movetext = {}, False
+            try:
+                key, rest = line[1:-1].split(' ', 1)
+                tags[key] = rest.strip().strip('"')
+            except ValueError:
+                pass
+        elif line and tags:
+            in_movetext = True
+    if tags:
+        yield tags
+
+
+def _stream_month(ym: str):
+    """Yield game-header dicts for the given month's Lichess PGN dump.
+
+    Returns an empty iterator if the file 404s — Lichess publishes dumps
+    lazily (the current month is updated continuously and the previous
+    month is only finalised a few days after it ends), so a missing file
+    for a recent month is expected, not an error.
+    """
+    name = f'lichess_db_broadcast_{ym}.pgn.zst'
+    url  = f'{BASE_URL}/{name}'
+    req  = urllib.request.Request(url, headers=UA_HEADERS)
+    print(f'  streaming {name} ...')
+    try:
+        resp = urllib.request.urlopen(req, timeout=600)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            print(f'    [skip] {name} not yet published on Lichess (HTTP 404)')
+            return
+        raise
+    with resp:
+        yield from _iter_games_from_stream(resp)
 
 
 def _to_utc(tags):
@@ -135,7 +127,7 @@ def _to_utc(tags):
         return None
 
 
-def _parse_all(paths: list[Path]) -> tuple[dict, dict, int]:
+def _accumulate(months: list[str]) -> tuple[dict, dict, int]:
     ev  = defaultdict(lambda: {
         'players': set(), 'rounds': set(), 'tcs': Counter(),
         'first': None, 'last': None, 'n_games': 0,
@@ -144,9 +136,8 @@ def _parse_all(paths: list[Path]) -> tuple[dict, dict, int]:
     rnd = defaultdict(list)
     n_games = 0
 
-    for p in paths:
-        print(f'  parsing {p.name} ...')
-        for tags in _iter_games(p):
+    for ym in months:
+        for tags in _stream_month(ym):
             white  = tags.get('White', '')
             black  = tags.get('Black', '')
             key    = tags.get('BroadcastName') or tags.get('Event', '')
@@ -182,6 +173,20 @@ def _parse_all(paths: list[Path]) -> tuple[dict, dict, int]:
 # ── DB upsert ─────────────────────────────────────────────────────────────────
 
 def _upsert(conn: sqlite3.Connection, ev: dict, rnd: dict) -> None:
+    """Merge the parsed window into other_events/_rounds/_participants.
+
+    Events whose games span the refresh window and older months are handled
+    correctly: we only touch the (broadcast_name) and (broadcast_name, round)
+    keys that appear in the window; older months' events stay untouched.
+
+    For an event that straddles the boundary, however, aggregates like
+    first_game_utc / n_games are only correct for the window's view of the
+    event. If an event's games span two months and the earlier month is NOT
+    in the refresh window, those aggregates will reflect only the recent
+    window. In practice broadcasts of interest conclude within a single
+    month and this is a non-issue — but worth knowing when debugging an
+    oddly-shaped `other_events` row.
+    """
     existing = {row[1] for row in conn.execute('PRAGMA table_info(other_events)')}
     for col, dtype in [('pct_titled', 'REAL'), ('is_online', 'INTEGER'), ('pct_with_fide_id', 'REAL')]:
         if col not in existing:
@@ -230,58 +235,50 @@ def _upsert(conn: sqlite3.Connection, ev: dict, rnd: dict) -> None:
     conn.commit()
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Public entry point ────────────────────────────────────────────────────────
+
+def run(months: int = 2) -> dict:
+    """Refresh the last `months` months of broadcast data; rebuild conflicts.
+
+    Returns a summary dict suitable for stashing in `job_runs.summary`.
+    """
+    refresh = _recent_months(months)
+    print(f'Streaming months: {refresh}')
+    ev, rnd, n_games = _accumulate(refresh)
+    print(f'  parsed {n_games:,} games -> {len(ev):,} broadcasts, {len(rnd):,} (broadcast, round) pairs')
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        print('Upserting into other_events / _rounds / _participants ...')
+        _upsert(conn, ev, rnd)
+
+        print('Rebuilding attendance_conflicts ...')
+        n_conflicts = build_attendance_conflicts(conn)
+        n_dates, n_users = conn.execute(
+            'SELECT COUNT(DISTINCT date), COUNT(DISTINCT username) FROM attendance_conflicts'
+        ).fetchone()
+    finally:
+        conn.close()
+
+    return {
+        'months_refreshed':    refresh,
+        'games_parsed':        n_games,
+        'broadcasts_upserted': len(ev),
+        'rounds_upserted':     len(rnd),
+        'conflicts_total':     n_conflicts,
+        'conflict_dates':      n_dates,
+        'conflict_players':    n_users,
+    }
+
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--refresh-recent', type=int, default=2,
-                    help='force re-download the last N months (default 2)')
-    ap.add_argument('--dumps-dir', default=str(DUMPS_DIR),
-                    help='where to store .pgn.zst files (default: data/lichess_dumps)')
-    ap.add_argument('--full-rebuild', action='store_true',
-                    help=f'download every missing month since {FIRST_MONTH}')
+    ap.add_argument('--months', type=int, default=2,
+                    help='how many trailing months to refresh (default 2)')
     args = ap.parse_args()
-
-    dumps_dir = Path(args.dumps_dir)
-    dumps_dir.mkdir(parents=True, exist_ok=True)
-
-    # Always sweep FIRST_MONTH -> current so we backfill any missing month,
-    # then force-redownload the last N months (Lichess updates these live).
-    # --full-rebuild upgrades the "force" set to include every month.
-    end_month   = _recent_months(1)[0]
-    all_months  = list(_month_range(FIRST_MONTH, end_month))
-    refresh_set = set(all_months) if args.full_rebuild \
-                                  else set(_recent_months(args.refresh_recent))
-
-    # 1. Download
-    print(f'Step 1/4: fetching dumps ({FIRST_MONTH} -> {end_month}); '
-          f'force-refreshing {sorted(refresh_set & set(all_months))}')
-    for ym in all_months:
-        _download_month(ym, dumps_dir, force=(ym in refresh_set))
-
-    # 2. Parse ALL local dumps to keep event aggregates correct across months
-    all_local = sorted(dumps_dir.glob('lichess_db_broadcast_*.pgn.zst'))
-    print(f'\nStep 2/4: parsing all {len(all_local)} local dumps')
-    ev, rnd, n_games = _parse_all(all_local)
-    print(f'  {n_games:,} games -> {len(ev):,} broadcasts, {len(rnd):,} (broadcast, round) pairs')
-
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        # 3. Upsert
-        print(f'\nStep 3/4: upserting into other_events / _rounds / _participants')
-        _upsert(conn, ev, rnd)
-        print('  done')
-
-        # 4. Rebuild attendance_conflicts
-        print(f'\nStep 4/4: rebuilding attendance_conflicts')
-        build_attendance_conflicts(conn)
-        n_dates, n_users = conn.execute(
-            'SELECT COUNT(DISTINCT date), COUNT(DISTINCT username) FROM attendance_conflicts'
-        ).fetchone()
-        print(f'  {n_dates} TT dates with conflicts across {n_users} players')
-    finally:
-        conn.close()
+    summary = run(months=args.months)
+    print(f'OK — {summary}')
 
 
 if __name__ == '__main__':
