@@ -79,9 +79,15 @@ def get_tt_positions_df(
     event_date: Union[date, str, None] = None,
     sleep: float = 0.05,
 ) -> pd.DataFrame:
-    """Fetch current TT positions from Kalshi API.
+    """Fetch current TT positions from Kalshi API, with fee-inclusive cost basis.
 
-    Returns columns: ticker, marketTitle, n, position, volume, cost, avg_price.
+    Joins Kalshi's live position data against the local kalshi-core `fills`
+    DB so transaction fees are reflected in `cost_incl_fees` and
+    `avg_price_incl_fees`. `cost` and `avg_price` remain Kalshi's raw
+    exposure numbers (fee-exclusive) for backward compatibility.
+
+    Returns columns: ticker, marketTitle, n, position, volume, cost, fees,
+    cost_incl_fees, avg_price, avg_price_incl_fees.
     """
     if event_date is None:
         event_date = _next_tuesday()
@@ -125,6 +131,21 @@ def get_tt_positions_df(
     tt["cost"]     = tt[exp_col].astype(float)
     tt["avg_price"] = tt["cost"] / tt["volume"]
 
+    # Fee-inclusive cost basis. kalshi_core.db.get_fills reads from the
+    # central ~/.kalshi/data/kalshi.db populated by sync_fills(client).
+    fees_by_ticker: dict[str, float] = {}
+    try:
+        from kalshi_core import get_fills
+        fills = get_fills()
+        if not fills.empty and "fee_cost" in fills.columns:
+            fees_by_ticker = fills.groupby("ticker")["fee_cost"].sum().to_dict()
+    except Exception as e:
+        print(f"  Warning: could not load fills for fee lookup: {e}")
+
+    tt["fees"] = tt["ticker"].map(fees_by_ticker).fillna(0.0).astype(float)
+    tt["cost_incl_fees"]      = tt["cost"] + tt["fees"]
+    tt["avg_price_incl_fees"] = tt["cost_incl_fees"] / tt["volume"]
+
     market_titles: dict[str, str] = {}
     for ticker in tt["ticker"]:
         try:
@@ -137,4 +158,6 @@ def get_tt_positions_df(
             time.sleep(sleep)
 
     tt["marketTitle"] = tt["ticker"].map(market_titles)
-    return tt[["ticker", "marketTitle", "n", "position", "volume", "cost", "avg_price"]].reset_index(drop=True)
+    return tt[["ticker", "marketTitle", "n", "position", "volume",
+               "cost", "fees", "cost_incl_fees",
+               "avg_price", "avg_price_incl_fees"]].reset_index(drop=True)
