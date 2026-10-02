@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """Create the orchestration tables (manual_adjustments, pipeline_runs, job_runs).
 
-Idempotent — safe to re-run. SQLite flavour of the schemas defined in §4 of
-ORCHESTRATION_AUTOMATION_PLAN.md. The Postgres cutover in Phase 1 will replace
-INTEGER PRIMARY KEY AUTOINCREMENT with SERIAL and the ISO-string timestamp
-columns with TIMESTAMPTZ, but the column names and semantics stay identical.
+Idempotent — safe to re-run. SQLite-flavoured. Phase 1 Postgres init lives in
+scripts/init_postgres_schema.py and declares the same tables with SERIAL /
+TIMESTAMPTZ / JSONB.
 """
-import sqlite3
 import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.config import DB_PATH
+from src.db import get_conn, is_postgres
 
 # ISO-8601 UTC with ms precision — mirrors what Postgres' TIMESTAMPTZ serialises to.
 _NOW_DEFAULT = "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
@@ -67,24 +65,26 @@ DDL = [
 ]
 
 
-def init(conn: sqlite3.Connection) -> None:
+def init(conn) -> None:
     for stmt in DDL:
         conn.execute(stmt)
     conn.commit()
 
 
 def main() -> None:
-    conn = sqlite3.connect(DB_PATH)
-    try:
+    if is_postgres():
+        raise RuntimeError(
+            'This is the SQLite-only migration. For Postgres, run '
+            'scripts/init_postgres_schema.py instead.'
+        )
+    with get_conn() as conn:
         init(conn)
         tables = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' "
             "AND name IN ('manual_adjustments','pipeline_runs','job_runs') "
             "ORDER BY name"
         ).fetchall()
-        print(f"OK — orchestration tables present: {[t[0] for t in tables]}")
-    finally:
-        conn.close()
+        print(f"OK -- orchestration tables present: {[t[0] for t in tables]}")
 
 
 if __name__ == '__main__':

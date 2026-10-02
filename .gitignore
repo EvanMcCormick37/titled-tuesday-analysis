@@ -16,3 +16,6 @@ data
 # Sensitive Info: .env file and portfolio API key
 .env
 trading-key.txt
+.env.local
+
+.kalshi_b64.tmp

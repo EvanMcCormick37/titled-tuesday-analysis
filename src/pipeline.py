@@ -13,13 +13,13 @@ Two public functions:
 Both can persist results to the DB via save_to_db / save_official flags.
 """
 
-import sqlite3
 from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
 
-from .config import DB_PATH, N_SIMS
+from .config import N_SIMS
+from .db import get_conn, get_engine, write_df_replace
 from .data import load_and_prepare, get_username_mappings, resolve_player_names
 from .simulation import build_player_pool_score, run_simulation_score, build_results
 
@@ -194,9 +194,7 @@ def _save_raw_to_db(results_raw: pd.DataFrame, tourn_date: str) -> None:
     out = results_raw[keep_cols].reset_index()
     out['tourn_date'] = tourn_date
 
-    conn = sqlite3.connect(DB_PATH)
-    out.to_sql('latest_model_predictions_raw', conn, if_exists='replace', index=False)
-    conn.close()
+    write_df_replace(out, 'latest_model_predictions_raw')
     print(f'Saved {len(out):,} rows -> latest_model_predictions_raw (unadjusted)')
 
 
@@ -210,9 +208,7 @@ def _save_adjusted_to_db(
     out['tourn_date'] = tourn_date
     out['attendance_altered'] = out['username'].isin(altered).astype(int)
 
-    conn = sqlite3.connect(DB_PATH)
-    out.to_sql('latest_model_predictions', conn, if_exists='replace', index=False)
-    conn.close()
+    write_df_replace(out, 'latest_model_predictions')
 
     n_altered = int(out['attendance_altered'].sum())
     print(f'Saved {len(out):,} rows -> latest_model_predictions ({n_altered} attendance_altered)')
@@ -225,9 +221,7 @@ def load_adj_run_from_db(tourn_date: str | None = None) -> AdjustedRun:
     then rebuilds pool arrays (players, hist_composites, hist_wts) from standings
     — fast (~5s), no MC simulation required.
     """
-    conn = sqlite3.connect(DB_PATH)
-    saved = pd.read_sql_query('SELECT * FROM latest_model_predictions', conn)
-    conn.close()
+    saved = pd.read_sql_query('SELECT * FROM latest_model_predictions', get_engine())
 
     if saved.empty:
         raise RuntimeError('No rows in latest_model_predictions — run run_adjusted() first.')
@@ -258,9 +252,7 @@ def load_raw_results_from_db(tourn_date: str | None = None) -> pd.DataFrame:
 
     Returns DataFrame indexed by username with P_top{N} and ip_adv_top{N} columns added.
     """
-    conn = sqlite3.connect(DB_PATH)
-    saved = pd.read_sql_query('SELECT * FROM latest_model_predictions_raw', conn)
-    conn.close()
+    saved = pd.read_sql_query('SELECT * FROM latest_model_predictions_raw', get_engine())
 
     if saved.empty:
         raise RuntimeError('No rows in latest_model_predictions_raw — run run_raw() first.')
@@ -280,11 +272,10 @@ def load_raw_results_from_db(tourn_date: str | None = None) -> pd.DataFrame:
 
 def next_tourn_date() -> str:
     """Return the ISO date of the next Titled Tuesday (one week after the latest in DB)."""
-    conn = sqlite3.connect(DB_PATH)
-    last = conn.execute(
-        'SELECT MAX(date) FROM titled_tuesday_standings'
-    ).fetchone()[0]
-    conn.close()
+    with get_conn() as conn:
+        last = conn.execute(
+            'SELECT MAX(date) FROM titled_tuesday_standings'
+        ).fetchone()[0]
     return (pd.Timestamp(last) + pd.Timedelta(weeks=1)).date().isoformat()
 
 
@@ -298,8 +289,7 @@ def load_adjustments(tourn_date: str) -> dict:
     row wins (ORDER BY created_at). This is the user's running "last edit wins"
     expectation from the notebook workflow.
     """
-    conn = sqlite3.connect(DB_PATH)
-    try:
+    with get_conn() as conn:
         rows = conn.execute(
             """
             SELECT player_name, adjustment_type, value
@@ -309,8 +299,6 @@ def load_adjustments(tourn_date: str) -> dict:
             """,
             (tourn_date,),
         ).fetchall()
-    finally:
-        conn.close()
 
     cut: dict[str, None] = {}        # dicts preserve insertion order so last-write-wins is natural
     keep: dict[str, None] = {}

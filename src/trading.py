@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import re
-import sqlite3
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -11,8 +10,9 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from kalshi_core import KalshiClient, _to_kalshi_date, bid_cents, best_ask, apply_pullback, kalshi_order_price
-from .config import DB_PATH, TOURN_DATE
+from .config import TOURN_DATE
 from .data import get_username_mappings
+from .db import get_engine
 from .kalshi_tt import _TT_EVENT_TEMPLATES, get_tt_asks
 
 _TEMPLATE_N: dict[str, int] = {
@@ -38,9 +38,7 @@ def _expiry_ts(tourn_date: str) -> int:
 
 
 def _load_predictions() -> pd.DataFrame:
-    conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("SELECT * FROM latest_model_predictions", conn)
-    conn.close()
+    df = pd.read_sql_query("SELECT * FROM latest_model_predictions", get_engine())
     return df.set_index("username")
 
 

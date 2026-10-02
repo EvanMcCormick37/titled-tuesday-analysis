@@ -23,7 +23,6 @@ Usage:
 import argparse
 import io
 import re
-import sqlite3
 import sys
 import urllib.error
 import urllib.request
@@ -37,7 +36,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / 'scripts'))
 
-from src.config import DB_PATH
+from src.db import get_conn, table_columns, upsert_many
 from build_attendance_conflicts import build_attendance_conflicts
 
 BASE_URL = 'https://database.lichess.org/broadcast'
@@ -172,7 +171,7 @@ def _accumulate(months: list[str]) -> tuple[dict, dict, int]:
 
 # ── DB upsert ─────────────────────────────────────────────────────────────────
 
-def _upsert(conn: sqlite3.Connection, ev: dict, rnd: dict) -> None:
+def _upsert(conn, ev: dict, rnd: dict) -> None:
     """Merge the parsed window into other_events/_rounds/_participants.
 
     Events whose games span the refresh window and older months are handled
@@ -187,7 +186,7 @@ def _upsert(conn: sqlite3.Connection, ev: dict, rnd: dict) -> None:
     month and this is a non-issue — but worth knowing when debugging an
     oddly-shaped `other_events` row.
     """
-    existing = {row[1] for row in conn.execute('PRAGMA table_info(other_events)')}
+    existing = table_columns(conn, 'other_events')
     for col, dtype in [('pct_titled', 'REAL'), ('is_online', 'INTEGER'), ('pct_with_fide_id', 'REAL')]:
         if col not in existing:
             conn.execute(f'ALTER TABLE other_events ADD COLUMN {col} {dtype}')
@@ -209,28 +208,31 @@ def _upsert(conn: sqlite3.Connection, ev: dict, rnd: dict) -> None:
             pct_titl, is_online, pct_fide,
         )
 
-    conn.executemany(
-        '''INSERT OR REPLACE INTO other_events
-           (broadcast_name, first_game_utc, last_game_utc,
-            n_rounds, n_games, n_players, modal_time_control,
-            pct_titled, is_online, pct_with_fide_id)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-        [_row(k, e) for k, e in ev.items()],
+    upsert_many(
+        conn, 'other_events',
+        columns=['broadcast_name', 'first_game_utc', 'last_game_utc',
+                 'n_rounds', 'n_games', 'n_players', 'modal_time_control',
+                 'pct_titled', 'is_online', 'pct_with_fide_id'],
+        rows=[_row(k, e) for k, e in ev.items()],
+        conflict_cols=['broadcast_name'],
     )
-    conn.executemany(
-        '''INSERT OR REPLACE INTO other_event_rounds
-           (broadcast_name, round, n_games, earliest_start_utc, median_start_utc)
-           VALUES (?, ?, ?, ?, ?)''',
-        [
+    upsert_many(
+        conn, 'other_event_rounds',
+        columns=['broadcast_name', 'round', 'n_games',
+                 'earliest_start_utc', 'median_start_utc'],
+        rows=[
             (k, r, len(dts),
              sorted(dts)[0].isoformat(),
              sorted(dts)[len(dts) // 2].isoformat())
             for (k, r), dts in rnd.items()
         ],
+        conflict_cols=['broadcast_name', 'round'],
     )
-    conn.executemany(
-        'INSERT OR REPLACE INTO other_event_participants (broadcast_name, player_name) VALUES (?, ?)',
-        [(k, player) for k, e in ev.items() for player in e['players']],
+    upsert_many(
+        conn, 'other_event_participants',
+        columns=['broadcast_name', 'player_name'],
+        rows=[(k, player) for k, e in ev.items() for player in e['players']],
+        conflict_cols=['broadcast_name', 'player_name'],
     )
     conn.commit()
 
@@ -247,8 +249,7 @@ def run(months: int = 2) -> dict:
     ev, rnd, n_games = _accumulate(refresh)
     print(f'  parsed {n_games:,} games -> {len(ev):,} broadcasts, {len(rnd):,} (broadcast, round) pairs')
 
-    conn = sqlite3.connect(DB_PATH)
-    try:
+    with get_conn() as conn:
         print('Upserting into other_events / _rounds / _participants ...')
         _upsert(conn, ev, rnd)
 
@@ -257,8 +258,6 @@ def run(months: int = 2) -> dict:
         n_dates, n_users = conn.execute(
             'SELECT COUNT(DISTINCT date), COUNT(DISTINCT username) FROM attendance_conflicts'
         ).fetchone()
-    finally:
-        conn.close()
 
     return {
         'months_refreshed':    refresh,

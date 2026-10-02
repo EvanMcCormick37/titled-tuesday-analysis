@@ -19,7 +19,6 @@ Usage:
 """
 import argparse
 import json
-import sqlite3
 import sys
 import time
 import traceback
@@ -40,7 +39,7 @@ sys.path.insert(0, str(PROJECT_ROOT / 'scripts' / 'scraping'))
 
 import requests  # for RequestException classification
 
-from src.config import DB_PATH
+from src.db import get_conn
 from src.pipeline import run_raw, next_tourn_date
 from update_titled_tuesday import (
     ListingMissingSlugError,
@@ -72,7 +71,7 @@ def _now_iso() -> str:
 
 # ── pipeline_runs / job_runs helpers ─────────────────────────────────────────
 
-def _get_or_create_pipeline_run(conn: sqlite3.Connection, tourn_date: str) -> dict:
+def _get_or_create_pipeline_run(conn, tourn_date: str) -> dict:
     """Return the pipeline_runs row for this tourn_date, creating one if absent."""
     row = conn.execute(
         'SELECT id, tourn_date, state, current_step, failed_step, error_kind, error_message, started_at, completed_at '
@@ -88,10 +87,10 @@ def _get_or_create_pipeline_run(conn: sqlite3.Connection, tourn_date: str) -> di
         return _get_or_create_pipeline_run(conn, tourn_date)
     cols = ('id', 'tourn_date', 'state', 'current_step', 'failed_step',
             'error_kind', 'error_message', 'started_at', 'completed_at')
-    return dict(zip(cols, row))
+    return {c: v for c, v in zip(cols, row)}
 
 
-def _set_pipeline_state(conn: sqlite3.Connection, pr_id: int, **fields) -> None:
+def _set_pipeline_state(conn, pr_id: int, **fields) -> None:
     if not fields:
         return
     cols = ', '.join(f'{k} = ?' for k in fields)
@@ -100,17 +99,17 @@ def _set_pipeline_state(conn: sqlite3.Connection, pr_id: int, **fields) -> None:
     conn.commit()
 
 
-def _start_job(conn: sqlite3.Connection, pr_id: int, job_name: str) -> int:
-    cur = conn.execute(
-        'INSERT INTO job_runs (pipeline_run_id, job_name, status) VALUES (?, ?, ?)',
+def _start_job(conn, pr_id: int, job_name: str) -> int:
+    row = conn.execute(
+        'INSERT INTO job_runs (pipeline_run_id, job_name, status) VALUES (?, ?, ?) RETURNING id',
         (pr_id, job_name, 'running'),
-    )
+    ).fetchone()
     conn.commit()
-    return cur.lastrowid
+    return row[0]
 
 
 def _end_job(
-    conn: sqlite3.Connection,
+    conn,
     job_id: int,
     *,
     status: str,
@@ -213,7 +212,7 @@ def run_pipeline(resume_from: str | None = None, slug_override: str | None = Non
     tourn_date = _most_recent_tuesday().isoformat()
     print(f'[weekly_pipeline] tourn_date = {tourn_date}')
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_conn()
     try:
         pr = _get_or_create_pipeline_run(conn, tourn_date)
         pr_id = pr['id']

@@ -13,7 +13,6 @@ Usage:
     python scripts/build_attendance_conflicts.py
 """
 
-import sqlite3
 import sys
 import unicodedata
 from collections import defaultdict
@@ -22,7 +21,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.config import DB_PATH
+from src.db import get_conn
 
 
 def _norm_name(s: str) -> str:
@@ -37,10 +36,10 @@ def _norm_name(s: str) -> str:
     return ' '.join(s.lower().split())
 
 
-def build_attendance_conflicts(conn: sqlite3.Connection) -> int:
+def build_attendance_conflicts(conn) -> int:
     # 1. TT dates (YYYY-MM-DD)
-    tt_dates = {row[0] for row in conn.execute(
-        'SELECT DISTINCT date(date) FROM titled_tuesday_standings'
+    tt_dates = {str(row[0])[:10] for row in conn.execute(
+        'SELECT DISTINCT substr(CAST(date AS TEXT), 1, 10) FROM titled_tuesday_standings'
     ).fetchall()}
 
     # 2. norm(player_name) → (username, player_name), preferring is_default=1
@@ -59,9 +58,10 @@ def build_attendance_conflicts(conn: sqlite3.Connection) -> int:
     # 3. broadcast → set of TT-date rounds
     broadcast_tt_dates: dict[str, set[str]] = defaultdict(set)
     for bname, rdate in conn.execute(
-        'SELECT broadcast_name, date(earliest_start_utc) FROM other_event_rounds'
+        'SELECT broadcast_name, substr(CAST(earliest_start_utc AS TEXT), 1, 10) FROM other_event_rounds'
     ):
-        if rdate in tt_dates:
+        rdate = str(rdate)[:10] if rdate is not None else None
+        if rdate and rdate in tt_dates:
             broadcast_tt_dates[bname].add(rdate)
 
     # 4. For each participant in a conflict-carrying broadcast, emit a row per date
@@ -106,8 +106,8 @@ def build_attendance_conflicts(conn: sqlite3.Connection) -> int:
 
 
 def main() -> None:
-    print(f'Building attendance_conflicts in {DB_PATH}...')
-    conn = sqlite3.connect(DB_PATH)
+    print('Building attendance_conflicts...')
+    conn = get_conn()
     try:
         build_attendance_conflicts(conn)
         n_dates, n_users = conn.execute(

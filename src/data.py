@@ -1,21 +1,21 @@
 """
 Data loading and player-pool construction.
 
-Reads from the SQLite database at data/titled_tuesday.db.
-All MC-ready arrays come from load_and_prepare() → build_player_pool*().
+Reads from the configured database (SQLite locally, Postgres on Railway) via
+src.db.get_conn / get_engine. All MC-ready arrays come from
+load_and_prepare() → build_player_pool*().
 """
-
-import sqlite3
 
 import joblib
 import numpy as np
 import pandas as pd
 
 from .config import (
-    DB_PATH, MODELS_DIR,
+    MODELS_DIR,
     DATA_CUTOFF, SKILL_DECAY, PARTICIPATION_DECAY, MIN_PARTICIPATION_RATE,
     SEASON_SHIFT_DATE, SEASON_SHIFT_FACTOR,
 )
+from .db import get_conn, get_engine, table_columns
 
 
 # ── Username / player-name mapping ────────────────────────────────────────────
@@ -55,7 +55,7 @@ _USERNAME_TO_PLAYER:dict | None = None
 _PLAYER_TO_USERNAME:dict | None = None
 
 
-def _populate_is_default(conn:sqlite3.Connection) -> None:
+def _populate_is_default(conn) -> None:
     """Set is_default=1 for each player's most-recently-seen TT username, 0 for all others."""
     conn.execute('UPDATE player_information SET is_default = 0')
     latest = dict(conn.execute(
@@ -74,10 +74,9 @@ def _populate_is_default(conn:sqlite3.Connection) -> None:
     conn.commit()
 
 
-def _ensure_is_default(conn:sqlite3.Connection) -> None:
+def _ensure_is_default(conn) -> None:
     """Add is_default column to player_information and populate it if not present."""
-    cols = {row[1] for row in conn.execute('PRAGMA table_info(player_information)')}
-    if 'is_default' not in cols:
+    if 'is_default' not in table_columns(conn, 'player_information'):
         conn.execute('ALTER TABLE player_information ADD COLUMN is_default INTEGER DEFAULT 0')
         conn.commit()
         _populate_is_default(conn)
@@ -86,10 +85,9 @@ def _ensure_is_default(conn:sqlite3.Connection) -> None:
 def refresh_default_usernames() -> None:
     """Re-compute is_default flags from current TT standings. Call after new data is loaded."""
     global _USERNAME_TO_PLAYER, _PLAYER_TO_USERNAME
-    conn = sqlite3.connect(DB_PATH)
-    _ensure_is_default(conn)
-    _populate_is_default(conn)
-    conn.close()
+    with get_conn() as conn:
+        _ensure_is_default(conn)
+        _populate_is_default(conn)
     _USERNAME_TO_PLAYER = None
     _PLAYER_TO_USERNAME = None
 
@@ -139,12 +137,11 @@ def get_username_mappings() -> tuple[dict, dict]:
     """
     global _USERNAME_TO_PLAYER, _PLAYER_TO_USERNAME
     if _USERNAME_TO_PLAYER is None:
-        conn = sqlite3.connect(DB_PATH)
-        _ensure_is_default(conn)
-        rows = conn.execute(
-            'SELECT username, player_name, is_default FROM player_information WHERE player_name IS NOT NULL'
-        ).fetchall()
-        conn.close()
+        with get_conn() as conn:
+            _ensure_is_default(conn)
+            rows = conn.execute(
+                'SELECT username, player_name, is_default FROM player_information WHERE player_name IS NOT NULL'
+            ).fetchall()
         _USERNAME_TO_PLAYER = {u:p for u, p, _ in rows}
         # Build PLAYER_TO_USERNAME:prefer is_default=1; fall back to last row for the name
         _PLAYER_TO_USERNAME = {}
@@ -160,7 +157,7 @@ def get_username_mappings() -> tuple[dict, dict]:
 
 # ── Attendance-conflict Z_part reduction ──────────────────────────────────────
 
-def _conflict_z_deduction(conn: sqlite3.Connection, ref: pd.Timestamp,
+def _conflict_z_deduction(conn, ref: pd.Timestamp,
                           use_season_shift: bool,
                           min_date: str | None) -> dict[str, float]:
     """Return dict[username → weight to subtract from Z_part].
@@ -174,7 +171,7 @@ def _conflict_z_deduction(conn: sqlite3.Connection, ref: pd.Timestamp,
         rows = conn.execute(
             'SELECT username, date FROM attendance_conflicts'
         ).fetchall()
-    except sqlite3.OperationalError:
+    except Exception:
         print('  Warning: attendance_conflicts table missing — run '
               'scripts/build_attendance_conflicts.py to enable conflict-aware p_participate')
         return {}
@@ -240,12 +237,14 @@ def load_and_prepare(scheduling_conflict=None, cut_players=None, keep_players=No
 
     ref = pd.Timestamp(as_of) if as_of else pd.Timestamp.now()
 
-    conn = sqlite3.connect(DB_PATH)
+    engine = get_engine()
     q = f"SELECT * FROM titled_tuesday_standings WHERE date >= '{DATA_CUTOFF}'"
     if as_of:
-        q += f" AND date(date) < '{ref.date()}'"
-    df = pd.read_sql_query(q, conn)
-    df['date'] = pd.to_datetime(df['date'], format='mixed')
+        q += f" AND substr(CAST(date AS TEXT), 1, 10) < '{ref.date()}'"
+    df = pd.read_sql_query(q, engine)
+    # Postgres returns TIMESTAMPTZ as tz-aware; SQLite returns strings. Normalize
+    # to tz-naive UTC so downstream arithmetic (`ref - df['date']`) is consistent.
+    df['date'] = pd.to_datetime(df['date'], format='mixed', utc=True).dt.tz_localize(None)
 
     df = (
         df.sort_values('rank')
@@ -271,11 +270,12 @@ def load_and_prepare(scheduling_conflict=None, cut_players=None, keep_players=No
     # excluded from BOTH numerator (already absent from standings) and
     # denominator (subtracted from Z_part below), so p_participate reflects the
     # rate of attendance on weeks with no scheduling conflict.
-    conflict_deduction = _conflict_z_deduction(
-        conn, ref,
-        use_season_shift=(attendance_start is None),
-        min_date=attendance_start,
-    )
+    with get_conn() as _conn:
+        conflict_deduction = _conflict_z_deduction(
+            _conn, ref,
+            use_season_shift=(attendance_start is None),
+            min_date=attendance_start,
+        )
 
     # ── Participation calculation ────────────────────────────────────────────
     if attendance_start is not None:
@@ -342,7 +342,6 @@ def load_and_prepare(scheduling_conflict=None, cut_players=None, keep_players=No
         min_obs_opportunism=min_obs_opportunism,
     )
 
-    conn.close()
     app_counts = df.groupby('username')['tournament_slug'].nunique().rename('appearances')
     print(f'  {N} events | {df["username"].nunique():,} unique players '
           f'| {df["date"].min().date()} to {df["date"].max().date()}')
@@ -353,52 +352,39 @@ def load_and_prepare(scheduling_conflict=None, cut_players=None, keep_players=No
 
 def load_standings(since=None) -> pd.DataFrame:
     """Load standings table from DB, optionally filtering by date."""
-    conn = sqlite3.connect(DB_PATH)
-    q    = 'SELECT * FROM titled_tuesday_standings'
+    q = 'SELECT * FROM titled_tuesday_standings'
     if since:
         q += f" WHERE date >= '{since}'"
-    df = pd.read_sql_query(q, conn, parse_dates=['date'])
-    conn.close()
-    return df
+    return pd.read_sql_query(q, get_engine(), parse_dates=['date'])
 
 
 def load_tournaments(since=None) -> pd.DataFrame:
     """Load tournaments table from DB, optionally filtering by date."""
-    conn = sqlite3.connect(DB_PATH)
-    q    = 'SELECT * FROM titled_tuesday_tournaments'
+    q = 'SELECT * FROM titled_tuesday_tournaments'
     if since:
         q += f" WHERE date >= '{since}'"
-    df = pd.read_sql_query(q, conn, parse_dates=['date'])
-    conn.close()
-    return df
+    return pd.read_sql_query(q, get_engine(), parse_dates=['date'])
 
 
 def load_kalshi_portfolio() -> pd.DataFrame:
     """Load Kalshi portfolio snapshot from DB."""
-    conn = sqlite3.connect(DB_PATH)
-    df   = pd.read_sql_query('SELECT * FROM kalshi_portfolio', conn)
-    conn.close()
-    return df
+    return pd.read_sql_query('SELECT * FROM kalshi_portfolio', get_engine())
 
 
 def load_model_predictions() -> pd.DataFrame:
     """Load latest MC model predictions from DB."""
-    conn = sqlite3.connect(DB_PATH)
-    df   = pd.read_sql_query('SELECT * FROM latest_model_predictions', conn)
-    conn.close()
-    return df
+    return pd.read_sql_query('SELECT * FROM latest_model_predictions', get_engine())
+
 
 def load_player_usernames() -> pd.DataFrame:
     """Load all player chess.com usernames form DB"""
-    conn = sqlite3.connect(DB_PATH)
-    df   = pd.read_sql_query("SELECT DISTINCT username FROM titled_tuesday_standings", conn)
-    conn.close()
-    return df
+    return pd.read_sql_query(
+        'SELECT DISTINCT username FROM titled_tuesday_standings', get_engine()
+    )
 
 
 def load_backtest(model:str | None = None, since:str | None = None) -> pd.DataFrame:
     """Load joint backtest results (score vs perf-rating). model='score' or 'perf'."""
-    conn = sqlite3.connect(DB_PATH)
     q = 'SELECT * FROM backtest'
     wheres = []
     if model:
@@ -407,6 +393,4 @@ def load_backtest(model:str | None = None, since:str | None = None) -> pd.DataFr
         wheres.append(f"tourn_date >= '{since}'")
     if wheres:
         q += ' WHERE ' + ' AND '.join(wheres)
-    df = pd.read_sql_query(q, conn, parse_dates=['tourn_date'])
-    conn.close()
-    return df
+    return pd.read_sql_query(q, get_engine(), parse_dates=['tourn_date'])

@@ -21,7 +21,6 @@ Be polite: sleeps between requests and sends a User-Agent header.
 import json
 import random
 import re
-import sqlite3
 import sys
 import threading
 import time
@@ -35,7 +34,7 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
-from src.config import DB_PATH
+from src.db import get_conn, get_engine, table_columns
 
 HEADERS   = {'User-Agent': 'titled-tuesday-research (contact: e.kidmccorm@gmail.com)'}
 LISTING   = 'https://www.chess.com/tournament/live/titled-tuesdays'
@@ -170,15 +169,15 @@ def _enrich_one(username: str, cache: Path) -> dict:
     return row
 
 
-def _ensure_enrich_columns(conn: sqlite3.Connection):
-    existing = {row[1] for row in conn.execute("PRAGMA table_info(player_information)")}
+def _ensure_enrich_columns(conn):
+    existing = table_columns(conn, 'player_information')
     for col, dtype in _ENRICH_NEW_COLS.items():
         if col not in existing:
             conn.execute(f"ALTER TABLE player_information ADD COLUMN {col} {dtype}")
     conn.commit()
 
 
-def _write_enriched_row(conn: sqlite3.Connection, row: dict):
+def _write_enriched_row(conn, row: dict):
     def _v(val):
         return val if val not in ("", None) else None
 
@@ -211,7 +210,7 @@ def _write_enriched_row(conn: sqlite3.Connection, row: dict):
     )
 
 
-def _insert_new_players(conn: sqlite3.Connection, usernames: list[str]) -> list[str]:
+def _insert_new_players(conn, usernames: list[str]) -> list[str]:
     """Insert usernames not yet in player_information; return the newly inserted ones."""
     new = []
     for u in usernames:
@@ -224,7 +223,7 @@ def _insert_new_players(conn: sqlite3.Connection, usernames: list[str]) -> list[
     return new
 
 
-def enrich_players(conn: sqlite3.Connection, usernames: list[str], workers: int = 4) -> None:
+def enrich_players(conn, usernames: list[str], workers: int = 4) -> None:
     """Fetch chess.com profile data for each username and write it to player_information."""
     if not usernames:
         return
@@ -261,9 +260,8 @@ def slug_to_title(slug: str) -> str:
 
 
 def known_slugs() -> set:
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute('SELECT tournament_slug FROM titled_tuesday_tournaments').fetchall()
-    conn.close()
+    with get_conn() as conn:
+        rows = conn.execute('SELECT tournament_slug FROM titled_tuesday_tournaments').fetchall()
     return {r[0] for r in rows}
 
 
@@ -328,8 +326,8 @@ def parse_round_cells(cells, round_indices: list) -> tuple[int, int, int]:
     return wins, draws, byes
 
 
-def _ensure_aroc_column(conn: sqlite3.Connection):
-    existing = {row[1] for row in conn.execute("PRAGMA table_info(titled_tuesday_standings)")}
+def _ensure_aroc_column(conn):
+    existing = table_columns(conn, 'titled_tuesday_standings')
     for col in ('aroc_1', 'performance_rating'):
         if col not in existing:
             conn.execute(f"ALTER TABLE titled_tuesday_standings ADD COLUMN {col} REAL")
@@ -423,14 +421,17 @@ def process(slug: str) -> None:
     players = fetch_standings(slug)
     winner  = next((p['username'] for p in players if p['rank'] == 1), None)
 
-    conn = sqlite3.connect(DB_PATH)
-    _ensure_aroc_column(conn)
+    engine = get_engine()
 
-    # standings: delete old rows, insert new
-    old_n = conn.execute(
-        'SELECT COUNT(*) FROM titled_tuesday_standings WHERE tournament_slug = ?', (slug,)
-    ).fetchone()[0]
-    conn.execute('DELETE FROM titled_tuesday_standings WHERE tournament_slug = ?', (slug,))
+    with get_conn() as conn:
+        _ensure_aroc_column(conn)
+
+        # standings: delete old rows, insert new
+        old_n = conn.execute(
+            'SELECT COUNT(*) FROM titled_tuesday_standings WHERE tournament_slug = ?', (slug,)
+        ).fetchone()[0]
+        conn.execute('DELETE FROM titled_tuesday_standings WHERE tournament_slug = ?', (slug,))
+        conn.commit()
 
     new_rows = pd.DataFrame([{
         'date':            f'{date} 00:00:00' if date else None,
@@ -449,14 +450,17 @@ def process(slug: str) -> None:
         'draws':           p['draws'],
         'byes':            p['byes'],
     } for p in players])
-    new_rows.to_sql('titled_tuesday_standings', conn, if_exists='append', index=False)
+    new_rows.to_sql('titled_tuesday_standings', engine, if_exists='append', index=False)
     print(f'  standings: replaced {old_n} rows -> {len(new_rows)} new')
 
     # tournaments: delete old row, insert new
     existing = pd.read_sql_query(
-        'SELECT * FROM titled_tuesday_tournaments WHERE tournament_slug = ?', conn, params=(slug,)
+        'SELECT * FROM titled_tuesday_tournaments WHERE tournament_slug = :slug',
+        engine, params={'slug': slug},
     )
-    conn.execute('DELETE FROM titled_tuesday_tournaments WHERE tournament_slug = ?', (slug,))
+
+    with get_conn() as conn:
+        conn.execute('DELETE FROM titled_tuesday_tournaments WHERE tournament_slug = ?', (slug,))
 
     new_tourn = {
         'date':            f'{date} 00:00:00' if date else None,
@@ -468,17 +472,14 @@ def process(slug: str) -> None:
         'tournament_slug': slug,
         'url':             url,
     }
-    pd.DataFrame([new_tourn]).to_sql('titled_tuesday_tournaments', conn, if_exists='append', index=False)
+    pd.DataFrame([new_tourn]).to_sql('titled_tuesday_tournaments', engine, if_exists='append', index=False)
     print(f'  tournaments: num_players={len(players)}, winner={winner}')
-
-    conn.commit()
 
     # enrich any usernames not yet in player_information
     all_usernames = [p['username'] for p in players if p['username']]
-    new_usernames = _insert_new_players(conn, all_usernames)
-    enrich_players(conn, new_usernames)
-
-    conn.close()
+    with get_conn() as conn:
+        new_usernames = _insert_new_players(conn, all_usernames)
+        enrich_players(conn, new_usernames)
 
 
 def main() -> None:

@@ -1,0 +1,50 @@
+# Railway service config for Titled Tuesday — Phase 1 (tt-cron only).
+#
+# Phases 2+ will add tt-app (Streamlit) and tt-bot (Telegram) as additional
+# services in the same Railway project. Each service is created via the
+# Railway UI pointing at this repo; this file provides the build + default
+# deploy config shared by all services.
+#
+# To create the three services:
+#   1. Railway → New Service → GitHub Repo → EvanMcCormick37/titled-tuesday-analysis (branch: mobile-production)
+#   2. For each service, override the start command in the UI:
+#        tt-cron → python scripts/weekly_pipeline.py
+#        tt-app  → streamlit run app/dashboard.py --server.port=$PORT --server.address=0.0.0.0
+#        tt-bot  → python app/telegram_bot.py
+#   3. For tt-cron only: set the cron schedule in the UI (Deploy tab → Cron Schedule).
+#      Expression: 0 15 * * TUE   (Tuesdays at 15:00 — local time, since TZ is set)
+#   4. Set the shared env vars listed below on each service (or on the project).
+#
+# Shared build:  all three services use the Dockerfile at the repo root and
+# pass GH_TOKEN as a build arg so pip can install the private kalshi-core.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+# GH_TOKEN is injected at build time via Railway's build-arg mechanism.
+# Set it on the service: Settings → Variables → RAILWAY_DOCKERFILE_BUILD_ARG_GH_TOKEN
+# (Railway maps any env var prefixed with RAILWAY_DOCKERFILE_BUILD_ARG_ to a Dockerfile ARG.)
+
+[deploy]
+# Default start command — Railway cron overrides nothing here, it just invokes
+# the container with this CMD on each schedule tick.
+startCommand = "python scripts/weekly_pipeline.py"
+restartPolicyType = "NEVER"
+# healthcheckPath has no meaning for a cron job; leave unset.
+
+# ── Env vars required (set per-service in Railway UI) ────────────────────────
+# Shared across all services:
+#   DATABASE_URL              = ${{ Postgres.DATABASE_URL }}     # Railway internal reference
+#   KALSHI_API_KEY_ID         = <from ~/.kalshi/.env>
+#   KALSHI_PRIVATE_KEY_B64    = <base64 of ~/.kalshi/trading-key.txt>
+#   KALSHI_ENV                = prod
+#   TZ                        = America/New_York                  # so cron fires at 15:00 ET year-round
+#   RAILWAY_DOCKERFILE_BUILD_ARG_GH_TOKEN = <GitHub PAT with repo scope>
+#
+# tt-app only:
+#   PORT                      = (auto-provided by Railway)
+#   DASHBOARD_PASSWORD        = <long random>
+#
+# tt-bot only:
+#   TELEGRAM_BOT_TOKEN        = <from @BotFather>
+#   TELEGRAM_CHAT_ID          = <your private chat id>

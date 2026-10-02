@@ -16,14 +16,13 @@ Original three-step logic:
   3. Opportunism boost              → p += shrunk_slope × n_top_conflicted
 """
 
-import sqlite3
 import unicodedata
 from collections import defaultdict
 
 import numpy as np
 import pandas as pd
 
-from .config import DB_PATH
+from .db import get_conn
 
 
 # ── Name normalisation ────────────────────────────────────────────────────────
@@ -49,11 +48,10 @@ def _resolve_player_names(player_names: list[str]) -> dict[str, str]:
     names (e.g. 'Sarin, Nihal' → 'nihalsarin').
     Returns dict[player_name → username] for matched names only.
     """
-    conn = sqlite3.connect(DB_PATH)
-    pi_rows = conn.execute(
-        'SELECT username, player_name FROM player_information WHERE player_name IS NOT NULL'
-    ).fetchall()
-    conn.close()
+    with get_conn() as conn:
+        pi_rows = conn.execute(
+            'SELECT username, player_name FROM player_information WHERE player_name IS NOT NULL'
+        ).fetchall()
 
     exact: dict[str, str] = {}
     prefix_list: list[tuple[str, str]] = []
@@ -93,75 +91,74 @@ def _compute_conflict_rates(
     if not cut_usernames:
         return {}
 
-    conn = sqlite3.connect(DB_PATH)
-    tt_dates = {row[0][:10] for row in conn.execute(
-        'SELECT DISTINCT date FROM titled_tuesday_standings'
-    ).fetchall()}
+    with get_conn() as conn:
+        tt_dates = {str(row[0])[:10] for row in conn.execute(
+            'SELECT DISTINCT date FROM titled_tuesday_standings'
+        ).fetchall()}
 
-    cut_set = set(cut_usernames)
-    pi_rows = conn.execute(
-        'SELECT username, player_name FROM player_information WHERE player_name IS NOT NULL'
-    ).fetchall()
+        cut_set = set(cut_usernames)
+        pi_rows = conn.execute(
+            'SELECT username, player_name FROM player_information WHERE player_name IS NOT NULL'
+        ).fetchall()
 
-    exact: dict[str, str] = {}
-    prefix_list: list[tuple[str, str]] = []
-    for uname, pname in pi_rows:
-        if uname not in cut_set:
-            continue
-        n = _norm_name(pname)
-        exact[n] = uname
-        prefix_list.append((n, uname))
-    prefix_list.sort(key=lambda x: -len(x[0]))
+        exact: dict[str, str] = {}
+        prefix_list: list[tuple[str, str]] = []
+        for uname, pname in pi_rows:
+            if uname not in cut_set:
+                continue
+            n = _norm_name(pname)
+            exact[n] = uname
+            prefix_list.append((n, uname))
+        prefix_list.sort(key=lambda x: -len(x[0]))
 
-    def _lookup(oep_name: str):
-        n = _norm_name(oep_name)
-        if n in exact:
-            return exact[n]
-        oep_words = set(n.split())
-        for known_norm, uname in prefix_list:
-            known_words = set(known_norm.split())
-            if len(known_words) >= 2 and known_words <= oep_words:
-                return uname
-        return None
+        def _lookup(oep_name: str):
+            n = _norm_name(oep_name)
+            if n in exact:
+                return exact[n]
+            oep_words = set(n.split())
+            for known_norm, uname in prefix_list:
+                known_words = set(known_norm.split())
+                if len(known_words) >= 2 and known_words <= oep_words:
+                    return uname
+            return None
 
-    oep_rows = conn.execute(
-        'SELECT broadcast_name, player_name FROM other_event_participants'
-    ).fetchall()
-    event_to_cut: dict[str, set] = defaultdict(set)
-    for bname, pname in oep_rows:
-        u = _lookup(pname)
-        if u:
-            event_to_cut[bname].add(u)
+        oep_rows = conn.execute(
+            'SELECT broadcast_name, player_name FROM other_event_participants'
+        ).fetchall()
+        event_to_cut: dict[str, set] = defaultdict(set)
+        for bname, pname in oep_rows:
+            u = _lookup(pname)
+            if u:
+                event_to_cut[bname].add(u)
 
-    oer_rows = conn.execute(
-        'SELECT broadcast_name, date(earliest_start_utc) FROM other_event_rounds'
-    ).fetchall()
-    user_round_dates: dict[str, set] = defaultdict(set)
-    for bname, rdate in oer_rows:
-        for u in event_to_cut.get(bname, ()):
-            user_round_dates[u].add(rdate)
+        oer_rows = conn.execute(
+            'SELECT broadcast_name, substr(CAST(earliest_start_utc AS TEXT), 1, 10) FROM other_event_rounds'
+        ).fetchall()
+        user_round_dates: dict[str, set] = defaultdict(set)
+        for bname, rdate in oer_rows:
+            for u in event_to_cut.get(bname, ()):
+                user_round_dates[u].add(str(rdate))
 
-    result: dict[str, float] = {}
-    for username in cut_usernames:
-        conflict_dates = sorted(user_round_dates[username] & tt_dates)
-        n_c = len(conflict_dates)
-        if n_c < 3:
-            print(f'  {username}: only {n_c} conflict TT date(s) - leaving p_participate unchanged')
-            continue
-        all_accts = account_groups.get(username, [username])
-        acc_ph = ','.join('?' * len(all_accts))
-        dt_ph  = ','.join('?' * n_c)
-        n_att  = conn.execute(
-            f'SELECT COUNT(DISTINCT date(date)) FROM titled_tuesday_standings '
-            f'WHERE username IN ({acc_ph}) AND date(date) IN ({dt_ph})',
-            all_accts + conflict_dates,
-        ).fetchone()[0]
-        rate = n_att / n_c
-        result[username] = rate
-        note = f' (combined {len(all_accts)} accounts)' if len(all_accts) > 1 else ''
-        print(f'  {username}{note}: {n_att}/{n_c} conflict TTs -> conflict_rate={rate:.3f}')
+        result: dict[str, float] = {}
+        for username in cut_usernames:
+            conflict_dates = sorted(user_round_dates[username] & tt_dates)
+            n_c = len(conflict_dates)
+            if n_c < 3:
+                print(f'  {username}: only {n_c} conflict TT date(s) - leaving p_participate unchanged')
+                continue
+            all_accts = account_groups.get(username, [username])
+            acc_ph = ','.join('?' * len(all_accts))
+            dt_ph  = ','.join('?' * n_c)
+            n_att  = conn.execute(
+                f'SELECT COUNT(DISTINCT substr(CAST(date AS TEXT), 1, 10)) FROM titled_tuesday_standings '
+                f'WHERE username IN ({acc_ph}) AND substr(CAST(date AS TEXT), 1, 10) IN ({dt_ph})',
+                all_accts + conflict_dates,
+            ).fetchone()[0]
+            rate = n_att / n_c
+            result[username] = rate
+            note = f' (combined {len(all_accts)} accounts)' if len(all_accts) > 1 else ''
+            print(f'  {username}{note}: {n_att}/{n_c} conflict TTs -> conflict_rate={rate:.3f}')
 
-    conn.close()
     return result
 
 
@@ -175,34 +172,32 @@ def _compute_broadcast_conflict_map() -> dict[str, set]:
     prohibitively slow at that scale.  Exact matching covers the vast majority
     of identifiable players for the opportunism slope computation.
     """
-    conn = sqlite3.connect(DB_PATH)
-    pi_rows = conn.execute(
-        'SELECT username, player_name FROM player_information WHERE player_name IS NOT NULL'
-    ).fetchall()
-    exact: dict[str, str] = {}
-    for uname, pname in pi_rows:
-        n = _norm_name(pname)
-        if n not in exact:
-            exact[n] = uname
+    with get_conn() as conn:
+        pi_rows = conn.execute(
+            'SELECT username, player_name FROM player_information WHERE player_name IS NOT NULL'
+        ).fetchall()
+        exact: dict[str, str] = {}
+        for uname, pname in pi_rows:
+            n = _norm_name(pname)
+            if n not in exact:
+                exact[n] = uname
 
-    oep_rows = conn.execute(
-        'SELECT broadcast_name, player_name FROM other_event_participants'
-    ).fetchall()
-    event_to_users: dict[str, set] = defaultdict(set)
-    for bname, pname in oep_rows:
-        u = exact.get(_norm_name(pname))
-        if u:
-            event_to_users[bname].add(u)
+        oep_rows = conn.execute(
+            'SELECT broadcast_name, player_name FROM other_event_participants'
+        ).fetchall()
+        event_to_users: dict[str, set] = defaultdict(set)
+        for bname, pname in oep_rows:
+            u = exact.get(_norm_name(pname))
+            if u:
+                event_to_users[bname].add(u)
 
-    oer_rows = conn.execute(
-        'SELECT broadcast_name, date(earliest_start_utc) FROM other_event_rounds'
-    ).fetchall()
-    conflict_map: dict[str, set] = defaultdict(set)
-    for bname, rdate in oer_rows:
-        for u in event_to_users.get(bname, ()):
-            conflict_map[u].add(rdate)
-
-    conn.close()
+        oer_rows = conn.execute(
+            'SELECT broadcast_name, substr(CAST(earliest_start_utc AS TEXT), 1, 10) FROM other_event_rounds'
+        ).fetchall()
+        conflict_map: dict[str, set] = defaultdict(set)
+        for bname, rdate in oer_rows:
+            for u in event_to_users.get(bname, ()):
+                conflict_map[u].add(str(rdate))
     return dict(conflict_map)
 
 
@@ -219,13 +214,12 @@ def _compute_opportunism_slopes(
     Uses the full TT history (no DATA_CUTOFF) for maximum regression window.
     Skips players with <min_obs eligible dates or a constant outcome.
     """
-    conn = sqlite3.connect(DB_PATH)
-    rows = conn.execute(
-        'SELECT username, date(date) AS date FROM titled_tuesday_standings'
-    ).fetchall()
-    conn.close()
+    with get_conn() as conn:
+        rows = conn.execute(
+            'SELECT username, substr(CAST(date AS TEXT), 1, 10) AS date FROM titled_tuesday_standings'
+        ).fetchall()
 
-    attended: set = set(rows)
+    attended: set = {(u, str(d)) for u, d in rows}
     tt_dates = sorted({d for _, d in attended})
 
     career: dict[str, tuple] = {}
@@ -382,11 +376,10 @@ def apply_schedule_adjustments(
     # ── Opportunism boost ──────────────────────────────────────────────────────
     all_conflicted = list(dict.fromkeys(sc_usernames + cut_usernames))
 
-    conn = sqlite3.connect(DB_PATH)
-    pred_rows = conn.execute(
-        'SELECT username, P_top10_given_play FROM latest_model_predictions_raw'
-    ).fetchall()
-    conn.close()
+    with get_conn() as conn:
+        pred_rows = conn.execute(
+            'SELECT username, "P_top10_given_play" FROM latest_model_predictions_raw'
+        ).fetchall()
 
     top_usernames = {u for u, pv in pred_rows if pv is not None and pv >= top_player_threshold}
 

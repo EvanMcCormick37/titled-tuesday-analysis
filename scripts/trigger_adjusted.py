@@ -17,7 +17,6 @@ Usage:
 """
 import argparse
 import json
-import sqlite3
 import sys
 import traceback
 from datetime import timedelta, datetime, timezone
@@ -28,7 +27,7 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.config import DB_PATH
+from src.db import get_conn
 from src.pipeline import run_adjusted, load_adjustments, next_tourn_date
 
 
@@ -36,7 +35,7 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%fZ')[:-4] + 'Z'
 
 
-def _pipeline_run_id_for(conn: sqlite3.Connection, tourn_date_predicted: str) -> int | None:
+def _pipeline_run_id_for(conn, tourn_date_predicted: str) -> int | None:
     """Return the pipeline_runs.id whose scraped Tuesday is one week before the predicted TT."""
     scraped = (pd.Timestamp(tourn_date_predicted) - pd.Timedelta(weeks=1)).date().isoformat()
     row = conn.execute(
@@ -57,35 +56,27 @@ def trigger_adjusted(tourn_date: str | None = None) -> dict:
           f'{len(adj["p_participate_overrides"])} overrides, '
           f'{len(adj["p_nudges"])} nudges, global_nudge={adj["global_nudge"]:+.2f}')
 
-    conn = sqlite3.connect(DB_PATH)
-    try:
+    with get_conn() as conn:
         pr_id = _pipeline_run_id_for(conn, target)
         if pr_id is None:
             print(f'  [warning] no pipeline_runs row for scraped={target} - 7d; '
                   f'proceeding without pipeline_run_id link.')
 
-        cur = conn.execute(
-            'INSERT INTO job_runs (pipeline_run_id, job_name, status) VALUES (?, ?, ?)',
+        row = conn.execute(
+            'INSERT INTO job_runs (pipeline_run_id, job_name, status) VALUES (?, ?, ?) RETURNING id',
             (pr_id, 'run_adjusted', 'running'),
-        )
-        conn.commit()
-        job_id = cur.lastrowid
-    finally:
-        conn.close()
+        ).fetchone()
+        job_id = row[0]
 
     try:
         adj_run = run_adjusted(target, save_official=True, **adj)
     except BaseException as exc:
         tb = traceback.format_exc()
-        conn = sqlite3.connect(DB_PATH)
-        try:
+        with get_conn() as conn:
             conn.execute(
                 'UPDATE job_runs SET ended_at = ?, status = ?, summary = ?, log_tail = ? WHERE id = ?',
                 (_now_iso(), 'failed', json.dumps({'error': str(exc)}), tb[-16_000:], job_id),
             )
-            conn.commit()
-        finally:
-            conn.close()
         print(f'[trigger_adjusted] FAIL: {exc}')
         raise
 
@@ -100,8 +91,7 @@ def trigger_adjusted(tourn_date: str | None = None) -> dict:
         'global_nudge':         adj["global_nudge"],
     }
 
-    conn = sqlite3.connect(DB_PATH)
-    try:
+    with get_conn() as conn:
         conn.execute(
             'UPDATE job_runs SET ended_at = ?, status = ?, summary = ? WHERE id = ?',
             (_now_iso(), 'success', json.dumps(summary), job_id),
@@ -111,9 +101,6 @@ def trigger_adjusted(tourn_date: str | None = None) -> dict:
                 'UPDATE pipeline_runs SET state = ?, completed_at = ? WHERE id = ?',
                 ('completed', _now_iso(), pr_id),
             )
-        conn.commit()
-    finally:
-        conn.close()
 
     print(f'[trigger_adjusted] OK run_adjusted complete: {summary}')
     return summary
