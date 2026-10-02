@@ -37,21 +37,24 @@ def _render_chances_chart(preds: pd.DataFrame, n: int) -> None:
         st.info('No predictions available yet.')
         return
 
-    col_p = f'P_top{n}'
-    col_ip = f'P_top{n}_given_play'
-    df['label_pct'] = (df[col_p] * 100).round(1).astype(str) + '%'
-    df['ip_pct']    = (df[col_ip] * 100).round(1).astype(str) + 'ip%'
+    col_p    = f'P_top{n}'
+    col_ip   = f'P_top{n}_given_play'
+    label    = _N_LABELS.get(n, f'Top {n}')
+    df['bar_pct'] = (df[col_p] * 100).round(1).astype(str) + '%'
 
     fig = px.bar(
         df, x=col_p, y='player', orientation='h',
         color=col_ip, color_continuous_scale='Plasma',
-        labels={col_p: 'P(Top-N)', col_ip: 'P | plays', 'player': ''},
+        labels={col_p: f'P({label})', col_ip: f'P({label} | plays)', 'player': ''},
         hover_data={col_p: ':.3%', col_ip: ':.3%', 'p_participate': ':.3%',
-                    'player': False, 'label_pct': False, 'ip_pct': False},
+                    'player': False, 'bar_pct': False},
+        text='bar_pct',
         height=720,
     )
+    fig.update_traces(textposition='inside', insidetextanchor='end',
+                      textfont={'color': 'white', 'size': 12})
     fig.update_layout(
-        title=f'Top players by chance to make {_N_LABELS.get(n, f"Top {n}")}',
+        title=f'Top players by chance to make {label}',
         yaxis={'autorange': 'reversed'},
         margin={'l': 10, 'r': 10, 't': 50, 'b': 30},
     )
@@ -87,36 +90,6 @@ def _render_prices_chart(preds: pd.DataFrame, n: int) -> None:
     st.plotly_chart(fig, use_container_width=True)
 
 
-def _render_ip_adv_chart(preds: pd.DataFrame, n: int) -> None:
-    col_p = f'P_top{n}'
-    col_adv = f'ip_adv_top{n}'
-    if col_adv not in preds.columns:
-        st.info('IP-advantage not available.')
-        return
-
-    df = preds[preds[col_p] > 0.01].nlargest(25, col_adv).copy()
-    df['player'] = _name_col(df)
-    df = df.reset_index()
-    if df.empty:
-        st.info('No players with P(Top-N) > 1%.')
-        return
-
-    fig = px.bar(
-        df, x=col_adv, y='player', orientation='h',
-        color=col_p, color_continuous_scale='Plasma',
-        labels={col_adv: 'IP advantage', col_p: 'P(Top-N)', 'player': ''},
-        hover_data={col_adv: ':.2f', col_p: ':.3%',
-                    f'P_top{n}_given_play': ':.3%', 'player': False},
-        height=620,
-    )
-    fig.update_layout(
-        title=f'IP-advantage — {_N_LABELS.get(n, f"Top {n}")} (P[play] ≥ 1%)',
-        yaxis={'autorange': 'reversed'},
-        margin={'l': 10, 'r': 10, 't': 50, 'b': 30},
-    )
-    st.plotly_chart(fig, use_container_width=True)
-
-
 def _render_table(preds: pd.DataFrame, n: int) -> None:
     df = _topn_df(preds, n, limit=50)
     if df.empty:
@@ -138,7 +111,7 @@ def render() -> None:
     with cols[1]:
         n = st.selectbox('N', _N_VALUES, format_func=lambda v: _N_LABELS[v])
     with cols[2]:
-        view = st.selectbox('View', ('Chances', 'Fair prices', 'IP advantage', 'Table'))
+        view = st.selectbox('View', ('Chances', 'Fair prices', 'Table'))
 
     preds = load_predictions(adjusted=(source == 'Adjusted'))
     if preds.empty:
@@ -150,7 +123,6 @@ def render() -> None:
         f'tourn_date={preds["tourn_date"].iloc[0] if "tourn_date" in preds.columns else "—"}'
     )
 
-    if view == 'Chances':      _render_chances_chart(preds, n)
-    elif view == 'Fair prices':_render_prices_chart(preds, n)
-    elif view == 'IP advantage':_render_ip_adv_chart(preds, n)
-    else:                      _render_table(preds, n)
+    if view == 'Chances':       _render_chances_chart(preds, n)
+    elif view == 'Fair prices': _render_prices_chart(preds, n)
+    else:                       _render_table(preds, n)
