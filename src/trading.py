@@ -241,6 +241,51 @@ def place_bids(
     }
 
 
+def cancel_tt_bids(
+    client: KalshiClient,
+    tourn_date: str,
+    dry_run: bool = True,
+) -> dict:
+    """Cancel all resting TT bids for `tourn_date`.
+
+    Returns a summary dict: {matched, cancelled, orders}.
+    `orders` is the list of resting-order dicts that were (or would be) cancelled,
+    so the UI can show the user what's about to happen before they confirm.
+    """
+    date_str = _to_kalshi_date(tourn_date)
+    tt_pat = re.compile(
+        rf"(?:KXTITLEDTUESDAY-{date_str}|KXTITLEDTUESTOP-{date_str}T\d+)-"
+    )
+
+    all_orders = client.get_open_orders()
+    tt_orders = [o for o in all_orders if tt_pat.search(o.get("ticker", ""))]
+
+    print(f"{'[DRY RUN] ' if dry_run else ''}Cancelling resting TT bids for {tourn_date}:")
+    print(f"  Total open orders   : {len(all_orders)}")
+    print(f"  TT orders to cancel : {len(tt_orders)}")
+
+    for o in tt_orders:
+        side  = o.get("side", "?")
+        price = o.get("price", "?")
+        qty   = o.get("remaining_count", o.get("count", "?"))
+        print(f"    {o['ticker']} side={side} price={price} qty={qty} id={o['order_id']}")
+
+    cancelled = 0
+    if not dry_run:
+        for o in tt_orders:
+            try:
+                client.cancel_order(o["order_id"])
+                cancelled += 1
+            except Exception as e:  # noqa: BLE001
+                print(f"    WARNING: could not cancel {o['order_id']}: {e}")
+
+    return {
+        "matched":   len(tt_orders),
+        "cancelled": cancelled,
+        "orders":    tt_orders,
+    }
+
+
 def take_trades(
     client: KalshiClient,
     tourn_date: str,
