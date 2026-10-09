@@ -4,7 +4,7 @@ from __future__ import annotations
 import concurrent.futures
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -35,6 +35,33 @@ _ET = ZoneInfo("America/New_York")
 def _expiry_ts(tourn_date: str) -> int:
     naive = datetime.strptime(tourn_date + " 09:00:00", "%Y-%m-%d %H:%M:%S")
     return int(naive.replace(tzinfo=_ET).timestamp())
+
+
+# TT tournament starts at 11:00 AM ET.
+_TOURN_START_HOUR, _TOURN_START_MIN = 11, 0
+
+
+def _expiry_ts_after_start(tourn_date: str, minutes_after_start: int) -> int:
+    """Return Unix TS for `tourn_date` at (11:00 ET + minutes_after_start)."""
+    naive = datetime.strptime(tourn_date, "%Y-%m-%d")
+    start = naive.replace(hour=_TOURN_START_HOUR, minute=_TOURN_START_MIN,
+                          tzinfo=_ET)
+    return int((start + timedelta(minutes=minutes_after_start)).timestamp())
+
+
+def _parse_kalshi_expiration(order: dict) -> int | None:
+    """Parse an open-order's `expiration_time` ISO string to a Unix TS.
+
+    Kalshi returns strings like '2026-10-06T15:00:00Z'. Returns None if the
+    field is missing or unparseable.
+    """
+    raw = order.get("expiration_time")
+    if not raw:
+        return None
+    try:
+        return int(datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp())
+    except (ValueError, AttributeError):
+        return None
 
 
 def _load_predictions() -> pd.DataFrame:
@@ -283,6 +310,195 @@ def cancel_tt_bids(
         "matched":   len(tt_orders),
         "cancelled": cancelled,
         "orders":    tt_orders,
+    }
+
+
+def place_fade_no_bids(
+    client: KalshiClient,
+    tourn_date: str,
+    discount_cents: int = 15,
+    count: int = 200,
+    minutes_after_start: int = 10,
+    min_bid_cents: int = 1,
+    max_bid_cents: int = 99,
+    sleep_read: float = 0.05,
+    sleep_write: float = 0.10,
+    dry_run: bool = True,
+) -> dict:
+    """Place resting NO bids priced at (fair_NO_given_plays − discount) cents,
+    with expiry `minutes_after_start` minutes after tournament start (11:00 ET).
+
+    Strategy — fade retail overpayment of YES when a low-attendance star shows
+    up on the roster. The bid prices NO using the player's **conditional**
+    chance of making top-N given they play (`P_top{N}_given_play`), ignoring
+    p_participate — because the fade thesis assumes the player has already
+    shown up and retail is panic-buying YES on that confirmation. Expiration
+    at 11:10 ET (default) gives roughly 10 minutes of post-start trading
+    before round-1 results start meaningfully moving the odds.
+
+    Pricing per market:
+        fair_no_cents  = round((1 − P_top{N}_given_play) × 100)
+        target_bid     = fair_no_cents − discount_cents  (clamped to [min, max])
+        edge           = fair_no_cents − target_bid  (= discount_cents by default)
+
+    Order management (per ticker) — only touches NO bids whose expiration is
+    at or after tournament start (11:00 ET on tourn_date). The 9 AM place_bids
+    NO orders are therefore never cancelled by this strategy:
+        - No existing post-start NO bid              → place a new one at `target_bid`
+        - Existing post-start NO bid at `target_bid` → leave it (idempotent re-runs)
+        - Existing post-start NO bid at other price  → cancel + replace at `target_bid`
+
+    Returns: {placed, cancelled, skipped, unmatched, expiry_iso, plan}.
+    """
+    expiry = _expiry_ts_after_start(tourn_date, minutes_after_start)
+    expiry_iso = datetime.fromtimestamp(expiry, _ET).isoformat()
+    tourn_start_ts = _expiry_ts_after_start(tourn_date, 0)
+    date_str   = _to_kalshi_date(tourn_date)
+    _, PLAYER_TO_USERNAME = get_username_mappings()
+
+    # ── Phase 1: Reads ────────────────────────────────────────────────────────
+    print(f"Loading model predictions from DB...")
+    preds = _load_predictions()
+
+    open_by_ticker: dict[str, list[dict]] = {}
+    if not dry_run:
+        print("Fetching open NO orders...")
+        for o in client.get_open_orders():
+            if o.get("outcome_side") != "no":
+                continue
+            if o.get("action") == "sell":
+                continue
+            open_by_ticker.setdefault(o["ticker"], []).append(o)
+        time.sleep(sleep_read)
+
+    print("Fetching markets...")
+    market_rows: list[tuple[str, str, str, int]] = []  # (ticker, title, subtitle, n)
+    for tmpl, n in _TEMPLATE_N.items():
+        event_ticker = tmpl.format(date=date_str)
+        for m in client.get_markets_by_event(event_ticker):
+            market_rows.append((m["ticker"], m.get("title", ""),
+                                m.get("yes_sub_title", ""), n))
+        time.sleep(sleep_read)
+
+    # ── Phase 2: Plan ─────────────────────────────────────────────────────────
+    plan: list[dict] = []
+    unmatched: list[str] = []
+    skipped:   list[dict] = []
+
+    for ticker, _title, subtitle, n in market_rows:
+        username = PLAYER_TO_USERNAME.get(subtitle)
+        if username is None or username not in preds.index:
+            unmatched.append(subtitle)
+            continue
+
+        col = _N_TO_COL[n]
+        p_cond = float(preds.loc[username, col])  # P(top-N | plays)
+        fair_no_cents = round((1.0 - p_cond) * 100)
+        target_bid    = fair_no_cents - discount_cents
+
+        if target_bid < min_bid_cents or target_bid > max_bid_cents:
+            skipped.append({
+                "ticker": ticker, "subtitle": subtitle,
+                "reason": f"target bid {target_bid}¢ outside [{min_bid_cents},{max_bid_cents}] "
+                          f"(P(top-{n}|plays)={p_cond:.3f})",
+            })
+            continue
+
+        # Only touch NO bids that expire at-or-after tournament start — these
+        # are prior fade-era orders. Pre-start NO bids (e.g. 9 AM place_bids
+        # orders) are deliberately left alone.
+        existing_post_start = [
+            o for o in open_by_ticker.get(ticker, [])
+            if (ts := _parse_kalshi_expiration(o)) is not None and ts >= tourn_start_ts
+        ]
+        cancel_ids: list[str] = []
+        if existing_post_start:
+            # If any post-start order sits at exactly `target_bid`, treat the
+            # whole set as idempotent and move on. Otherwise cancel all
+            # post-start NO bids on this ticker and replace with the new one.
+            if any(round(float(o.get("no_price_dollars", 0)) * 100) == target_bid
+                   for o in existing_post_start):
+                skipped.append({
+                    "ticker": ticker, "subtitle": subtitle,
+                    "reason": f"NO bid already resting at {target_bid}¢ with post-start expiry",
+                })
+                continue
+            cancel_ids = [o["order_id"] for o in existing_post_start]
+
+        plan.append({
+            "ticker": ticker, "subtitle": subtitle, "n": n,
+            "p_cond": p_cond, "fair_no_cents": fair_no_cents,
+            "bid_c": target_bid, "cancel": cancel_ids,
+        })
+
+    # ── Phase 3: Summary ──────────────────────────────────────────────────────
+    print(f"\n{'[DRY RUN] ' if dry_run else ''}Fade-NO plan for {tourn_date} "
+          f"(discount={discount_cents}¢, expiry={expiry_iso}):")
+    print(f"  Markets scanned : {len(market_rows)}")
+    print(f"  Unmatched names : {len(unmatched)}")
+    print(f"  Bids to place   : {len(plan)}")
+    print(f"  Orders to cancel: {sum(len(p['cancel']) for p in plan)}")
+    print(f"  Skipped         : {len(skipped)}")
+
+    if unmatched:
+        print(f"\n  Unmatched player names:")
+        for name in unmatched[:20]:
+            print(f"    - {name!r}")
+        if len(unmatched) > 20:
+            print(f"    ... (+{len(unmatched) - 20} more)")
+
+    if skipped:
+        print(f"\n  Skipped markets:")
+        for s in skipped[:20]:
+            print(f"    {s['ticker']} ({s['subtitle']}) — {s['reason']}")
+        if len(skipped) > 20:
+            print(f"    ... (+{len(skipped) - 20} more)")
+
+    if plan:
+        print(f"\n  Planned NO bids (fair - {discount_cents}¢):")
+        for p in sorted(plan, key=lambda x: x["bid_c"]):
+            tag = f" (cancelling {len(p['cancel'])})" if p["cancel"] else ""
+            print(f"    {p['ticker']:48s} N={p['n']}  P(top|plays)={p['p_cond']:.3f}  "
+                  f"fairNO={p['fair_no_cents']}¢  bid={p['bid_c']}¢{tag}  [{p['subtitle']}]")
+
+    if dry_run:
+        print("\n[DRY RUN] No orders placed or cancelled.")
+        return {
+            "placed": 0, "cancelled": 0,
+            "skipped": len(skipped), "unmatched": unmatched,
+            "expiry_iso": expiry_iso, "plan": plan,
+        }
+
+    # ── Phase 4: Execute ──────────────────────────────────────────────────────
+    cancelled = 0
+    placed    = 0
+    for p in plan:
+        for oid in p["cancel"]:
+            try:
+                client.cancel_order(oid)
+                cancelled += 1
+                print(f"  Cancelled {oid}")
+            except Exception as e:  # noqa: BLE001
+                print(f"  WARNING: could not cancel {oid}: {e}")
+            time.sleep(sleep_write)
+
+    for p in plan:
+        try:
+            client.place_order(
+                ticker=p["ticker"], side="no", count=count, price=p["bid_c"],
+                expiration_ts=expiry, dry_run=False,
+            )
+            placed += 1
+            print(f"  Placed {p['ticker']} NO @ {p['bid_c']}¢ (expires {expiry_iso})")
+        except Exception as e:  # noqa: BLE001
+            print(f"  WARNING: could not place {p['ticker']} NO: {e}")
+        time.sleep(sleep_write)
+
+    print(f"\nDone. Placed {placed}, cancelled {cancelled}, skipped {len(skipped)}.")
+    return {
+        "placed": placed, "cancelled": cancelled,
+        "skipped": len(skipped), "unmatched": unmatched,
+        "expiry_iso": expiry_iso, "plan": plan,
     }
 
 

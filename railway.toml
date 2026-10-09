@@ -49,4 +49,14 @@ restartPolicyType = "NEVER"
 #
 # tt-bot only:
 #   TELEGRAM_BOT_TOKEN        = <from @BotFather>
-#   TELEGRAM_CHAT_ID          = <your private chat id>
+#   TELEGRAM_CHAT_ID          = <your private chat id — positive int>
+#
+# tt-bot deploy notes:
+#   - Start command: python app/telegram_bot.py
+#   - Not a web service — no PORT needed, don't expose any ports.
+#   - restartPolicyType = ON_FAILURE in the UI (unlike tt-cron, this is long-running).
+#   - Pushes alerts on every pipeline_runs state change (completed / failed /
+#     adjustments_pending). Startup also fires an alert for any sticky
+#     failed/adjustments_pending state so a bot restart doesn't miss events.
+#   - All commands are gated to TELEGRAM_CHAT_ID; messages from any other chat
+#     are silently dropped.

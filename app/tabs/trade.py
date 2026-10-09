@@ -212,6 +212,37 @@ def _render_take(gate_ok: bool, tourn_date: str) -> None:
                            execute_label='Fire takers live')
 
 
+def _render_fade(gate_ok: bool, tourn_date: str) -> None:
+    st.markdown('### Fade NO bids (post-start expiry)')
+    st.caption(
+        'Resting NO bids priced at **(P(top-N | plays) × 100 − discount)¢**, '
+        'expiring **N minutes after 11:00 ET tournament start**. Thesis: catch '
+        'retail overpaying YES when a low-attendance star shows up on the roster. '
+        'Uses the *conditional* probability — attendance is ignored because the '
+        'fade only triggers once the player is already on the roster.'
+    )
+    cols = st.columns(3)
+    with cols[0]:
+        discount = st.number_input('discount (¢)', 1, 50, 15, 1, key='fade_discount',
+                                   help='Cents off fair NO.')
+    with cols[1]:
+        count = st.number_input('count', 1, 10_000, 200, 1, key='fade_count',
+                                help='Contracts per NO bid.')
+    with cols[2]:
+        minutes_after_start = st.number_input('expiry (min after 11:00 ET)',
+                                              0, 180, 10, 1, key='fade_mas',
+                                              help='Bids expire this many minutes after tourn start.')
+
+    params = {
+        'discount_cents':      int(discount),
+        'count':               int(count),
+        'minutes_after_start': int(minutes_after_start),
+    }
+    from src.trading import place_fade_no_bids
+    _preview_execute_block('fade', gate_ok, tourn_date, place_fade_no_bids, params,
+                           execute_label='Place fade NO bids live')
+
+
 def _render_cancel(gate_ok: bool, tourn_date: str) -> None:
     st.markdown('### Cancel resting bids')
     st.caption(f'Cancels every resting order on TT markets dated **{tourn_date}**.')
@@ -242,10 +273,13 @@ def render() -> None:
 
     st.caption(f'Target tournament: **{tourn_date}**')
 
-    section = st.radio('Action', ('Place bids', 'Take trades', 'Cancel bids'),
+    section = st.radio('Action',
+                       ('Place bids', 'Fade NO bids', 'Take trades', 'Cancel bids'),
                        horizontal=True, label_visibility='collapsed')
     if section == 'Place bids':
         _render_place(gate_ok, tourn_date)
+    elif section == 'Fade NO bids':
+        _render_fade(gate_ok, tourn_date)
     elif section == 'Take trades':
         _render_take(gate_ok, tourn_date)
     else:
