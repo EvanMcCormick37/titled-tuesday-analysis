@@ -14,8 +14,12 @@
 #      Use `python -m streamlit` (not bare `streamlit`) — the module form is
 #      PATH-independent and avoids "executable not found" errors on PaaS hosts
 #      that run start commands through a stripped-down shell.
-#   3. For tt-cron only: set the cron schedule in the UI (Deploy tab → Cron Schedule).
-#      Expression: 0 15 * * TUE   (Tuesdays at 15:00 — local time, since TZ is set)
+#   3. For tt-cron only: set the cron schedule in the UI (Settings → Cron Schedule).
+#      Expression: 0 19 * * 2    (Tuesdays at 19:00 UTC = 15:00 EDT / 14:00 EST)
+#      Railway cron expressions are evaluated in UTC regardless of the TZ env
+#      var — the TZ var only affects what the container's clock returns inside
+#      Python (which matters for _most_recent_tuesday()). Use numeric day-of-week
+#      (2 = Tuesday), not the "TUE" alias — Railway's parser doesn't accept it.
 #   4. Set the shared env vars listed below on each service (or on the project).
 #
 # Shared build:  all three services use the Dockerfile at the repo root and

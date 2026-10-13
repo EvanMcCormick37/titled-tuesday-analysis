@@ -10,7 +10,6 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from kalshi_core import KalshiClient, _to_kalshi_date, bid_cents, best_ask, apply_pullback, kalshi_order_price
-from .config import TOURN_DATE
 from .data import get_username_mappings
 from .db import get_engine
 from .kalshi_tt import _TT_EVENT_TEMPLATES, get_tt_asks
@@ -81,7 +80,7 @@ def _parse_n(title: str) -> int:
 
 def place_bids(
     client: KalshiClient,
-    tourn_date: str = TOURN_DATE,
+    tourn_date: str | None = None,
     count: int = 200,
     markup: float = 1.5,
     max_discount: float = 10,
@@ -92,12 +91,16 @@ def place_bids(
 ) -> dict:
     """Place resting bids for all Titled Tuesday markets on tourn_date.
 
+    tourn_date: YYYY-MM-DD; defaults to the next TT (resolved from the DB).
     markup: divisor applied to fair price (bid = fair / markup). Default 1.5 → bid = 2/3 fair.
     max_discount: maximum cents-off cap so bid >= fair - max_discount.
     side_filter: if "yes" or "no", only place bids on that side.
 
     Returns a summary dict: {placed, cancelled, skipped, unmatched}.
     """
+    if tourn_date is None:
+        from .pipeline import next_tourn_date
+        tourn_date = next_tourn_date()
     expiry = _expiry_ts(tourn_date)
     date_str = _to_kalshi_date(tourn_date)
     _, PLAYER_TO_USERNAME = get_username_mappings()

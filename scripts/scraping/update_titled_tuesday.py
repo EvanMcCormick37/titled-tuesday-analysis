@@ -434,7 +434,9 @@ def process(slug: str) -> None:
         conn.commit()
 
     new_rows = pd.DataFrame([{
-        'date':            f'{date} 00:00:00' if date else None,
+        # Pin to UTC midnight so pandas sends a real timestamp — Postgres TIMESTAMPTZ
+        # refuses the implicit cast from a bare VARCHAR, and SQLite tolerates it fine.
+        'date':            pd.Timestamp(f'{date} 00:00:00+00:00') if date else None,
         'tournament_slug': slug,
         'session':         session,
         'rank':            p['rank'],
@@ -463,7 +465,7 @@ def process(slug: str) -> None:
         conn.execute('DELETE FROM titled_tuesday_tournaments WHERE tournament_slug = ?', (slug,))
 
     new_tourn = {
-        'date':            f'{date} 00:00:00' if date else None,
+        'date':            pd.Timestamp(f'{date} 00:00:00+00:00') if date else None,
         'time_local':      existing.iloc[0]['time_local'] if not existing.empty else None,
         'title':           title,
         'session':         existing.iloc[0]['session'] if not existing.empty else session,

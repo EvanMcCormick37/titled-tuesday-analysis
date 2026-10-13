@@ -7,19 +7,21 @@ the thesis assumes the player is already on the roster when the overpay happens.
 Expiration default 11:10 AM ET on tournament day; round-1 results shouldn't
 have moved the top-N odds meaningfully by then.
 
+Date is always resolved from `src.pipeline.next_tourn_date()`.
+
 Usage
 -----
     # Dry run
-    python scripts/place_fade_bids.py --date 2026-10-07
+    python scripts/place_fade_bids.py
 
     # Live
-    python scripts/place_fade_bids.py --date 2026-10-07 --live
+    python scripts/place_fade_bids.py --live
 
-    # Different discount / count / count
-    python scripts/place_fade_bids.py --date 2026-10-07 --live --discount 20 --count 100
+    # Different discount / count
+    python scripts/place_fade_bids.py --live --discount 20 --count 100
 
     # Different post-start expiry window (e.g. 20 minutes after start)
-    python scripts/place_fade_bids.py --date 2026-10-07 --live --minutes-after-start 20
+    python scripts/place_fade_bids.py --live --minutes-after-start 20
 """
 import argparse
 import sys
@@ -29,7 +31,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from kalshi_core import KalshiClient
-from src.config import TOURN_DATE
+from src.pipeline import next_tourn_date
 from src.trading import place_fade_no_bids
 
 
@@ -38,8 +40,6 @@ def main() -> None:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    ap.add_argument('--date', default=TOURN_DATE,
-                    help='Tournament date YYYY-MM-DD (default: src.config.TOURN_DATE)')
     ap.add_argument('--live', action='store_true',
                     help='Actually place orders. Without this flag, runs in dry-run mode.')
     ap.add_argument('--discount', type=int, default=15,
@@ -50,10 +50,13 @@ def main() -> None:
                     help='Minutes after 11:00 ET start that bids expire (default: 10)')
     args = ap.parse_args()
 
+    tourn_date = next_tourn_date()
+    print(f"[place_fade_bids] tourn_date = {tourn_date}")
+
     client = KalshiClient()
     result = place_fade_no_bids(
         client,
-        tourn_date=args.date,
+        tourn_date=tourn_date,
         discount_cents=args.discount,
         count=args.count,
         minutes_after_start=args.minutes_after_start,

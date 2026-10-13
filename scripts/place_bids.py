@@ -6,19 +6,22 @@ max(fair / markup, fair - max_discount), applies pullback if an ask is already
 at or below the computed bid, and cancels stale open orders when the
 new price is lower.
 
+Date is always resolved from `src.pipeline.next_tourn_date()` — the upcoming
+TT is the only market Kalshi actually publishes before the previous week ends.
+
 Usage
 -----
     # Dry run (default — no orders placed)
-    python scripts/place_bids.py --date 2026-08-04
+    python scripts/place_bids.py
 
-    # Live — actually submit orders (1 contract each)
-    python scripts/place_bids.py --date 2026-08-04 --live
+    # Live — actually submit orders
+    python scripts/place_bids.py --live
 
     # Live with higher contract count and tighter markup
-    python scripts/place_bids.py --date 2026-08-04 --live --count 5 --markup 1.25
+    python scripts/place_bids.py --live --count 5 --markup 1.25
 
     # Only place YES bids
-    python scripts/place_bids.py --date 2026-08-04 --side yes
+    python scripts/place_bids.py --side yes
 """
 
 import argparse
@@ -29,8 +32,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from kalshi_core import KalshiClient
+from src.pipeline import next_tourn_date
 from src.trading import place_bids
-from src.config import TOURN_DATE
 
 
 def main() -> None:
@@ -39,24 +42,20 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "--date", default=TOURN_DATE,
-        help="Tournament date in YYYY-MM-DD format (e.g. 2026-08-04)",
-    )
-    parser.add_argument(
         "--live", action="store_true",
         help="Actually submit orders. Without this flag, runs in dry-run mode.",
     )
     parser.add_argument(
         "--count", type=int, default=200,
-        help="Number of contracts per bid (default: 1)",
+        help="Number of contracts per bid (default: 200)",
     )
     parser.add_argument(
         "--markup", type=float, default=1.5,
-        help="Bid = fair / markup. Default 1.5 → bid = 2/3 fair.",
+        help="Bid = fair / markup. Default 1.5 -> bid = 2/3 fair.",
     )
     parser.add_argument(
         "--max-discount", type=float, default=15,
-        help="Maximum discount from fair price in dollars (default: 0.10).",
+        help="Maximum discount from fair price in cents (default: 15).",
     )
     parser.add_argument(
         "--side", choices=["yes", "no"], default=None,
@@ -64,10 +63,13 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    tourn_date = next_tourn_date()
+    print(f"[place_bids] tourn_date = {tourn_date}")
+
     client = KalshiClient()
     result = place_bids(
         client,
-        tourn_date=args.date,
+        tourn_date=tourn_date,
         count=args.count,
         markup=args.markup,
         max_discount=args.max_discount,

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Fire taker orders on high-EV Titled Tuesday markets, with optional continuous loop.
 
+Date is always resolved from `src.pipeline.next_tourn_date()`.
+
 In loop mode the script runs indefinitely:
   - Each iteration fires the single highest-ROI trade per event category
     (winner / top-3 / top-5 / top-8), then waits --interval minutes.
@@ -11,19 +13,19 @@ In loop mode the script runs indefinitely:
 Usage
 -----
     # Dry run, one shot
-    python scripts/take_trades.py --date 2026-08-05
+    python scripts/take_trades.py
 
     # Live, one shot — buy up to 200 contracts per event category
-    python scripts/take_trades.py --date 2026-08-05 --live
+    python scripts/take_trades.py --live
 
     # Live, continuous loop — check every 15 min, back off 1 h when dry
-    python scripts/take_trades.py --date 2026-08-05 --live --loop
+    python scripts/take_trades.py --live --loop
 
     # Live loop with $50 total exposure cap
-    python scripts/take_trades.py --date 2026-08-05 --live --loop --budget 50
+    python scripts/take_trades.py --live --loop --budget 50
 
     # Custom thresholds + loop
-    python scripts/take_trades.py --date 2026-08-05 --live --loop \\
+    python scripts/take_trades.py --live --loop \\
         --min-roi 1.3 --min-qty 10 --max-qty 100 --interval 10 --fallback-wait 2
 """
 
@@ -37,6 +39,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from kalshi_core import KalshiClient
+from src.pipeline import next_tourn_date
 from src.trading import take_trades
 
 
@@ -66,10 +69,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    parser.add_argument(
-        "--date", required=True,
-        help="Tournament date in YYYY-MM-DD format (e.g. 2026-08-05)",
     )
     parser.add_argument(
         "--live", action="store_true",
@@ -105,6 +104,8 @@ def main() -> None:
         help="Hours to wait when no qualifying trades are found (default: 1)",
     )
     args = parser.parse_args()
+    args.date = next_tourn_date()
+    print(f"[take_trades] tourn_date = {args.date}")
 
     client = KalshiClient()
 
