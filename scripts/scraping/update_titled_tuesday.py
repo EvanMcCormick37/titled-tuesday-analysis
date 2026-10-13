@@ -33,6 +33,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup
+from sqlalchemy import text
 
 from src.db import get_conn, get_engine, table_columns
 
@@ -459,7 +460,7 @@ def process(slug: str) -> None:
 
     # tournaments: delete old row, insert new
     existing = pd.read_sql_query(
-        'SELECT * FROM titled_tuesday_tournaments WHERE tournament_slug = :slug',
+        text('SELECT * FROM titled_tuesday_tournaments WHERE tournament_slug = :slug'),
         engine, params={'slug': slug},
     )
 
