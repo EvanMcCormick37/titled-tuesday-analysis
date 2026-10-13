@@ -1,123 +1,158 @@
-"""Attendance Adjustments tab — the critical weekly input surface.
+"""Attendance Adjustments tab — bulk editable form.
 
-Replaces the top cell of notebooks/command-center.ipynb. Writes directly to
-the manual_adjustments table; the "Save & recompute" button fires
-scripts.trigger_adjusted.trigger_adjusted() synchronously.
+Mirrors the top-of-notebook config cell in notebooks/command-center.ipynb:
+one text block per adjustment type (list / dict / scalar), submitted together.
+Each save REPLACES all manual_adjustments rows for the current tourn_date,
+so what's in the textboxes IS the full state.
 """
 from __future__ import annotations
 
-import pandas as pd
+import ast
+
 import streamlit as st
 
-from app.state import (
-    all_player_names,
-    invalidate_caches,
-    next_tourn_date_str,
-)
+from app.state import invalidate_caches, next_tourn_date_str
 from src.db import get_conn
-
-_ADJ_TYPES = ('cut', 'keep', 'override', 'nudge', 'global_nudge')
-_NEEDS_VALUE = {'override', 'nudge', 'global_nudge'}
-_NEEDS_PLAYER = {'cut', 'keep', 'override', 'nudge'}
+from src.pipeline import load_adjustments
 
 
-def _load_adjustments(tourn_date: str) -> pd.DataFrame:
+# ── DB write ──────────────────────────────────────────────────────────────────
+
+def _replace_all(
+    tourn_date: str,
+    cut: list[str],
+    keep: list[str],
+    overrides: dict[str, float],
+    nudges: dict[str, float],
+    global_nudge: float,
+) -> None:
+    """Replace every manual_adjustments row for `tourn_date` with the new state."""
     with get_conn() as conn:
-        rows = conn.execute(
-            'SELECT id, player_name, adjustment_type, value, note, created_at, created_by '
-            'FROM manual_adjustments WHERE tourn_date = ? ORDER BY created_at DESC',
-            (tourn_date,),
-        ).fetchall()
-    return pd.DataFrame(rows, columns=['id', 'player_name', 'adjustment_type', 'value',
-                                       'note', 'created_at', 'created_by'])
+        conn.execute('DELETE FROM manual_adjustments WHERE tourn_date = ?', (tourn_date,))
+
+        def _ins(player: str, kind: str, value: float | None) -> None:
+            conn.execute(
+                'INSERT INTO manual_adjustments '
+                '(tourn_date, player_name, adjustment_type, value, created_by) '
+                'VALUES (?, ?, ?, ?, ?)',
+                (tourn_date, player, kind, value, 'dashboard'),
+            )
+
+        for name in cut:
+            _ins(name, 'cut', None)
+        for name in keep:
+            _ins(name, 'keep', None)
+        for name, val in overrides.items():
+            _ins(name, 'override', float(val))
+        for name, val in nudges.items():
+            _ins(name, 'nudge', float(val))
+        if global_nudge:
+            _ins('', 'global_nudge', float(global_nudge))
 
 
-def _insert_adjustment(tourn_date: str, player: str, kind: str,
-                       value: float | None, note: str) -> None:
-    with get_conn() as conn:
-        conn.execute(
-            'INSERT INTO manual_adjustments '
-            '(tourn_date, player_name, adjustment_type, value, note, created_by) '
-            'VALUES (?, ?, ?, ?, ?, ?)',
-            (tourn_date, player, kind, value, note.strip() or None, 'dashboard'),
+# ── Parsing ───────────────────────────────────────────────────────────────────
+
+def _parse_list(text: str, label: str) -> list[str]:
+    s = text.strip()
+    if not s:
+        return []
+    try:
+        val = ast.literal_eval(s)
+    except (SyntaxError, ValueError) as e:
+        raise ValueError(f'{label}: could not parse ({e})')
+    if not isinstance(val, list) or not all(isinstance(x, str) for x in val):
+        raise ValueError(f'{label}: expected a list of strings, got {type(val).__name__}')
+    return val
+
+
+def _parse_num_dict(text: str, label: str) -> dict[str, float]:
+    s = text.strip()
+    if not s:
+        return {}
+    try:
+        val = ast.literal_eval(s)
+    except (SyntaxError, ValueError) as e:
+        raise ValueError(f'{label}: could not parse ({e})')
+    if not isinstance(val, dict):
+        raise ValueError(f'{label}: expected a dict, got {type(val).__name__}')
+    for k, v in val.items():
+        if not isinstance(k, str) or not isinstance(v, (int, float)):
+            raise ValueError(f'{label}: expected dict[str, number] — bad entry {k!r}: {v!r}')
+    return {k: float(v) for k, v in val.items()}
+
+
+# ── Pretty-printers ───────────────────────────────────────────────────────────
+
+def _fmt_list(xs: list[str]) -> str:
+    if not xs:
+        return '[]'
+    return '[\n    ' + ',\n    '.join(repr(x) for x in xs) + ',\n]'
+
+
+def _fmt_num_dict(d: dict[str, float], fmt: str = '{:+.3f}') -> str:
+    if not d:
+        return '{}'
+    lines = [f'    {k!r}: {fmt.format(v)}' for k, v in d.items()]
+    return '{\n' + ',\n'.join(lines) + ',\n}'
+
+
+# ── UI ────────────────────────────────────────────────────────────────────────
+
+def _render_bulk_form(tourn_date: str) -> None:
+    current = load_adjustments(tourn_date)
+
+    with st.form('adj_bulk_form'):
+        st.caption(
+            'Edit each block as a Python literal (list / dict / number). '
+            'Submitting **replaces all** adjustments for this tourn_date — '
+            'what you see here is the full state.'
         )
 
+        cut_txt = st.text_area(
+            'CUT_PLAYERS — list[str]  (p_participate → 0)',
+            value=_fmt_list(current['cut_players']),
+            height=120,
+        )
+        keep_txt = st.text_area(
+            'KEEP_PLAYERS — list[str]  (p_participate → 1)',
+            value=_fmt_list(current['keep_players']),
+            height=120,
+        )
+        over_txt = st.text_area(
+            'P_OVERRIDES — dict[str, float 0..1]  (explicit p_participate)',
+            value=_fmt_num_dict(current['p_participate_overrides']),
+            height=160,
+        )
+        nudges_txt = st.text_area(
+            'P_NUDGES — dict[str, float]  (per-player log-odds shift; +raises)',
+            value=_fmt_num_dict(current['p_nudges']),
+            height=160,
+        )
+        global_nudge = st.number_input(
+            'GLOBAL_NUDGE — log-odds shift applied to every player',
+            value=float(current['global_nudge']), step=0.1, format='%.2f',
+        )
 
-def _delete_adjustment(row_id: int) -> None:
-    with get_conn() as conn:
-        conn.execute('DELETE FROM manual_adjustments WHERE id = ?', (row_id,))
+        col1, col2 = st.columns(2)
+        save      = col1.form_submit_button('Save', width='stretch')
+        save_run  = col2.form_submit_button('Save & recompute', type='primary', width='stretch')
 
-
-def _render_add_form(tourn_date: str, players: list[str]) -> None:
-    st.markdown('### Add adjustment')
-    with st.form('adj_form', clear_on_submit=True):
-        kind = st.selectbox('Type', _ADJ_TYPES, index=0, help=_TYPE_HELP)
-        player = ''
-        if kind in _NEEDS_PLAYER:
-            player = st.selectbox('Player', options=players, index=None,
-                                  placeholder='Start typing a player name…')
-        value = None
-        if kind in _NEEDS_VALUE:
-            if kind == 'nudge' or kind == 'global_nudge':
-                value = st.number_input(
-                    'Log-odds shift', value=0.0, step=0.1, format='%.2f',
-                    help='Positive = raise attendance. Interpreted as a log-odds additive shift.',
-                )
-            else:  # override
-                value = st.number_input(
-                    'p_participate', min_value=0.0, max_value=1.0, value=0.5, step=0.05,
-                    format='%.2f', help='Explicit probability override, between 0 and 1.',
-                )
-        note = st.text_input('Note (optional)', placeholder='e.g. "WR tournament clash"')
-        submitted = st.form_submit_button('Add', type='primary')
-
-    if not submitted:
+    if not (save or save_run):
         return
-    if kind in _NEEDS_PLAYER and not player:
-        st.warning('Pick a player first.')
+
+    try:
+        cut     = _parse_list(cut_txt,     'CUT_PLAYERS')
+        keep    = _parse_list(keep_txt,    'KEEP_PLAYERS')
+        over    = _parse_num_dict(over_txt,   'P_OVERRIDES')
+        nudges  = _parse_num_dict(nudges_txt, 'P_NUDGES')
+    except ValueError as e:
+        st.error(str(e))
         return
-    if kind == 'global_nudge':
-        player = ''  # sentinel
-    _insert_adjustment(tourn_date, player, kind, value, note)
+
+    _replace_all(tourn_date, cut, keep, over, nudges, float(global_nudge))
     invalidate_caches()
-    st.success(f'Added {kind}' + (f' for {player}' if player else ''))
-    st.rerun()
 
-
-def _render_current_table(tourn_date: str) -> None:
-    df = _load_adjustments(tourn_date)
-    st.markdown(f'### Current adjustments for **{tourn_date}**')
-    if df.empty:
-        st.caption('_No adjustments yet._')
-        return
-
-    # One row per adjustment, with a delete button.
-    header = st.columns([2, 2, 1.5, 3, 1])
-    header[0].markdown('**Player**')
-    header[1].markdown('**Type**')
-    header[2].markdown('**Value**')
-    header[3].markdown('**Note**')
-    header[4].markdown('**Delete**')
-    for _, row in df.iterrows():
-        c = st.columns([2, 2, 1.5, 3, 1])
-        c[0].write(row['player_name'] or '_(global)_')
-        c[1].write(f"`{row['adjustment_type']}`")
-        c[2].write('—' if row['value'] is None else f"{row['value']:+.3f}")
-        c[3].write(row['note'] or '')
-        if c[4].button('✕', key=f'del_{row["id"]}', help='Delete this adjustment'):
-            _delete_adjustment(int(row['id']))
-            invalidate_caches()
-            st.rerun()
-
-
-def _render_recompute_section(tourn_date: str) -> None:
-    st.markdown('### Save & recompute')
-    st.caption(
-        'Writes `manual_adjustments` rows (above) through `pipeline.load_adjustments()` '
-        'into `run_adjusted()`. Takes ~60s to run 100k simulations. The Odds tab '
-        'and pipeline banner refresh when it finishes.'
-    )
-    if st.button('Save & recompute', type='primary', width='stretch'):
+    if save_run:
         from scripts.trigger_adjusted import trigger_adjusted
         with st.spinner('Running adjusted MC (100,000 sims)…'):
             try:
@@ -126,18 +161,17 @@ def _render_recompute_section(tourn_date: str) -> None:
                 st.exception(e)
                 return
         invalidate_caches()
-        st.success(f'OK — {summary["pool_size"]:,} players, {summary["overrides"]} overrides, '
-                   f'{summary["nudges"]} nudges applied.')
-        st.rerun()
-
-
-_TYPE_HELP = (
-    '• **cut** — force p_participate = 0.\n'
-    '• **keep** — force p_participate = 1.\n'
-    '• **override** — set p_participate to an explicit value.\n'
-    '• **nudge** — add a log-odds shift to a single player.\n'
-    '• **global_nudge** — add a log-odds shift to every player.'
-)
+        st.success(
+            f'Saved + recomputed — {summary["pool_size"]:,} players, '
+            f'{summary["overrides"]} overrides, {summary["nudges"]} nudges applied.'
+        )
+    else:
+        st.success(
+            f'Saved: {len(cut)} cut, {len(keep)} keep, '
+            f'{len(over)} override, {len(nudges)} nudge, '
+            f'global_nudge={global_nudge:+.2f}.'
+        )
+    st.rerun()
 
 
 def render() -> None:
@@ -147,8 +181,5 @@ def render() -> None:
         st.info('No pipeline run yet — adjustments require the raw predictions to exist first.')
         return
 
-    _render_current_table(predicting)
-    st.divider()
-    _render_add_form(predicting, all_player_names())
-    st.divider()
-    _render_recompute_section(predicting)
+    st.markdown(f'Editing adjustments for **{predicting}**.')
+    _render_bulk_form(predicting)

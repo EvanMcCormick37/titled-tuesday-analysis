@@ -197,9 +197,12 @@ def build_results(players, p_play, plays_ct, topn_ct, n_sims, n_values=N_VALUES)
     for k in n_values:
         with np.errstate(invalid='ignore', divide='ignore'):
             cond = np.where(plays_ct > 0, topn_ct[k] / plays_ct, 0.0)
-        rows[f'P_top{k}_given_play'] = cond
-        rows[f'P_top{k}']           = topn_ct[k] / n_sims
-        rows[f'ip_adv_top{k}']      = cond / (topn_ct[k] / n_sims)
+            p_topk = topn_ct[k] / n_sims
+            # ip_adv is NaN for players who never made top-k (0/0) — downstream
+            # (app/state.py, pipeline.py) already treats that as expected.
+            rows[f'P_top{k}_given_play'] = cond
+            rows[f'P_top{k}']           = p_topk
+            rows[f'ip_adv_top{k}']      = cond / p_topk
     return pd.DataFrame(rows, index=pd.Index(players, name='username'))
 
 
