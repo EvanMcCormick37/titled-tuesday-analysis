@@ -385,8 +385,10 @@ def fetch_standings(slug: str) -> list[dict]:
                 continue
             rank, title, username, rating = parse_player_cell(cells[0])
             wins, draws, byes = parse_round_cells(cells, round_indices)
-            score     = cells[score_col].get_text(strip=True) if score_col < len(cells) else None
-            tie_break = cells[tb1_col].get_text(strip=True)   if tb1_col  < len(cells) else None
+            # score and tie_break are REAL columns in Postgres — parse to float at
+            # scrape time rather than relying on SQLite's permissive type coercion.
+            score     = _parse_float(cells[score_col].get_text(strip=True)) if score_col < len(cells) else None
+            tie_break = _parse_float(cells[tb1_col].get_text(strip=True))   if tb1_col  < len(cells) else None
             aroc_1    = _parse_float(cells[aroc1_col].get_text(strip=True)) if (aroc1_col is not None and aroc1_col < len(cells)) else None
             if rank is None:
                 rank = len(players) + 1
