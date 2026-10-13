@@ -13,6 +13,9 @@ models
 # Data
 data
 
+# Logs
+logs
+
 # Sensitive Info: .env file and portfolio API key
 .env
 trading-key.txt
