@@ -505,6 +505,69 @@ def place_fade_no_bids(
     }
 
 
+def compute_edges(
+    client: KalshiClient,
+    tourn_date: str,
+    sleep_read: float = 0.05,
+    verbose: bool = False,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Fetch live asks for `tourn_date` and enrich with model EV/ROI/Expected Return.
+
+    Returns (df, unmatched_player_names).
+
+    DataFrame columns (one row per ask level, kept rows have matched usernames
+    and computable EV):
+        Market Ticker, Market Title, Player Name, Side, Ask Price ($),
+        Quantity Available, n, username, EV, Order Price, Total Cost,
+        Expected Return, ROI
+
+    Shared between `take_trades` (filter → fire) and the Edges dashboard tab
+    (filter → display).
+    """
+    _, PLAYER_TO_USERNAME = get_username_mappings()
+
+    if verbose:
+        print("Loading model predictions from DB...")
+    preds = _load_predictions()
+    for n in [1, 3, 5, 8, 10]:
+        col_given = f"P_top{n}_given_play"
+        if col_given in preds.columns:
+            preds[f"P_top{n}"] = preds["p_participate"] * preds[col_given]
+
+    if verbose:
+        print(f"Fetching live asks for {tourn_date}...")
+    all_asks = get_tt_asks(client, tourn_date, sleep=sleep_read)
+    if verbose:
+        print(f"Fetched {len(all_asks)} orderbook levels.")
+
+    if not all_asks:
+        return pd.DataFrame(), []
+
+    df = pd.DataFrame(all_asks)
+    df["n"] = df["Market Title"].apply(_parse_n)
+    df["username"] = df["Player Name"].map(lambda name: PLAYER_TO_USERNAME.get(name))
+
+    unmatched = df[df["username"].isna()]["Player Name"].unique().tolist()
+    df = df[df["username"].notna()].copy()
+
+    evs = []
+    for _, row in df.iterrows():
+        col = f"P_top{int(row['n'])}"
+        if row["username"] not in preds.index or col not in preds.columns:
+            evs.append(None)
+            continue
+        p_yes = float(preds.loc[row["username"], col])
+        evs.append(p_yes if row["Side"] == "YES" else 1.0 - p_yes)
+
+    df["EV"] = evs
+    df = df[df["EV"].notna()].copy()
+    df["Order Price"]     = df["Ask Price ($)"].apply(kalshi_order_price)
+    df["Total Cost"]      = df["Quantity Available"] * df["Order Price"]
+    df["Expected Return"] = (df["EV"] - df["Order Price"]) * df["Quantity Available"].astype(int)
+    df["ROI"]             = df["EV"] / df["Order Price"]
+    return df, unmatched
+
+
 def take_trades(
     client: KalshiClient,
     tourn_date: str,
@@ -526,43 +589,10 @@ def take_trades(
 
     Returns {placed, failed, skipped, unmatched, edge_count, exposure, budget_exceeded}.
     """
-    _, PLAYER_TO_USERNAME = get_username_mappings()
-
-    print("Loading model predictions from DB...")
-    preds = _load_predictions()
-    for n in [1, 3, 5, 8, 10]:
-        col_given = f"P_top{n}_given_play"
-        if col_given in preds.columns:
-            preds[f"P_top{n}"] = preds["p_participate"] * preds[col_given]
-
-    print(f"Fetching live asks for {tourn_date}...")
-    all_asks = get_tt_asks(client, tourn_date, sleep=sleep_read)
-    print(f"Fetched {len(all_asks)} orderbook levels.")
-
-    if not all_asks:
+    df, unmatched = compute_edges(client, tourn_date, sleep_read=sleep_read, verbose=True)
+    if df.empty:
         print("No asks found.")
-        return {"placed": 0, "failed": 0, "skipped": 0, "unmatched": [], "edge_count": 0}
-
-    df = pd.DataFrame(all_asks)
-    df["n"] = df["Market Title"].apply(_parse_n)
-    df["username"] = df["Player Name"].map(lambda name: PLAYER_TO_USERNAME.get(name))
-
-    unmatched = df[df["username"].isna()]["Player Name"].unique().tolist()
-    df = df[df["username"].notna()].copy()
-
-    evs = []
-    for _, row in df.iterrows():
-        col = f"P_top{int(row['n'])}"
-        if row["username"] not in preds.index or col not in preds.columns:
-            evs.append(None)
-            continue
-        p_yes = float(preds.loc[row["username"], col])
-        evs.append(p_yes if row["Side"] == "YES" else 1.0 - p_yes)
-
-    df["EV"] = evs
-    df = df[df["EV"].notna()].copy()
-    df["Order Price"] = df["Ask Price ($)"].apply(kalshi_order_price)
-    df["ROI"] = df["EV"] / df["Order Price"]
+        return {"placed": 0, "failed": 0, "skipped": 0, "unmatched": unmatched, "edge_count": 0}
 
     has_volume   = df["Quantity Available"] >= min_qty
     has_edge     = df["ROI"] > min_roi

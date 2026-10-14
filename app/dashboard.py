@@ -1,7 +1,7 @@
 """Titled Tuesday — mobile dashboard.
 
 Entry point for the tt-app Streamlit service. Guards access via auth.py,
-renders the persistent status banner, then routes to one of six tabs.
+renders the persistent status banner, then routes to one of seven tabs.
 
 Run locally:
     streamlit run app/dashboard.py
@@ -31,18 +31,19 @@ st.set_page_config(
 
 from app.auth import require_auth
 from app import banner
-from app.tabs import odds, adjustments, pipeline as pipeline_tab, portfolio, trade, jobs
+from app.tabs import odds, adjustments, pipeline as pipeline_tab, portfolio, trade, edges, jobs
 
 require_auth()
 
 banner.render()
 
-tab_odds, tab_adj, tab_pipe, tab_port, tab_trade, tab_jobs = st.tabs([
-    'Odds', 'Attendance', 'Pipeline', 'Portfolio', 'Trade', 'Jobs',
+tab_odds, tab_adj, tab_pipe, tab_port, tab_trade, tab_edges, tab_jobs = st.tabs([
+    'Odds', 'Attendance', 'Pipeline', 'Portfolio', 'Trade', 'Edges', 'Jobs',
 ])
 with tab_odds:    odds.render()
 with tab_adj:     adjustments.render()
 with tab_pipe:    pipeline_tab.render()
 with tab_port:    portfolio.render()
 with tab_trade:   trade.render()
+with tab_edges:   edges.render()
 with tab_jobs:    jobs.render()
