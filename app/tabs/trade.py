@@ -200,16 +200,135 @@ def _render_take(gate_ok: bool, tourn_date: str) -> None:
                                    help='Fire only the single highest-ROI trade per N-category.')
     budget = st.number_input('budget cap ($) — leave 0 for no cap', 0.0, 100_000.0, 0.0, 10.0,
                              key='take_budget')
-    params = {
-        'min_roi': float(min_roi),
-        'min_qty': int(min_qty),
-        'max_qty': int(max_qty),
+
+    mode = st.radio(
+        'Mode', ('One-shot', 'Loop'), horizontal=True, key='take_mode',
+        help=('One-shot: Preview → Execute a single sweep. '
+              'Loop: run sweeps continuously on an interval until stopped or budget exhausted.'),
+    )
+
+    base_params = {
+        'min_roi':        float(min_roi),
+        'min_qty':        int(min_qty),
+        'max_qty':        int(max_qty),
         'best_per_event': bool(best_per_event),
-        'budget_remaining': None if budget <= 0 else float(budget),
     }
-    from src.trading import take_trades
-    _preview_execute_block('take', gate_ok, tourn_date, take_trades, params,
-                           execute_label='Fire takers live')
+    budget_f = None if budget <= 0 else float(budget)
+
+    if mode == 'One-shot':
+        from src.trading import take_trades
+        _preview_execute_block('take', gate_ok, tourn_date, take_trades,
+                               {**base_params, 'budget_remaining': budget_f},
+                               execute_label='Fire takers live')
+    else:
+        _render_take_loop(gate_ok, tourn_date, base_params, budget_f)
+
+
+def _fmt_dt(dt) -> str:
+    return dt.strftime('%Y-%m-%d %H:%M:%S') if dt else '—'
+
+
+def _render_take_loop(gate_ok: bool, tourn_date: str, base_params: dict,
+                      budget: float | None) -> None:
+    """Loop controls + status, backed by `app.trade_loop` module-level thread."""
+    from app import trade_loop
+
+    cols = st.columns(2)
+    with cols[0]:
+        interval_minutes = st.number_input(
+            'interval (min, between sweeps that found trades)',
+            1.0, 240.0, 15.0, 1.0, key='take_loop_interval',
+        )
+    with cols[1]:
+        fallback_wait_hours = st.number_input(
+            'fallback wait (hours, when a sweep found nothing)',
+            0.1, 12.0, 1.0, 0.1, key='take_loop_fallback',
+        )
+
+    state = trade_loop.get_state()
+    running = state['running']
+
+    st.markdown('#### Status')
+    if running:
+        c = st.columns(4)
+        c[0].metric('State', 'running')
+        c[1].metric('Iterations', state['iterations'])
+        c[2].metric('Total spent ($)', f'{state["total_spent"]:.2f}')
+        if budget is None:
+            c[3].metric('Budget', 'none')
+        else:
+            c[3].metric('Budget remaining ($)',
+                        f'{max(budget - state["total_spent"], 0.0):.2f}')
+        st.caption(
+            f'Started: {_fmt_dt(state["started_at"])} · '
+            f'Last sweep: {_fmt_dt(state["last_sweep_at"])} · '
+            f'Next sweep: {_fmt_dt(state["next_sweep_at"])}'
+        )
+    else:
+        if state['stopped_at']:
+            st.info(
+                f'Last loop stopped at {_fmt_dt(state["stopped_at"])} '
+                f'(reason: `{state["stop_reason"]}`, '
+                f'{state["iterations"]} iteration(s), '
+                f'${state["total_spent"]:.2f} spent).'
+            )
+        else:
+            st.caption('No loop has run in this session.')
+
+    st.markdown('#### Controls')
+    if running:
+        if st.button('Stop loop', key='take_loop_stop', type='primary'):
+            ok, msg = trade_loop.stop()
+            st.toast(msg, icon='✋' if ok else '⚠️')
+            st.rerun()
+        if st.button('Refresh status', key='take_loop_refresh'):
+            st.rerun()
+    else:
+        st.warning(
+            'The loop fires **live** taker orders every iteration — there is no '
+            'per-sweep confirmation. Review the parameters above before starting.'
+        )
+        ack = st.checkbox(
+            'I confirm this will submit live orders to Kalshi on an interval',
+            key='take_loop_ack',
+        )
+        if st.button('Start loop', key='take_loop_start',
+                     disabled=(not ack) or (not gate_ok), type='primary'):
+            params = {
+                **base_params,
+                'tourn_date':          tourn_date,
+                'interval_minutes':    float(interval_minutes),
+                'fallback_wait_hours': float(fallback_wait_hours),
+                'budget':              budget,
+            }
+            try:
+                ok, msg = trade_loop.start(params)
+            except Exception as e:  # noqa: BLE001
+                st.exception(e); return
+            st.toast(msg, icon='▶️' if ok else '⚠️')
+            if ok:
+                st.rerun()
+
+    # History: compact, most-recent first.
+    history = state['history']
+    if history:
+        st.markdown('#### Recent sweeps')
+        for entry in reversed(history):
+            icon = '✗' if entry['error'] else ('✓' if entry['edge_count'] else '○')
+            label = (
+                f'{icon} {_fmt_dt(entry["at"])} · '
+                f'edges={entry["edge_count"]} · '
+                f'exposure=${entry["exposure"]:.2f}'
+            )
+            with st.expander(label):
+                if entry['error']:
+                    st.error('Sweep raised an exception:')
+                    st.code(entry['error'], language='text')
+                if entry['stdout']:
+                    st.code(entry['stdout'], language='text')
+                if entry['summary']:
+                    st.caption('Returned summary:')
+                    st.json(entry['summary'])
 
 
 def _render_fade(gate_ok: bool, tourn_date: str) -> None:
