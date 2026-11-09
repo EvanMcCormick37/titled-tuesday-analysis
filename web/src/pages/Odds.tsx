@@ -8,14 +8,13 @@ import { pct } from '../format';
 type Row = { player: string; p_participate: number; p_given_play: number; p_top: number; yes_price: number; no_price: number };
 type Data = { rows: Row[]; pool_size: number; tourn_date: string | null };
 
-const N_OPTIONS = [[1, 'Winner'], [3, 'Top 3'], [5, 'Top 5'], [8, 'Top 8'], [10, 'Top 10']] as const;
-
 function Bar({ value, max }: { value: number; max: number }) {
   return <div className="bar-track"><div className="bar" style={{ width: `${max > 0 ? (value / max) * 100 : 0}%` }} /></div>;
 }
 
 export default function Odds() {
   const { market } = useApp();
+  const N_OPTIONS = market.n_values.map((v) => [v, v === 1 ? 'Winner' : `Top ${v}`] as const);
   const [n, setN] = useState<number>(1);
   const [adjusted, setAdjusted] = useState<'adjusted' | 'raw'>('adjusted');
   const [view, setView] = useState<'chances' | 'prices' | 'table'>('chances');

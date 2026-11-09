@@ -20,33 +20,36 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.config import DB_PATH
 
+MARKET = 'titled_tuesday'
+
 
 def main():
     conn = sqlite3.connect(DB_PATH)
 
-    n_src = conn.execute('SELECT COUNT(*) FROM latest_model_predictions').fetchone()[0]
+    n_src = conn.execute('SELECT COUNT(*) FROM latest_model_predictions WHERE market = ?', (MARKET,)).fetchone()[0]
     if n_src == 0:
         print('latest_model_predictions is empty — nothing to save.')
         conn.close()
         return
 
     tourn_date = conn.execute(
-        'SELECT DISTINCT tourn_date FROM latest_model_predictions LIMIT 1'
+        'SELECT DISTINCT tourn_date FROM latest_model_predictions WHERE market = ? LIMIT 1', (MARKET,)
     ).fetchone()[0]
 
     conn.execute('''
         INSERT OR REPLACE INTO historical_predictions
-            (tourn_date, username, p_participate,
+            (market, tourn_date, username, p_participate,
              P_top1_given_play, P_top3_given_play, P_top5_given_play,
              P_top8_given_play, P_top10_given_play)
         SELECT
-            tourn_date, username, p_participate,
+            market, tourn_date, username, p_participate,
             P_top1_given_play, P_top3_given_play, P_top5_given_play,
             P_top8_given_play, P_top10_given_play
         FROM latest_model_predictions
-    ''')
+        WHERE market = ?
+    ''', (MARKET,))
     n_written = conn.execute(
-        'SELECT COUNT(*) FROM historical_predictions WHERE tourn_date = ?', (tourn_date,)
+        'SELECT COUNT(*) FROM historical_predictions WHERE market = ? AND tourn_date = ?', (MARKET, tourn_date)
     ).fetchone()[0]
     conn.commit()
     conn.close()

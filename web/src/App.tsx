@@ -30,15 +30,22 @@ const PAGES = [
   ['logs', 'Logs', Logs],
 ] as const;
 
-function usePage(): [string, (p: string) => void] {
-  const read = () => location.pathname.replace(/^\//, '') || 'trade';
-  const [page, setPage] = useState(read);
+type Route = { slug: string; page: string };
+
+/** The URL is /<market>/<page>; an older /<page> link opens the first market. */
+function useRoute(slugs: string[]): [Route, (next: Route) => void] {
+  const read = (): Route => {
+    const parts = location.pathname.split('/').filter(Boolean);
+    const hasMarket = slugs.includes(parts[0]);
+    return { slug: hasMarket ? parts[0] : slugs[0], page: (hasMarket ? parts[1] : parts[0]) || 'trade' };
+  };
+  const [route, setRoute] = useState(read);
   useEffect(() => {
-    const onPop = () => setPage(read());
+    const onPop = () => setRoute(read());
     addEventListener('popstate', onPop);
     return () => removeEventListener('popstate', onPop);
   }, []);
-  return [page, (p) => { history.pushState(null, '', `/${p}`); setPage(p); }];
+  return [route, (next) => { history.pushState(null, '', `/${next.slug}/${next.page}`); setRoute(next); }];
 }
 
 function Login({ onDone }: { onDone: () => void }) {
@@ -68,9 +75,9 @@ function Login({ onDone }: { onDone: () => void }) {
 
 function Shell({ markets }: { markets: Market[] }) {
   const queryClient = useQueryClient();
-  const [slug, setSlug] = useState(markets[0].slug);
+  const [{ slug, page }, navigate] = useRoute(markets.map((m) => m.slug));
   const market = markets.find((m) => m.slug === slug) ?? markets[0];
-  const [page, setPage] = usePage();
+  const setPage = (p: string) => navigate({ slug: market.slug, page: p });
   const [jobId, setJobId] = useState<number | null>(null);
   const [killing, setKilling] = useState(false);
   const { toasts, toast } = useToasts();
@@ -106,14 +113,14 @@ function Shell({ markets }: { markets: Market[] }) {
         <div className="brand">
           <strong>Trading Desk</strong>
           {markets.length > 1 ? (
-            <select aria-label="Market" value={slug} onChange={(e) => setSlug(e.target.value)}>
+            <select aria-label="Market" value={market.slug} onChange={(e) => navigate({ slug: e.target.value, page })}>
               {markets.map((m) => <option key={m.slug} value={m.slug}>{m.label}</option>)}
             </select>
           ) : <span className="muted">{market.label}</span>}
         </div>
         <nav aria-label="Pages">
           {PAGES.map(([key, label]) => (
-            <a key={key} href={`/${key}`} aria-current={page === key ? 'page' : undefined}
+            <a key={key} href={`/${market.slug}/${key}`} aria-current={page === key ? 'page' : undefined}
                onClick={(e) => { e.preventDefault(); setPage(key); }}>{label}</a>
           ))}
         </nav>
@@ -123,7 +130,8 @@ function Shell({ markets }: { markets: Market[] }) {
         </div>
       </header>
       <Banner status={status.data} onGoPipeline={() => setPage('pipeline')} />
-      <main className="page"><Page /></main>
+      {/* Keyed so form values and filters never carry over to another market. */}
+      <main className="page"><Page key={market.slug} /></main>
       {jobId !== null && <JobDrawer id={jobId} onClose={() => setJobId(null)} />}
       {killing && (
         <ConfirmDialog

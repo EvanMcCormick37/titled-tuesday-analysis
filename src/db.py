@@ -245,23 +245,23 @@ def upsert_many(
     conn.executemany(sql, rows)
 
 
-def write_df_replace(df, table: str) -> None:
-    """Overwrite a table's contents with the given DataFrame.
+def replace_market_rows(df, table: str, market: str) -> None:
+    """Atomically replace one market's rows in a shared table with `df`.
 
-    SQLite: `to_sql(if_exists='replace')` — drops and recreates the table
-      from the DataFrame's inferred types (matches current behaviour).
-    Postgres: TRUNCATE the table (preserving the DDL from the schema init
-      script), then `to_sql(if_exists='append')` to repopulate.
-
-    Only safe for tables where the schema init script already defined the
-    canonical shape — i.e. the two predictions tables. Everything else
-    should write via `to_sql(if_exists='append')` directly on the engine.
+    Readers see either the old rows or the new ones, and other markets' rows
+    are untouched.
     """
-    engine = get_engine()
-    if is_postgres():
-        from sqlalchemy import text
-        with engine.begin() as sa_conn:
-            sa_conn.execute(text(f'TRUNCATE TABLE {table}'))
-        df.to_sql(table, engine, if_exists='append', index=False)
-    else:
-        df.to_sql(table, engine, if_exists='replace', index=False)
+    from sqlalchemy import inspect, text
+    with get_engine().begin() as sa_conn:
+        if inspect(sa_conn).has_table(table):
+            sa_conn.execute(text(f'DELETE FROM {table} WHERE market = :market'), {'market': market})
+        df.assign(market=market).to_sql(table, sa_conn, if_exists='append', index=False)
+
+
+def read_market_rows(table: str, market: str):
+    """One market's rows from a shared table, without the `market` column."""
+    import pandas as pd
+    from sqlalchemy import text
+    df = pd.read_sql_query(text(f'SELECT * FROM {table} WHERE market = :market'),
+                           get_engine(), params={'market': market})
+    return df.drop(columns='market')

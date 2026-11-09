@@ -85,7 +85,8 @@ def backend(request, tmp_path, monkeypatch):
     q.init_schema()
     with db.get_conn() as conn:
         conn.execute(
-            'CREATE TABLE pipeline_runs (id INTEGER, tourn_date TEXT, state TEXT, current_step TEXT, '
+            "CREATE TABLE pipeline_runs (id INTEGER, market TEXT NOT NULL DEFAULT 'titled_tuesday', "
+            'tourn_date TEXT, state TEXT, current_step TEXT, '
             'failed_step TEXT, error_kind TEXT, error_message TEXT, started_at TEXT, completed_at TEXT)'
         )
         conn.execute("INSERT INTO pipeline_runs (id, tourn_date, state) VALUES (1, ?, 'completed')",
@@ -102,7 +103,7 @@ def model(monkeypatch):
         'P_top5_given_play': [0.7, 0.4],
         'P_top8_given_play': [0.8, 0.5],
     }, index=pd.Index(['a', 'b'], name='username'))
-    monkeypatch.setattr(trading, '_load_predictions', lambda: preds.copy())
+    monkeypatch.setattr(trading, '_load_predictions', lambda market=MARKET: preds.copy())
     monkeypatch.setattr(trading, 'get_username_mappings',
                         lambda: ({}, {'Player A': 'a', 'Player B': 'b'}))
 

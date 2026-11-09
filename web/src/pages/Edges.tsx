@@ -13,10 +13,10 @@ type Payload = { rows: Row[]; unmatched: string[] };
 type SortKey = 'expected_return' | 'roi' | 'total_cost' | 'qty' | 'ev';
 
 const COLUMNS: [SortKey, string][] = [['expected_return', 'Exp. return'], ['roi', 'ROI'], ['ev', 'EV'], ['qty', 'Qty'], ['total_cost', 'Cost']];
-const NS = [1, 3, 5, 8];
 
 export default function Edges() {
   const { market, status } = useApp();
+  const NS = market.traded_ns;
   const [minRoi, setMinRoi] = useState(1.1);
   const [minQty, setMinQty] = useState(10);
   const [side, setSide] = useState<'All' | 'YES' | 'NO'>('All');

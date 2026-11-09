@@ -22,9 +22,9 @@ from .db import get_conn, is_postgres
 ACTIVE_STATUSES = ('queued', 'running', 'needs_review')
 TERMINAL_STATUSES = ('succeeded', 'partial', 'failed', 'cancelled', 'interrupted', 'expired')
 
-# Non-trading jobs. They share the market's lane on purpose: a recompute briefly
-# empties the predictions table, so a trade must never plan during one. The kill
-# switch leaves them alone because they can't place orders.
+# Non-trading jobs. They share the market's lane on purpose: a trade must never
+# plan against predictions that are mid-recompute. The kill switch leaves them
+# alone because they can't place orders.
 OPS_STRATEGIES = ('recompute', 'run_pipeline')
 _OPS_SQL = ', '.join(f"'{s}'" for s in OPS_STRATEGIES)
 

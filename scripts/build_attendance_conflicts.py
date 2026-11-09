@@ -7,7 +7,7 @@ weeks are excluded from EWMA participation-rate calculations in
 src.data.load_and_prepare() so that p_participate reflects the player's
 attendance rate on weeks where they had no unavoidable conflict.
 
-The table is dropped and rebuilt from scratch on every run.
+Each run replaces only the given market's rows; defaults to Titled Tuesday.
 
 Usage:
     python scripts/build_attendance_conflicts.py
@@ -22,6 +22,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.db import get_conn
+from src.markets import TITLED_TUESDAY, MarketSpec
 
 
 def _norm_name(s: str) -> str:
@@ -36,10 +37,10 @@ def _norm_name(s: str) -> str:
     return ' '.join(s.lower().split())
 
 
-def build_attendance_conflicts(conn) -> int:
-    # 1. TT dates (YYYY-MM-DD)
+def build_attendance_conflicts(conn, spec: MarketSpec = TITLED_TUESDAY) -> int:
+    # 1. Event dates (YYYY-MM-DD)
     tt_dates = {str(row[0])[:10] for row in conn.execute(
-        'SELECT DISTINCT substr(CAST(date AS TEXT), 1, 10) FROM titled_tuesday_standings'
+        f'SELECT DISTINCT substr(CAST(date AS TEXT), 1, 10) FROM {spec.model.standings_table}'
     ).fetchall()}
 
     # 2. norm(player_name) → (username, player_name), preferring is_default=1
@@ -81,22 +82,11 @@ def build_attendance_conflicts(conn) -> int:
         for d in dates:
             conflicts.add((d, player_name, username))
 
-    # 5. Drop + recreate table
-    conn.execute('DROP TABLE IF EXISTS attendance_conflicts')
-    conn.execute(
-        'CREATE TABLE attendance_conflicts ('
-        '  date        TEXT NOT NULL, '
-        '  player_name TEXT NOT NULL, '
-        '  username    TEXT NOT NULL, '
-        '  PRIMARY KEY (date, username)'
-        ')'
-    )
+    # 5. Replace this market's rows
+    conn.execute('DELETE FROM attendance_conflicts WHERE market = ?', (spec.slug,))
     conn.executemany(
-        'INSERT INTO attendance_conflicts (date, player_name, username) VALUES (?, ?, ?)',
-        sorted(conflicts),
-    )
-    conn.execute(
-        'CREATE INDEX idx_attendance_conflicts_username ON attendance_conflicts(username)'
+        'INSERT INTO attendance_conflicts (market, date, player_name, username) VALUES (?, ?, ?, ?)',
+        [(spec.slug, *row) for row in sorted(conflicts)],
     )
     conn.commit()
 
@@ -111,7 +101,8 @@ def main() -> None:
     try:
         build_attendance_conflicts(conn)
         n_dates, n_users = conn.execute(
-            'SELECT COUNT(DISTINCT date), COUNT(DISTINCT username) FROM attendance_conflicts'
+            "SELECT COUNT(DISTINCT date), COUNT(DISTINCT username) FROM attendance_conflicts "
+            "WHERE market = 'titled_tuesday'"
         ).fetchone()
         print(f'  Distinct TT dates with any conflict: {n_dates}')
         print(f'  Distinct players with any conflict:  {n_users}')

@@ -344,7 +344,8 @@ def load_players_from_db() -> list[dict]:
                lmp.p_participate * lmp.P_top10_given_play AS p_top10
         FROM latest_model_predictions_raw lmp
         JOIN player_information pi ON lmp.username = pi.username
-        WHERE pi.player_name IS NOT NULL
+        WHERE lmp.market = 'titled_tuesday'
+          AND pi.player_name IS NOT NULL
           AND pi.player_name != ''
           AND pi.player_name GLOB '*[A-Za-z]*'
           AND lmp.p_participate * lmp.P_top10_given_play > 0.01

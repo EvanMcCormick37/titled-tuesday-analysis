@@ -25,12 +25,11 @@ from pydantic import BaseModel, Field, ValidationError
 from api import auth
 from src import job_queue as q
 from src import strategies as strat
-from src.db import get_conn, get_engine
+from src.db import get_conn, read_market_rows
 from src.pipeline import load_adjustments
 
 WEB_DIST = Path(__file__).resolve().parent.parent / 'web' / 'dist'
 WORKER_OFFLINE_AFTER_SECONDS = 45
-N_VALUES = (1, 3, 5, 8, 10)
 PREDICTIONS_CACHE_SECONDS = 15
 
 
@@ -107,6 +106,8 @@ def markets() -> list[dict]:
     return [{
         'slug': m.slug,
         'label': m.label,
+        'n_values': list(m.spec.prediction_ns),
+        'traded_ns': list(m.spec.traded_ns),
         'strategies': [{
             'name': s.name, 'label': s.label, 'description': s.description,
             'spends': s.spends, 'can_loop': s.can_loop,
@@ -122,7 +123,9 @@ def status(slug: str) -> dict:
     with get_conn() as conn:
         row = conn.execute(
             'SELECT id, tourn_date, state, current_step, failed_step, error_kind, error_message, '
-            'started_at, completed_at FROM pipeline_runs ORDER BY tourn_date DESC LIMIT 1'
+            'started_at, completed_at FROM pipeline_runs WHERE market = ? '
+            'ORDER BY tourn_date DESC LIMIT 1',
+            (slug,),
         ).fetchone()
     pipeline = None
     if row:
@@ -241,30 +244,31 @@ def snapshot(slug: str, kind: str, force: bool = False) -> dict:
 
 # ── Predictions ──────────────────────────────────────────────────────────────
 
-_predictions_cache: dict[bool, tuple[float, pd.DataFrame]] = {}
+_predictions_cache: dict[tuple[str, bool], tuple[float, pd.DataFrame]] = {}
 
 
-def _load_predictions(adjusted: bool) -> pd.DataFrame:
-    cached = _predictions_cache.get(adjusted)
+def _load_predictions(slug: str, adjusted: bool) -> pd.DataFrame:
+    key = (slug, adjusted)
+    cached = _predictions_cache.get(key)
     if cached and time.monotonic() - cached[0] < PREDICTIONS_CACHE_SECONDS:
         return cached[1]
     table = 'latest_model_predictions' if adjusted else 'latest_model_predictions_raw'
-    df = pd.read_sql_query(f'SELECT * FROM {table}', get_engine())
+    df = read_market_rows(table, slug)
     with get_conn() as conn:
         names = dict(conn.execute('SELECT username, player_name FROM player_information '
                                   'WHERE player_name IS NOT NULL').fetchall())
     if not df.empty:
         df['player'] = df['username'].map(names).fillna(df['username'])
-    _predictions_cache[adjusted] = (time.monotonic(), df)
+    _predictions_cache[key] = (time.monotonic(), df)
     return df
 
 
 @api.get('/markets/{slug}/predictions')
 def predictions(slug: str, n: int = 1, adjusted: bool = True, limit: int = 30) -> dict:
-    _market(slug)
-    if n not in N_VALUES:
-        raise HTTPException(status_code=422, detail=f'n must be one of {N_VALUES}')
-    df = _load_predictions(adjusted)
+    n_values = _market(slug).spec.prediction_ns
+    if n not in n_values:
+        raise HTTPException(status_code=422, detail=f'n must be one of {n_values}')
+    df = _load_predictions(slug, adjusted)
     given = f'P_top{n}_given_play'
     if df.empty or given not in df.columns:
         return {'rows': [], 'pool_size': 0, 'tourn_date': None}
@@ -297,7 +301,7 @@ def get_adjustments(slug: str) -> dict:
         names = [r[0] for r in conn.execute(
             'SELECT DISTINCT player_name FROM player_information WHERE player_name IS NOT NULL '
             'ORDER BY player_name').fetchall()]
-    return {'event_date': date, 'adjustments': load_adjustments(date), 'players': names}
+    return {'event_date': date, 'adjustments': load_adjustments(date, slug), 'players': names}
 
 
 @api.put('/markets/{slug}/adjustments')
@@ -318,11 +322,11 @@ def save_adjustments(slug: str, body: AdjustmentsBody) -> dict:
         rows.append(('', 'global_nudge', body.global_nudge))
 
     with get_conn() as conn:
-        conn.execute('DELETE FROM manual_adjustments WHERE tourn_date = ?', (date,))
+        conn.execute('DELETE FROM manual_adjustments WHERE market = ? AND tourn_date = ?', (slug, date))
         conn.executemany(
-            'INSERT INTO manual_adjustments (tourn_date, player_name, adjustment_type, value, created_by) '
-            'VALUES (?, ?, ?, ?, ?)',
-            [(date, name, kind, value, 'dashboard') for name, kind, value in rows],
+            'INSERT INTO manual_adjustments (market, tourn_date, player_name, adjustment_type, value, created_by) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            [(slug, date, name, kind, value, 'dashboard') for name, kind, value in rows],
         )
     job_id = strat.submit_ops(slug, 'recompute', created_by='dashboard') if body.recompute else None
     return {'saved': len(rows), 'job_id': job_id}
@@ -366,8 +370,8 @@ def pipeline_history(slug: str) -> dict:
     _market(slug)
     cols = ('id', 'tourn_date', 'state', 'failed_step', 'error_kind', 'started_at', 'completed_at')
     with get_conn() as conn:
-        rows = conn.execute(f'SELECT {", ".join(cols)} FROM pipeline_runs '
-                            'ORDER BY tourn_date DESC LIMIT 10').fetchall()
+        rows = conn.execute(f'SELECT {", ".join(cols)} FROM pipeline_runs WHERE market = ? '
+                            'ORDER BY tourn_date DESC LIMIT 10', (slug,)).fetchall()
         runs = [dict(zip(cols, r)) for r in rows]
         for run in runs:
             run['started_at'], run['completed_at'] = _ts(run['started_at']), _ts(run['completed_at'])

@@ -12,6 +12,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.db import get_conn, is_postgres
+from src.multi_market_schema import migrate
 
 # ISO-8601 UTC with ms precision — mirrors what Postgres' TIMESTAMPTZ serialises to.
 _NOW_DEFAULT = "(strftime('%Y-%m-%dT%H:%M:%fZ','now'))"
@@ -68,6 +69,8 @@ DDL = [
 def init(conn) -> None:
     for stmt in DDL:
         conn.execute(stmt)
+    conn.commit()
+    migrate(conn)
     conn.commit()
 
 

@@ -256,7 +256,8 @@ def run(months: int = 2) -> dict:
         print('Rebuilding attendance_conflicts ...')
         n_conflicts = build_attendance_conflicts(conn)
         n_dates, n_users = conn.execute(
-            'SELECT COUNT(DISTINCT date), COUNT(DISTINCT username) FROM attendance_conflicts'
+            "SELECT COUNT(DISTINCT date), COUNT(DISTINCT username) FROM attendance_conflicts "
+            "WHERE market = 'titled_tuesday'"
         ).fetchone()
 
     return {

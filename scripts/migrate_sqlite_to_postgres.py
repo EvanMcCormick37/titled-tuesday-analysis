@@ -2,7 +2,7 @@
 """One-shot SQLite -> Postgres data migration for the Phase 1 cutover.
 
 For each known table:
-  1. Read every row from SQLite (data/titled_tuesday.db).
+  1. Read every row from SQLite (data/chess_tournament_data.db).
   2. Bulk-insert into Postgres via psycopg's executemany.
   3. Verify row counts match post-load.
 
@@ -42,19 +42,19 @@ MANIFEST = [
     ('player_information',          'username'),
     ('titled_tuesday_tournaments',  'tournament_slug'),
     ('titled_tuesday_standings',     None),             # no natural PK; truncate+append on each full run
-    ('attendance_conflicts',        '(date, username)'),
+    ('attendance_conflicts',        '(market, date, username)'),
     ('other_events',                'broadcast_name'),
     ('other_event_rounds',          '(broadcast_name, round)'),
     ('other_event_participants',    '(broadcast_name, player_name)'),
     ('latest_model_predictions',     None),             # replace-mode table
     ('latest_model_predictions_raw', None),
-    ('historical_predictions',      '(tourn_date, username)'),
-    ('backtest',                    '(tourn_date, model, username)'),
+    ('historical_predictions',      '(market, tourn_date, username)'),
+    ('backtest',                    '(market, tourn_date, model, username)'),
     ('kalshi_markets',              'market_ticker'),
     ('kalshi_market_snapshots',      None),             # append-only; UNIQUE index drops dups where present
     ('kalshi_portfolio',             None),
     ('manual_adjustments',           None),             # BIGSERIAL id; append-only
-    ('pipeline_runs',               'tourn_date'),
+    ('pipeline_runs',               '(market, tourn_date)'),
     ('job_runs',                     None),             # BIGSERIAL id; append-only
 ]
 

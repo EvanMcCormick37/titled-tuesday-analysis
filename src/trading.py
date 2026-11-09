@@ -1,32 +1,27 @@
-"""Kalshi bid-placement and taker strategies for Titled Tuesday markets.
+"""Kalshi bid-placement and taker strategies for weekly top-N markets.
 
 Each strategy has a read-only `plan_*` function returning a `Plan`, which
 `trade_plan.execute_plan` sends to Kalshi. The job worker uses those directly.
 The original `place_bids` / `place_fade_no_bids` / `take_trades` /
 `cancel_tt_bids` functions remain as print-based wrappers for the CLI scripts,
 notebook, and Telegram bot.
+
+Every `plan_*` takes a `spec`, defaulting to Titled Tuesday.
 """
 from __future__ import annotations
 
-import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 from kalshi_core import KalshiClient, _to_kalshi_date, bid_cents, best_ask, apply_pullback, kalshi_order_price
 from .data import get_username_mappings
-from .db import get_engine
-from .kalshi_tt import _TT_EVENT_TEMPLATES, fetch_orderbooks, get_tt_asks
+from .db import read_market_rows
+from .kalshi_markets import fetch_orderbooks, get_asks
+from .markets import TITLED_TUESDAY, MarketSpec
 from .trade_plan import CancelIntent, Emit, OrderIntent, Plan, execute_plan, format_plan, noop_emit, print_emit
-
-_TEMPLATE_N: dict[str, int] = {
-    "KXTITLEDTUESDAY-{date}":   1,
-    "KXTITLEDTUESTOP-{date}T3": 3,
-    "KXTITLEDTUESTOP-{date}T5": 5,
-    "KXTITLEDTUESTOP-{date}T8": 8,
-}
 
 _N_TO_COL: dict[int, str] = {
     1: "P_top1_given_play",
@@ -35,24 +30,14 @@ _N_TO_COL: dict[int, str] = {
     8: "P_top8_given_play",
 }
 
-_ET = ZoneInfo("America/New_York")
+def _expiry_ts(tourn_date: str, spec: MarketSpec = TITLED_TUESDAY) -> int:
+    return spec.bid_expiry_ts(tourn_date)
 
 
-def _expiry_ts(tourn_date: str) -> int:
-    naive = datetime.strptime(tourn_date + " 09:00:00", "%Y-%m-%d %H:%M:%S")
-    return int(naive.replace(tzinfo=_ET).timestamp())
-
-
-# TT tournament starts at 11:00 AM ET.
-_TOURN_START_HOUR, _TOURN_START_MIN = 11, 0
-
-
-def _expiry_ts_after_start(tourn_date: str, minutes_after_start: int) -> int:
-    """Return Unix TS for `tourn_date` at (11:00 ET + minutes_after_start)."""
-    naive = datetime.strptime(tourn_date, "%Y-%m-%d")
-    start = naive.replace(hour=_TOURN_START_HOUR, minute=_TOURN_START_MIN,
-                          tzinfo=_ET)
-    return int((start + timedelta(minutes=minutes_after_start)).timestamp())
+def _expiry_ts_after_start(tourn_date: str, minutes_after_start: int,
+                           spec: MarketSpec = TITLED_TUESDAY) -> int:
+    """Return the Unix TS `minutes_after_start` minutes after the event starts."""
+    return spec.start_ts(tourn_date, minutes_after_start)
 
 
 def _parse_kalshi_expiration(order: dict) -> int | None:
@@ -70,19 +55,8 @@ def _parse_kalshi_expiration(order: dict) -> int | None:
         return None
 
 
-def _load_predictions() -> pd.DataFrame:
-    df = pd.read_sql_query("SELECT * FROM latest_model_predictions", get_engine())
-    return df.set_index("username")
-
-
-def _parse_n(title: str) -> int:
-    if re.search("Winner", title or "") is not None:
-        return 1
-    m = re.search(r"\b(Top\s+)(\d+)\b", title or "")
-    if not m:
-        return 1
-    val = int(m.group(2))
-    return val if val <= 20 else 1
+def _load_predictions(market: str = TITLED_TUESDAY.slug) -> pd.DataFrame:
+    return read_market_rows("latest_model_predictions", market).set_index("username")
 
 
 def _order_cents(order: dict) -> int | None:
@@ -103,12 +77,12 @@ def _cancel_intent(order: dict) -> CancelIntent:
     )
 
 
-def _fetch_tt_markets(
-    client: KalshiClient, date_str: str, sleep_read: float,
+def _fetch_markets(
+    client: KalshiClient, date_str: str, sleep_read: float, spec: MarketSpec,
 ) -> list[tuple[str, str, str, int]]:
     """Return (ticker, title, yes_sub_title, n) for every market on the date."""
     rows: list[tuple[str, str, str, int]] = []
-    for tmpl, n in _TEMPLATE_N.items():
+    for tmpl, n in spec.event_templates.items():
         for m in client.get_markets_by_event(tmpl.format(date=date_str)):
             rows.append((m["ticker"], m.get("title", ""), m.get("yes_sub_title", ""), n))
         if sleep_read:
@@ -127,8 +101,9 @@ def plan_place_bids(
     side_filter: str | None = None,
     sleep_read: float = 0.05,
     emit: Emit = noop_emit,
+    spec: MarketSpec = TITLED_TUESDAY,
 ) -> Plan:
-    """Plan resting bids for all Titled Tuesday markets on tourn_date.
+    """Plan resting bids for all of the market's contracts on tourn_date.
 
     markup: divisor applied to fair price (bid = fair / markup).
     max_discount: maximum cents-off cap so bid >= fair - max_discount.
@@ -138,13 +113,13 @@ def plan_place_bids(
     """
     if tourn_date is None:
         from .pipeline import next_tourn_date
-        tourn_date = next_tourn_date()
-    expiry = _expiry_ts(tourn_date)
+        tourn_date = next_tourn_date(spec)
+    expiry = _expiry_ts(tourn_date, spec)
     date_str = _to_kalshi_date(tourn_date)
     _, player_to_username = get_username_mappings()
 
     emit("phase", "Loading model predictions")
-    preds = _load_predictions()
+    preds = _load_predictions(spec.slug)
 
     emit("phase", "Fetching open orders")
     open_by_key: dict[tuple[str, str], list[dict]] = {}
@@ -154,7 +129,7 @@ def plan_place_bids(
         open_by_key.setdefault((o["ticker"], o.get("outcome_side", "yes")), []).append(o)
 
     emit("phase", "Fetching markets and orderbooks")
-    markets = _fetch_tt_markets(client, date_str, sleep_read)
+    markets = _fetch_markets(client, date_str, sleep_read, spec)
     books = fetch_orderbooks(client, [m[0] for m in markets])
 
     plan = Plan(strategy="place_bids", tourn_date=tourn_date)
@@ -217,28 +192,29 @@ def plan_fade_no_bids(
     max_bid_cents: int = 99,
     sleep_read: float = 0.05,
     emit: Emit = noop_emit,
+    spec: MarketSpec = TITLED_TUESDAY,
 ) -> Plan:
     """Plan resting NO bids at (fair_NO_given_plays − discount) cents, expiring
-    `minutes_after_start` minutes after tournament start (11:00 ET).
+    `minutes_after_start` minutes after the event starts.
 
     Strategy — fade retail overpayment of YES when a low-attendance star shows
     up on the roster. Prices NO using `P_top{N}_given_play`, ignoring
     p_participate, because the fade assumes the player has already shown up.
 
     Only NO bids expiring at or after tournament start are managed, so the
-    9 AM place_bids NO orders are never cancelled by this strategy:
+    pre-start place_bids NO orders are never cancelled by this strategy:
         - No existing post-start NO bid              → place at target
         - Existing post-start NO bid at target       → leave it (idempotent)
         - Existing post-start NO bid at other price  → cancel + replace
     """
-    expiry = _expiry_ts_after_start(tourn_date, minutes_after_start)
-    expiry_iso = datetime.fromtimestamp(expiry, _ET).isoformat()
-    tourn_start_ts = _expiry_ts_after_start(tourn_date, 0)
+    expiry = _expiry_ts_after_start(tourn_date, minutes_after_start, spec)
+    expiry_iso = datetime.fromtimestamp(expiry, ZoneInfo(spec.timezone)).isoformat()
+    tourn_start_ts = _expiry_ts_after_start(tourn_date, 0, spec)
     date_str = _to_kalshi_date(tourn_date)
     _, player_to_username = get_username_mappings()
 
     emit("phase", "Loading model predictions")
-    preds = _load_predictions()
+    preds = _load_predictions(spec.slug)
 
     emit("phase", "Fetching open NO orders")
     open_by_ticker: dict[str, list[dict]] = {}
@@ -248,7 +224,7 @@ def plan_fade_no_bids(
         open_by_ticker.setdefault(o["ticker"], []).append(o)
 
     emit("phase", "Fetching markets")
-    markets = _fetch_tt_markets(client, date_str, sleep_read)
+    markets = _fetch_markets(client, date_str, sleep_read, spec)
 
     plan = Plan(strategy="fade_no_bids", tourn_date=tourn_date,
                 stats={"markets_scanned": len(markets), "expires": expiry_iso},
@@ -304,6 +280,7 @@ def plan_take_trades(
     best_per_event: bool = True,
     sleep_read: float = 0.05,
     emit: Emit = noop_emit,
+    spec: MarketSpec = TITLED_TUESDAY,
 ) -> Plan:
     """Plan fill-or-kill taker orders on levels whose ROI clears `min_roi`.
 
@@ -313,7 +290,7 @@ def plan_take_trades(
     max_qty: cap on contracts purchased per level.
     """
     emit("phase", "Fetching live asks")
-    df, unmatched = compute_edges(client, tourn_date, sleep_read=sleep_read)
+    df, unmatched = compute_edges(client, tourn_date, sleep_read=sleep_read, spec=spec)
     plan = Plan(strategy="take_trades", tourn_date=tourn_date, unmatched=unmatched,
                 stats={"levels_scanned": len(df), "edge_count": 0, "thin_skipped": 0})
     if df.empty:
@@ -350,19 +327,19 @@ def plan_cancel_bids(
     client: KalshiClient,
     tourn_date: str,
     emit: Emit = noop_emit,
+    spec: MarketSpec = TITLED_TUESDAY,
 ) -> Plan:
-    """Plan cancelling every resting TT order for `tourn_date`."""
-    date_str = _to_kalshi_date(tourn_date)
-    tt_pat = re.compile(rf"(?:KXTITLEDTUESDAY-{date_str}|KXTITLEDTUESTOP-{date_str}T\d+)-")
+    """Plan cancelling every resting order on this market for `tourn_date`."""
+    pattern = spec.ticker_pattern(_to_kalshi_date(tourn_date))
 
     emit("phase", "Fetching open orders")
     all_orders = client.get_open_orders()
-    tt_orders = [o for o in all_orders if tt_pat.search(o.get("ticker", ""))]
+    matched = [o for o in all_orders if pattern.search(o.get("ticker", ""))]
     return Plan(
         strategy="cancel_bids", tourn_date=tourn_date,
-        cancels=[_cancel_intent(o) for o in tt_orders],
-        stats={"open_orders": len(all_orders), "tt_orders": len(tt_orders)},
-        extra={"orders": tt_orders},
+        cancels=[_cancel_intent(o) for o in matched],
+        stats={"open_orders": len(all_orders), "matched_orders": len(matched)},
+        extra={"orders": matched},
     )
 
 
@@ -373,6 +350,7 @@ def compute_edges(
     tourn_date: str,
     sleep_read: float = 0.05,
     verbose: bool = False,
+    spec: MarketSpec = TITLED_TUESDAY,
 ) -> tuple[pd.DataFrame, list[str]]:
     """Fetch live asks for `tourn_date` and enrich with model EV/ROI/Expected Return.
 
@@ -390,7 +368,7 @@ def compute_edges(
 
     if verbose:
         print("Loading model predictions from DB...")
-    preds = _load_predictions()
+    preds = _load_predictions(spec.slug)
     for n in [1, 3, 5, 8, 10]:
         col_given = f"P_top{n}_given_play"
         if col_given in preds.columns:
@@ -398,7 +376,7 @@ def compute_edges(
 
     if verbose:
         print(f"Fetching live asks for {tourn_date}...")
-    all_asks = get_tt_asks(client, tourn_date, sleep=sleep_read)
+    all_asks = get_asks(client, spec, tourn_date)
     if verbose:
         print(f"Fetched {len(all_asks)} orderbook levels.")
 
@@ -406,7 +384,6 @@ def compute_edges(
         return pd.DataFrame(), []
 
     df = pd.DataFrame(all_asks)
-    df["n"] = df["Market Title"].apply(_parse_n)
     df["username"] = df["Player Name"].map(lambda name: PLAYER_TO_USERNAME.get(name))
 
     unmatched = df[df["username"].isna()]["Player Name"].unique().tolist()

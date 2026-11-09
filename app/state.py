@@ -11,8 +11,8 @@ from datetime import date, timedelta
 import pandas as pd
 import streamlit as st
 
-from app.bot.db_reads import PipelineStatus  # shared NamedTuple
-from src.db import get_conn, get_engine
+from app.bot.db_reads import MARKET, PipelineStatus  # shared with the bot
+from src.db import get_conn, read_market_rows
 
 __all__ = ['PipelineStatus', 'current_status', 'load_predictions',
            'username_to_player_map', 'all_player_names', 'next_tourn_date_str',
@@ -35,8 +35,8 @@ def current_status() -> PipelineStatus:
         row = conn.execute(
             'SELECT id, tourn_date, state, current_step, failed_step, '
             'error_kind, error_message, started_at, completed_at '
-            'FROM pipeline_runs WHERE tourn_date = ?',
-            (tourn_date,),
+            'FROM pipeline_runs WHERE market = ? AND tourn_date = ?',
+            (MARKET, tourn_date),
         ).fetchone()
     if row is None:
         return PipelineStatus(None, tourn_date, 'absent',
@@ -52,7 +52,7 @@ def load_predictions(adjusted: bool = True) -> pd.DataFrame:
     ip_adv_top{N}, tourn_date. Indexed by username.
     """
     table = 'latest_model_predictions' if adjusted else 'latest_model_predictions_raw'
-    df = pd.read_sql_query(f'SELECT * FROM {table}', get_engine())
+    df = read_market_rows(table, MARKET)
     if df.empty:
         return df
     df = df.set_index('username')

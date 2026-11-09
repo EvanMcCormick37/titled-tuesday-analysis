@@ -15,11 +15,15 @@ Supported models (--models):
 Attendance is computed from the single-session era only (>= 2025-09-02),
 regardless of how far back skill history is allowed to reach.
 
-Predictions and actual outcomes are stored jointly in the `backtest` table.
+Each run is recorded in data/backtests.db with its settings and git commit, so
+runs can be compared in notebooks/backtest-explorer.ipynb. The `backtest` table in
+the main database keeps the latest result per date and model for older notebooks.
+
+Runs against the local SQLite file; use scripts/pull_snapshot.py to populate it.
 
 Usage
 -----
-    python scripts/run_backtest.py
+    python scripts/run_backtest.py --notes "baseline"
     python scripts/run_backtest.py --models score_smooth_narrow
     python scripts/run_backtest.py --start 2025-11-04 --sims 100000
     python scripts/run_backtest.py --sample 3         # quick smoke test
@@ -41,7 +45,10 @@ from src.config import (
     DB_PATH, N_SIMS, DATA_START,
     SCORE_GAUSSIAN_KERNEL_SIGMA_WIDE, SCORE_GAUSSIAN_KERNEL_SIGMA_NARROW,
 )
+from src import backtest_runs
 from src.data import load_and_prepare
+from src.db import is_postgres
+from src.markets import TITLED_TUESDAY
 from src.simulation import (
     build_player_pool_score, build_player_pool_perf,
     run_simulation_ranked, build_results,
@@ -70,6 +77,7 @@ def _ensure_table(conn: sqlite3.Connection) -> None:
     )
     conn.execute(f"""
         CREATE TABLE IF NOT EXISTS backtest (
+            market             TEXT NOT NULL DEFAULT 'titled_tuesday',
             tourn_date         TEXT,
             model              TEXT,
             username           TEXT,
@@ -77,7 +85,7 @@ def _ensure_table(conn: sqlite3.Connection) -> None:
             {cols},
             played             INTEGER,
             actual_rank        REAL,
-            PRIMARY KEY (tourn_date, model, username)
+            PRIMARY KEY (market, tourn_date, model, username)
         )
     """)
     conn.commit()
@@ -122,8 +130,8 @@ def _fetch_actuals(conn: sqlite3.Connection, tourn_date: str) -> pd.DataFrame:
 
 
 def _write(
-    conn: sqlite3.Connection, tourn_date: str, model: str,
-    results: pd.DataFrame, actuals: pd.DataFrame,
+    conn: sqlite3.Connection, store: sqlite3.Connection, run_id: int,
+    tourn_date: str, model: str, results: pd.DataFrame, actuals: pd.DataFrame,
 ) -> int:
     out = results[['p_participate'] +
                   [f'P_top{k}_given_play' for k in N_VALUES]].copy()
@@ -134,10 +142,11 @@ def _write(
     out.insert(0, 'tourn_date', tourn_date)
 
     conn.execute(
-        'DELETE FROM backtest WHERE tourn_date = ? AND model = ?',
+        "DELETE FROM backtest WHERE market = 'titled_tuesday' AND tourn_date = ? AND model = ?",
         (tourn_date, model),
     )
     out.to_sql('backtest', conn, if_exists='append', index=False)
+    backtest_runs.save_predictions(store, run_id, out)
     return len(out)
 
 
@@ -148,7 +157,39 @@ def run_backtest(
     sample: int     = None,
     attendance_start: str = DATA_START,
     models: tuple  = DEFAULT_MODELS,
-) -> None:
+    notes: str     = None,
+) -> int:
+    """Run the walk-forward backtest and return its run_id."""
+    if is_postgres():
+        raise RuntimeError('Backtests run on the local SQLite snapshot. Unset DATABASE_URL.')
+
+    model_config = TITLED_TUESDAY.model
+    settings = {
+        'start_date': start_date, 'attendance_start': attendance_start, 'n_sims': n_sims,
+        'base_seed': base_seed, 'sample': sample, 'n_values': N_VALUES, 'min_appearances': MIN_APP,
+        'noise_sigma': {m: MODEL_NOISE_SIGMA[m] for m in models},
+        'skill_decay': model_config.skill_decay,
+        'participation_decay': model_config.participation_decay,
+        'min_participation_rate': model_config.min_participation_rate,
+        'data_cutoff': model_config.data_cutoff,
+        'season_shift_applied': attendance_start is None,
+    }
+    store = backtest_runs.connect()
+    run_id = backtest_runs.start_run(store, TITLED_TUESDAY.slug, models, settings, notes)
+    print(f'Backtest run {run_id}')
+    try:
+        _run_events(run_id, store, start_date, n_sims, base_seed, sample, attendance_start, models)
+    except BaseException as exc:
+        backtest_runs.finish_run(store, run_id, f'{type(exc).__name__}: {exc}')
+        raise
+    finally:
+        store.commit()
+    backtest_runs.finish_run(store, run_id)
+    store.close()
+    return run_id
+
+
+def _run_events(run_id, store, start_date, n_sims, base_seed, sample, attendance_start, models) -> None:
     t0 = time.time()
 
     conn = sqlite3.connect(DB_PATH)
@@ -198,12 +239,13 @@ def run_backtest(
             if results.empty:
                 print(f'  SKIP {model}: pool too small')
                 continue
-            n_written = _write(conn, t_date, model, results, actuals)
+            n_written = _write(conn, store, run_id, t_date, model, results, actuals)
             n_played  = int(results.index.isin(actuals.index).sum())
             print(f'  {model:5s}: pool={len(results):,}  '
                   f'played={n_played:,}  rows_written={n_written:,}')
 
         conn.commit()
+        backtest_runs.record_event(store, run_id)
         print(f'  elapsed={time.time()-t0:>6.1f}s')
 
     conn.close()
@@ -222,6 +264,7 @@ if __name__ == '__main__':
     parser.add_argument('--models',           nargs='+', default=list(DEFAULT_MODELS),
                         choices=list(ALL_MODELS),
                         help='which model variants to run')
+    parser.add_argument('--notes', help='what this run is testing; shown in the run list')
     args = parser.parse_args()
 
     run_backtest(
@@ -230,4 +273,5 @@ if __name__ == '__main__':
         sample           = args.sample,
         attendance_start = args.attendance_start,
         models           = tuple(args.models),
+        notes            = args.notes,
     )

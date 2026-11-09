@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+from functools import partial
 
 import pandas as pd
 import pytest
@@ -11,6 +12,7 @@ from api import auth
 from api import main as api_main
 from src import db, job_queue as q, strategies
 from src.job_runner import JobRunner, Worker
+from src.markets import TITLED_TUESDAY
 from tests.test_trade_jobs import DATE, MARKET, PREV, FakeClient, backend, juicy, model  # noqa: F401
 
 PASSWORD = 'correct horse'
@@ -27,7 +29,7 @@ def client(backend, monkeypatch):  # noqa: F811
     with TestClient(api_main.app, base_url='https://testserver') as c:
         c.fake = fake
         yield c
-    object.__setattr__(market, 'next_event_date', strategies._tt_next_date)
+    object.__setattr__(market, 'next_event_date', partial(strategies._next_date, market.spec))
 
 
 @pytest.fixture
@@ -96,6 +98,21 @@ def test_preview_submit_run_detail(authed):
     assert authed.get(f'/api/jobs/{job_id}?after={last}').json()['events'] == []
 
 
+def test_status_and_history_ignore_other_markets(authed):
+    with db.get_conn() as conn:
+        conn.execute('CREATE TABLE IF NOT EXISTS job_runs (id INTEGER, pipeline_run_id INTEGER, job_name TEXT, '
+                     'status TEXT, started_at TEXT, ended_at TEXT, summary TEXT, log_tail TEXT)')
+        conn.execute("INSERT INTO pipeline_runs (id, market, tourn_date, state) "
+                     "VALUES (2, 'bullet_brawl', '2026-11-14', 'failed')")
+    assert authed.get(f'/api/markets/{MARKET}/status').json()['pipeline']['tourn_date'] == PREV
+    assert [r['tourn_date'] for r in authed.get(f'/api/markets/{MARKET}/pipeline').json()['runs']] == [PREV]
+
+
+def test_markets_advertise_their_n_values(authed):
+    listed = authed.get('/api/markets').json()[0]
+    assert listed['n_values'] == [1, 3, 5, 8, 10] and listed['traded_ns'] == [1, 3, 5, 8]
+
+
 def test_submit_without_cap_is_422_with_message(authed):
     r = authed.post(f'/api/markets/{MARKET}/jobs', json={'strategy': 'take_trades', 'params': {}})
     assert r.status_code == 422 and 'max exposure' in r.json()['detail']
@@ -141,7 +158,7 @@ def date_patched(backend):  # noqa: F811
     market = strategies.MARKETS[MARKET]
     object.__setattr__(market, 'next_event_date', lambda: DATE)
     yield
-    object.__setattr__(market, 'next_event_date', strategies._tt_next_date)
+    object.__setattr__(market, 'next_event_date', partial(strategies._next_date, market.spec))
 
 
 def _run_op():
@@ -195,7 +212,7 @@ def test_kill_leaves_ops_alone(date_patched):
 
 
 def test_ops_command_cannot_inject_flags():
-    cmd = strategies._tt_pipeline_command(DATE, {'slug_url': '--resume=run_raw'})
+    cmd = strategies.MARKETS[MARKET].ops['run_pipeline'].command(DATE, {'slug_url': '--resume=run_raw'})
     assert cmd[-1] == '--slug-url=--resume=run_raw'
 
 
@@ -234,7 +251,7 @@ def test_worker_publishes_snapshot(date_patched):
 
 def test_edges_payload_is_json_safe(date_patched):
     from src import market_views
-    payload = market_views.tt_edges_snapshot(FakeClient(asks_no_side=juicy()), DATE)
+    payload = market_views.edges_snapshot(FakeClient(asks_no_side=juicy()), DATE, TITLED_TUESDAY)
     row = payload['rows'][0]
     assert row['roi'] > 1.2 and row['side'] == 'YES'
     assert pd.notna(row['ev'])

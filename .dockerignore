@@ -20,10 +20,13 @@ web/dist
 data/lichess_dumps
 
 # The DB itself is a runtime volume mount, not an image artefact
-data/titled_tuesday.db
-data/titled_tuesday.db-journal
-data/titled_tuesday.db-wal
-data/titled_tuesday.db-shm
+data/chess_tournament_data.db
+data/chess_tournament_data.db-journal
+data/chess_tournament_data.db-wal
+data/chess_tournament_data.db-shm
+data/chess_tournament_data.db.bak
+data/chess_tournament_data.partial
+data/backtests.db
 
 # API cache is runtime-only too (rebuilt from scratch)
 data/api_cache

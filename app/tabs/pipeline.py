@@ -143,7 +143,7 @@ def render() -> None:
     with get_conn() as conn:
         rows = conn.execute(
             'SELECT tourn_date, state, failed_step, error_kind, started_at, completed_at '
-            'FROM pipeline_runs ORDER BY tourn_date DESC LIMIT 10'
+            "FROM pipeline_runs WHERE market = 'titled_tuesday' ORDER BY tourn_date DESC LIMIT 10"
         ).fetchall()
     df = pd.DataFrame(rows, columns=['tourn_date', 'state', 'failed_step',
                                      'error_kind', 'started_at', 'completed_at'])

@@ -46,7 +46,8 @@ class StateWatcher:
             rows = conn.execute(
                 'SELECT id, tourn_date, state, current_step, failed_step, '
                 '       error_kind, error_message, started_at, completed_at '
-                'FROM pipeline_runs ORDER BY tourn_date DESC LIMIT 8'
+                'FROM pipeline_runs WHERE market = ? ORDER BY tourn_date DESC LIMIT 8',
+                (db_reads.MARKET,),
             ).fetchall()
         from app.bot.db_reads import PipelineStatus
         return [PipelineStatus(*r) for r in rows]

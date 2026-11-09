@@ -28,7 +28,8 @@ def _replace_all(
 ) -> None:
     """Replace every manual_adjustments row for `tourn_date` with the new state."""
     with get_conn() as conn:
-        conn.execute('DELETE FROM manual_adjustments WHERE tourn_date = ?', (tourn_date,))
+        conn.execute("DELETE FROM manual_adjustments WHERE market = 'titled_tuesday' AND tourn_date = ?",
+                     (tourn_date,))
 
         def _ins(player: str, kind: str, value: float | None) -> None:
             conn.execute(

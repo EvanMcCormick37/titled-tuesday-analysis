@@ -24,6 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.db import get_conn, is_postgres
+from src.multi_market_schema import migrate
 
 
 DDL = [
@@ -320,6 +321,7 @@ def main() -> None:
     with get_conn() as conn:
         for stmt in DDL:
             conn.execute(stmt)
+        migrate(conn)
         conn.commit()
         from src.job_queue import init_schema
         init_schema()

@@ -11,7 +11,9 @@ from typing import NamedTuple
 
 import pandas as pd
 
-from src.db import get_conn, get_engine
+from src.db import get_conn, read_market_rows
+
+MARKET = 'titled_tuesday'   # the bot and Streamlit app only cover Titled Tuesday
 
 
 class PipelineStatus(NamedTuple):
@@ -38,8 +40,8 @@ def current_status() -> PipelineStatus:
         row = conn.execute(
             'SELECT id, tourn_date, state, current_step, failed_step, '
             'error_kind, error_message, started_at, completed_at '
-            'FROM pipeline_runs WHERE tourn_date = ?',
-            (tourn_date,),
+            'FROM pipeline_runs WHERE market = ? AND tourn_date = ?',
+            (MARKET, tourn_date),
         ).fetchone()
     if row is None:
         return PipelineStatus(None, tourn_date, 'absent',
@@ -51,7 +53,7 @@ def current_status() -> PipelineStatus:
 
 def load_predictions(adjusted: bool = True) -> pd.DataFrame:
     table = 'latest_model_predictions' if adjusted else 'latest_model_predictions_raw'
-    df = pd.read_sql_query(f'SELECT * FROM {table}', get_engine())
+    df = read_market_rows(table, MARKET)
     if df.empty:
         return df
     df = df.set_index('username')
@@ -98,8 +100,8 @@ def adjustments_for(tourn_date: str) -> list[tuple[str, str, float | None]]:
     with get_conn() as conn:
         rows = conn.execute(
             'SELECT player_name, adjustment_type, value FROM manual_adjustments '
-            'WHERE tourn_date = ? ORDER BY created_at ASC',
-            (tourn_date,),
+            'WHERE market = ? AND tourn_date = ? ORDER BY created_at ASC',
+            (MARKET, tourn_date),
         ).fetchall()
     return [(r[0], r[1], r[2]) for r in rows]
 
@@ -109,8 +111,8 @@ def insert_adjustment(tourn_date: str, player_name: str, adjustment_type: str,
     with get_conn() as conn:
         conn.execute(
             'INSERT INTO manual_adjustments '
-            '(tourn_date, player_name, adjustment_type, value, created_by) '
-            'VALUES (?, ?, ?, ?, ?)',
-            (tourn_date, player_name, adjustment_type, value, created_by),
+            '(market, tourn_date, player_name, adjustment_type, value, created_by) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            (MARKET, tourn_date, player_name, adjustment_type, value, created_by),
         )
         conn.commit()

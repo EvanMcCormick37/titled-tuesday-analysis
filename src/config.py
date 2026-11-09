@@ -4,10 +4,11 @@ from pathlib import Path
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).parent.parent
-DB_PATH      = PROJECT_ROOT / 'data' / 'titled_tuesday.db'
+DB_PATH      = PROJECT_ROOT / 'data' / 'chess_tournament_data.db'
 MODELS_DIR   = PROJECT_ROOT / 'models'
 DATA_DIR     = PROJECT_ROOT / 'data'
 BACKTEST_DIR = PROJECT_ROOT / 'data' / 'backtest'
+BACKTEST_DB_PATH = DATA_DIR / 'backtests.db'    # run history; separate so a snapshot can't erase it
 
 # ── Monte Carlo hyperparameters ───────────────────────────────────────────────
 # (TOURN_DATE removed — resolve dynamically via src.pipeline.next_tourn_date())
@@ -39,7 +40,7 @@ MIN_APP    = 3              # minimum weeks attended to appear in training set
 # Tournaments before this date have their participation weight multiplied by
 # SEASON_SHIFT_FACTOR, downweighting pre-shift history relative to the new CCT
 # season era.  Set SEASON_SHIFT_DATE = None to disable.
-SEASON_SHIFT_DATE   = '2026-08-30 00:00:00'
+SEASON_SHIFT_DATE   = '2026-08-31 00:00:00'
 SEASON_SHIFT_FACTOR = 0.5
 
 # FEATURE_COLS = [

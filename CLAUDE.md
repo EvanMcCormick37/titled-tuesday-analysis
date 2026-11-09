@@ -129,13 +129,31 @@ Rules: jobs **re-plan when they fire**, and a plan above the approved `max_expos
 
 Tests: `python -m pytest tests` (fake Kalshi client; set `TEST_PG_URL` to a disposable Postgres to also run against Postgres — tables are dropped). Frontend: `cd web && npm run dev` with the API on port 8000. `DASHBOARD_PASSWORD` is required (login fails closed); set `TT_INSECURE_COOKIE=1` for plain-http local testing.
 
+### Local analysis
+
+Notebooks and backtests run against a local SQLite copy of Railway, in the `tt` conda env (`requirements-dev.txt` plus `kalshi-core`, Jupyter kernel "Python (tt)").
+
+- `python scripts/pull_snapshot.py` refreshes `data/chess_tournament_data.db` over a read-only connection. Never put the Railway URL in `.env.local`.
+- `python scripts/run_backtest.py --notes "..."` records a run in `data/backtests.db` with its settings and git commit. Pulling a snapshot doesn't affect that file.
+- `notebooks/backtest-explorer.ipynb` lists and compares runs; `src/backtest_runs.py` holds the scoring.
+
+### Multiple markets
+
+`src/markets/` holds one `MarketSpec` per weekly event: Kalshi series, N values, start and bid-expiry times, and a `ModelConfig`. Trading, snapshots, the pipeline runner and the API all take a spec, defaulting to Titled Tuesday. A spec becomes tradable only when it is registered in `MARKETS` in `src/strategies.py`.
+
+- `pipeline_runs`, `manual_adjustments`, `attendance_conflicts`, both latest-predictions tables, `historical_predictions` and `backtest` have a `market` column. Always filter on it, and write predictions with `db.replace_market_rows`.
+- Each market keeps its raw results in its own tables (`titled_tuesday_standings`, `bullet_brawl_standings`).
+- `scripts/migrate_multi_market.py` applies this schema to an existing database. It is idempotent.
+- The Telegram bot and Streamlit app cover Titled Tuesday only.
+- Bullet Brawl is defined but unregistered: it still needs an ingest step, a tuned `ModelConfig` and a `PIPELINES` entry in `scripts/weekly_pipeline.py`.
+
 ### Key modules
 
 **`src/config.py`** — Single source of truth for MC hyperparameters (`N_SIMS=100_000`, `SKILL_DECAY=0.96`, `PARTICIPATION_DECAY=0.75`), DB path (local), attendance model cutoffs. **No `TOURN_DATE` constant** — resolve dynamically via `src.pipeline.next_tourn_date()` which queries `MAX(titled_tuesday_standings.date) + 1 week`.
 
-**`src/db.py`** — Dual-backend connection layer. `get_conn()` returns a wrapped DB-API connection (auto-translates `?` → `%s` on Postgres); `get_engine()` returns a cached SQLAlchemy engine for pandas-style access. Backend chosen at import time from `$DATABASE_URL`: `postgres(ql)://` → psycopg3, else SQLite at `config.DB_PATH`. Helpers: `upsert_many()`, `write_df_replace()`, `table_columns()`.
+**`src/db.py`** — Dual-backend connection layer. `get_conn()` returns a wrapped DB-API connection (auto-translates `?` → `%s` on Postgres); `get_engine()` returns a cached SQLAlchemy engine for pandas-style access. Backend chosen at import time from `$DATABASE_URL`: `postgres(ql)://` → psycopg3, else SQLite at `config.DB_PATH`. Helpers: `upsert_many()`, `replace_market_rows()`, `read_market_rows()`, `table_columns()`.
 
-**`src/data.py`** — `load_and_prepare()` reads standings, computes decay-weighted skill history and EWMA participation rates, applies an isotonic regression floor (`models/isotonic_regression.joblib`) to smooth low-attendance players, subtracts `attendance_conflicts` weeks from the EWMA denominator.
+**`src/data.py`** — `load_and_prepare()` reads standings, computes decay-weighted skill history and EWMA participation rates, down-weights events before `SEASON_SHIFT_DATE`, subtracts `attendance_conflicts` weeks from the EWMA denominator.
 
 **`src/simulation.py`** — Monte Carlo kernels + three player-pool builders:
 - `build_player_pool()` + `run_simulation()`: rank-percentile (legacy, float32)
@@ -150,7 +168,7 @@ The score and perf pools feed `run_simulation_ranked` (also exported as `run_sim
 - `load_adjustments(tourn_date) -> dict` — reads `manual_adjustments` and shapes the rows into the kwargs `run_adjusted` expects. "Last-write-wins" per (player, type).
 - `next_tourn_date() -> str` — the one Tuesday after `MAX(titled_tuesday_standings.date)`.
 
-**`src/kalshi_tt.py`** — TT-specific Kalshi helpers: `get_tt_markets()`, `get_tt_asks()`, `get_tt_positions_df()`. The positions reader joins Kalshi's live position data against the local kalshi-core `fills` table so transaction fees are reflected in `cost_incl_fees` and `avg_price_incl_fees`. Import `KalshiClient` from `kalshi_core`, not from here.
+**`src/kalshi_markets.py`** — Kalshi helpers for any market spec; `src/kalshi_tt.py` wraps them as `get_tt_markets()`, `get_tt_asks()`, `get_tt_positions_df()`. The positions reader joins Kalshi's live position data against the local kalshi-core `fills` table so transaction fees are reflected in `cost_incl_fees` and `avg_price_incl_fees`. Import `KalshiClient` from `kalshi_core`, not from here.
 
 **`src/trading.py`** — Four live strategies. All default `tourn_date=None` and lazily resolve via `next_tourn_date()`:
 - `place_bids()` — fair price = `p_participate × P_top{N}_given_play`, bids at `max(fair/markup, fair − max_discount)`, cancels stale orders if new bid is lower, pulls back if market ask is at or below the computed bid. Expiry 9 AM ET on tourn day.
@@ -279,5 +297,5 @@ Kalshi credentials live in `~/.kalshi/` (not in this repo):
 `kalshi_core.KalshiClient()` loads from this location. On Railway, `KalshiClient.from_env()` reads `KALSHI_API_KEY_ID` + `KALSHI_PRIVATE_KEY_B64` (base64 of the PEM key) from env vars instead.
 
 Database:
-- **Local:** nothing to configure — `DB_PATH = data/titled_tuesday.db` (SQLite, auto-created).
+- **Local:** nothing to configure — `DB_PATH = data/chess_tournament_data.db` (SQLite, auto-created).
 - **Railway-like local test:** put `DATABASE_URL=postgres://...` in `.env.local` (gitignored); `src/db.py` auto-loads it.

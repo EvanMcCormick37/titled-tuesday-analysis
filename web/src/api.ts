@@ -43,7 +43,7 @@ export type Strategy = {
   schema: { properties?: Record<string, SchemaProp> };
 };
 
-export type Market = { slug: string; label: string; strategies: Strategy[] };
+export type Market = { slug: string; label: string; n_values: number[]; traded_ns: number[]; strategies: Strategy[] };
 
 export type PipelineRow = {
   id: number;

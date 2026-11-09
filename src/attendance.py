@@ -378,7 +378,8 @@ def apply_schedule_adjustments(
 
     with get_conn() as conn:
         pred_rows = conn.execute(
-            'SELECT username, "P_top10_given_play" FROM latest_model_predictions_raw'
+            'SELECT username, "P_top10_given_play" FROM latest_model_predictions_raw '
+            "WHERE market = 'titled_tuesday'"
         ).fetchall()
 
     top_usernames = {u for u, pv in pred_rows if pv is not None and pv >= top_player_threshold}

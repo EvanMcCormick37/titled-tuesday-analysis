@@ -1,95 +1,34 @@
-"""Titled Tuesday-specific Kalshi market helpers."""
+"""Titled Tuesday entry points for the helpers in src.kalshi_markets."""
 from __future__ import annotations
 
-import re
-import time
-from datetime import date, timedelta
+from datetime import date
 from typing import Optional, Union
 
 import pandas as pd
 
-from kalshi_core import KalshiClient, _to_kalshi_date
+from kalshi_core import KalshiClient
 
-_TT_EVENT_TEMPLATES = [
-    "KXTITLEDTUESDAY-{date}",    # winner
-    "KXTITLEDTUESTOP-{date}T3",  # top 3
-    "KXTITLEDTUESTOP-{date}T5",  # top 5
-    "KXTITLEDTUESTOP-{date}T8",  # top 8
-]
+from .kalshi_markets import fetch_orderbooks, get_asks, get_event_markets, get_positions_df
+from .markets import TITLED_TUESDAY
+
+__all__ = ['fetch_orderbooks', 'get_tt_asks', 'get_tt_markets', 'get_tt_positions_df']
+
+_TT_EVENT_TEMPLATES = list(TITLED_TUESDAY.event_templates)
 
 
 def _next_tuesday(from_date: Optional[date] = None) -> date:
-    d = from_date or date.today()
-    days_until = (1 - d.weekday()) % 7  # 0 if today is Tuesday
-    return d + timedelta(days=days_until)
+    return TITLED_TUESDAY.next_event_on_or_after(from_date)
 
 
-def get_tt_markets(
-    client: KalshiClient, event_date: Union[date, str, None] = None
-) -> list[dict]:
-    """Return all open markets for a Titled Tuesday date (defaults to soonest upcoming Tuesday)."""
-    if event_date is None:
-        event_date = _next_tuesday()
-    date_str = _to_kalshi_date(event_date)
-    markets = []
-    for tmpl in _TT_EVENT_TEMPLATES:
-        markets.extend(client.get_markets_by_event(tmpl.format(date=date_str)))
-    return markets
-
-
-def fetch_orderbooks(client: KalshiClient, tickers: list[str]) -> dict[str, dict]:
-    """Bulk-fetch orderbooks, retrying any ticker the batch response left out.
-
-    A ticker that still can't be fetched is absent from the result, so callers
-    can skip it instead of mistaking it for an empty book.
-    """
-    books = client.get_orderbooks(tickers) if tickers else {}
-    for ticker in tickers:
-        if ticker in books:
-            continue
-        try:
-            books[ticker] = client.get_orderbook(ticker)
-        except Exception as e:
-            print(f"Could not retrieve orderbook for {ticker}: {e}")
-    return books
+def get_tt_markets(client: KalshiClient, event_date: Union[date, str, None] = None) -> list[dict]:
+    return get_event_markets(client, TITLED_TUESDAY, event_date)
 
 
 def get_tt_asks(
-    client: KalshiClient,
-    event_date: Union[date, str, None] = None,
-    sleep: float = 0.05,
+    client: KalshiClient, event_date: Union[date, str, None] = None, sleep: float = 0.05,
 ) -> list[dict]:
-    """Fetch all resting ask levels for a Titled Tuesday event date.
-
-    Each entry: Market Ticker, Market Title, Player Name,
-                Ask Price ($), Quantity Available, Side ('YES' | 'NO')
-
-    `sleep` is retained for call-site compatibility; orderbooks are now fetched
-    in bulk, so there is no per-market request to throttle.
-    """
-    markets = get_tt_markets(client, event_date)
-    books = fetch_orderbooks(client, [m["ticker"] for m in markets])
-    all_asks = []
-    for market in markets:
-        ticker   = market["ticker"]
-        title    = market.get("title", "")
-        subtitle = market.get("yes_sub_title", "")
-        ob = books.get(ticker)
-        if ob is None:
-            continue
-        for price_str, qty_str in ob.get("yes_dollars") or []:
-            all_asks.append({
-                "Market Ticker": ticker, "Market Title": title, "Player Name": subtitle,
-                "Ask Price ($)": 1.0 - float(price_str),
-                "Quantity Available": float(qty_str), "Side": "NO",
-            })
-        for price_str, qty_str in ob.get("no_dollars") or []:
-            all_asks.append({
-                "Market Ticker": ticker, "Market Title": title, "Player Name": subtitle,
-                "Ask Price ($)": 1.0 - float(price_str),
-                "Quantity Available": float(qty_str), "Side": "YES",
-            })
-    return all_asks
+    """`sleep` is retained for call-site compatibility; orderbooks are fetched in bulk."""
+    return get_asks(client, TITLED_TUESDAY, event_date)
 
 
 def get_tt_positions_df(
@@ -98,83 +37,4 @@ def get_tt_positions_df(
     sleep: float = 0.05,
     fees_by_ticker: Optional[dict[str, float]] = None,
 ) -> pd.DataFrame:
-    """Fetch current TT positions from Kalshi API, with fee-inclusive cost basis.
-
-    Pass `fees_by_ticker` to supply fees directly instead of reading the local
-    kalshi-core `fills` DB.
-
-
-    Joins Kalshi's live position data against the local kalshi-core `fills`
-    DB so transaction fees are reflected in `cost_incl_fees` and
-    `avg_price_incl_fees`. `cost` and `avg_price` remain Kalshi's raw
-    exposure numbers (fee-exclusive) for backward compatibility.
-
-    Returns columns: ticker, marketTitle, n, position, volume, cost, fees,
-    cost_incl_fees, avg_price, avg_price_incl_fees.
-    """
-    if event_date is None:
-        event_date = _next_tuesday()
-    date_str = _to_kalshi_date(event_date)
-
-    positions_df = client.get_positions()
-    if positions_df.empty:
-        return pd.DataFrame()
-
-    tt_pat = re.compile(
-        rf"(?:KXTITLEDTUESDAY-{date_str}|KXTITLEDTUESTOP-{date_str}T\d+)-"
-    )
-    mask = positions_df["ticker"].apply(lambda t: bool(tt_pat.search(t)))
-    tt = positions_df[mask].copy()
-    if tt.empty:
-        return pd.DataFrame()
-
-    pos_col = "position_fp"
-    exp_col = "market_exposure_dollars"
-    for col in (pos_col, exp_col):
-        if col not in tt.columns:
-            raise KeyError(f"Expected '{col}' in positions; got {list(tt.columns)}")
-
-    tt = tt[tt[pos_col].astype(float) != 0].copy()
-    if tt.empty:
-        return pd.DataFrame()
-
-    def _n(ticker: str) -> Optional[int]:
-        if f"KXTITLEDTUESDAY-{date_str}-" in ticker:
-            return 1
-        m = re.search(rf"KXTITLEDTUESTOP-{date_str}T(\d+)-", ticker)
-        return int(m.group(1)) if m else None
-
-    tt["n"] = tt["ticker"].apply(_n)
-    tt = tt[tt["n"].notna()].copy()
-    tt["n"] = tt["n"].astype(int)
-
-    signed = tt[pos_col].astype(float)
-    tt["position"] = signed.apply(lambda p: "Yes" if p > 0 else "No")
-    tt["volume"]   = signed.abs()
-    tt["cost"]     = tt[exp_col].astype(float)
-    tt["avg_price"] = tt["cost"] / tt["volume"]
-
-    # Fee-inclusive cost basis. kalshi_core.db.get_fills reads from the
-    # central ~/.kalshi/data/kalshi.db populated by sync_fills(client).
-    if fees_by_ticker is None:
-        fees_by_ticker = {}
-        try:
-            from kalshi_core import get_fills
-            fills = get_fills()
-            if not fills.empty and "fee_cost" in fills.columns:
-                fees_by_ticker = fills.groupby("ticker")["fee_cost"].sum().to_dict()
-        except Exception as e:
-            print(f"  Warning: could not load fills for fee lookup: {e}")
-
-    tt["fees"] = tt["ticker"].map(fees_by_ticker).fillna(0.0).astype(float)
-    tt["cost_incl_fees"]      = tt["cost"] + tt["fees"]
-    tt["avg_price_incl_fees"] = tt["cost_incl_fees"] / tt["volume"]
-
-    market_titles = {
-        m["ticker"]: m.get("yes_sub_title", "")
-        for m in client.get_markets_by_tickers(tt["ticker"].tolist())
-    }
-    tt["marketTitle"] = tt["ticker"].map(market_titles).fillna("")
-    return tt[["ticker", "marketTitle", "n", "position", "volume",
-               "cost", "fees", "cost_incl_fees",
-               "avg_price", "avg_price_incl_fees"]].reset_index(drop=True)
+    return get_positions_df(client, TITLED_TUESDAY, event_date, fees_by_ticker)

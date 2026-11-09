@@ -8,12 +8,14 @@ from __future__ import annotations
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import job_queue, market_views, trading
+from .markets import TITLED_TUESDAY, MarketSpec
 from .trade_plan import Emit, Plan
 
 
@@ -33,7 +35,7 @@ class FadeNoBidsParams(_Params):
     discount_cents: int = Field(15, ge=1, le=50, title='Discount (¢)',
                                 description='Cents below fair NO')
     count: int = Field(200, ge=1, le=10_000, title='Contracts per bid')
-    minutes_after_start: int = Field(10, ge=0, le=180, title='Expiry (min after 11:00 ET)')
+    minutes_after_start: int = Field(10, ge=0, le=180, title='Expiry (min after start)')
 
 
 class TakeTradesParams(_Params):
@@ -79,6 +81,7 @@ class Snapshot:
 class Market:
     slug: str
     label: str
+    spec: MarketSpec
     strategies: dict[str, Strategy]
     next_event_date: Callable[[], str]
     event_start: Callable[[str], datetime]
@@ -88,104 +91,117 @@ class Market:
     snapshots: dict[str, Snapshot] = field(default_factory=dict)
 
 
-def _tt_next_date() -> str:
+def _next_date(spec: MarketSpec) -> str:
     from .pipeline import next_tourn_date
-    return next_tourn_date()
+    return next_tourn_date(spec)
 
 
-def _tt_start(tourn_date: str) -> datetime:
-    return datetime.fromtimestamp(trading._expiry_ts_after_start(tourn_date, 0), timezone.utc)
+def _start(spec: MarketSpec, event_date: str) -> datetime:
+    return datetime.fromtimestamp(spec.start_ts(event_date), timezone.utc)
 
 
-def _tt_previous(tourn_date: str) -> str:
-    d = datetime.strptime(tourn_date, '%Y-%m-%d').date() - timedelta(days=7)
+def _previous(event_date: str) -> str:
+    d = datetime.strptime(event_date, '%Y-%m-%d').date() - timedelta(days=7)
     return d.isoformat()
 
 
-def _tt_pipeline_ready(tourn_date: str) -> bool:
-    """Predictions for `tourn_date` come from the prior week's completed run."""
+def _pipeline_ready(spec: MarketSpec, event_date: str) -> bool:
+    """Predictions for `event_date` come from the prior week's completed run."""
     from .db import get_conn
     with get_conn() as conn:
-        row = conn.execute('SELECT state FROM pipeline_runs WHERE tourn_date = ?',
-                           (_tt_previous(tourn_date),)).fetchone()
+        row = conn.execute('SELECT state FROM pipeline_runs WHERE market = ? AND tourn_date = ?',
+                           (spec.slug, _previous(event_date))).fetchone()
     return bool(row and row[0] == 'completed')
 
 
-_TT_STRATEGIES = {s.name: s for s in (
-    Strategy(
-        'place_bids', 'Place bids',
-        'Resting bids on every market at max(fair / markup, fair − max discount), expiring 9 AM ET.',
-        PlaceBidsParams,
-        lambda client, d, p, emit: trading.plan_place_bids(client, d, emit=emit, **p),
-    ),
-    Strategy(
-        'fade_no_bids', 'Fade NO bids',
-        'Resting NO bids priced off P(top-N | plays), expiring shortly after tournament start.',
-        FadeNoBidsParams,
-        lambda client, d, p, emit: trading.plan_fade_no_bids(client, d, emit=emit, **p),
-    ),
-    Strategy(
-        'take_trades', 'Take trades',
-        'Fill-or-kill orders on live asks whose ROI clears the threshold.',
-        TakeTradesParams,
-        lambda client, d, p, emit: trading.plan_take_trades(client, d, emit=emit, **p),
-        can_loop=True,
-    ),
-    Strategy(
-        'cancel_bids', 'Cancel bids',
-        'Cancels every resting order for this tournament.',
-        CancelBidsParams,
-        lambda client, d, p, emit: trading.plan_cancel_bids(client, d, emit=emit, **p),
-        spends=False,
-    ),
-)}
+def _clock_label(hour: int) -> str:
+    return f'{hour % 12 or 12} {"AM" if hour < 12 else "PM"} ET'
+
+
+def _standard_strategies(spec: MarketSpec) -> dict[str, Strategy]:
+    return {s.name: s for s in (
+        Strategy(
+            'place_bids', 'Place bids',
+            'Resting bids on every market at max(fair / markup, fair − max discount), '
+            f'expiring {_clock_label(spec.bid_expiry_hour)}.',
+            PlaceBidsParams,
+            lambda client, d, p, emit: trading.plan_place_bids(client, d, emit=emit, spec=spec, **p),
+        ),
+        Strategy(
+            'fade_no_bids', 'Fade NO bids',
+            'Resting NO bids priced off P(top-N | plays), expiring shortly after tournament start.',
+            FadeNoBidsParams,
+            lambda client, d, p, emit: trading.plan_fade_no_bids(client, d, emit=emit, spec=spec, **p),
+        ),
+        Strategy(
+            'take_trades', 'Take trades',
+            'Fill-or-kill orders on live asks whose ROI clears the threshold.',
+            TakeTradesParams,
+            lambda client, d, p, emit: trading.plan_take_trades(client, d, emit=emit, spec=spec, **p),
+            can_loop=True,
+        ),
+        Strategy(
+            'cancel_bids', 'Cancel bids',
+            'Cancels every resting order for this tournament.',
+            CancelBidsParams,
+            lambda client, d, p, emit: trading.plan_cancel_bids(client, d, emit=emit, spec=spec, **p),
+            spends=False,
+        ),
+    )}
+
 
 _SCRIPTS = Path(__file__).resolve().parent.parent / 'scripts'
 
 
-def _tt_recompute_command(tourn_date: str, params: dict) -> list[str]:
-    return [sys.executable, str(_SCRIPTS / 'trigger_adjusted.py'), f'--date={tourn_date}']
+def _recompute_command(spec: MarketSpec, event_date: str, params: dict) -> list[str]:
+    return [sys.executable, str(_SCRIPTS / 'trigger_adjusted.py'),
+            f'--market={spec.slug}', f'--date={event_date}']
 
 
-def _tt_pipeline_command(tourn_date: str, params: dict) -> list[str]:
-    cmd = [sys.executable, str(_SCRIPTS / 'weekly_pipeline.py')]
+def _pipeline_command(spec: MarketSpec, event_date: str, params: dict) -> list[str]:
+    cmd = [sys.executable, str(_SCRIPTS / 'weekly_pipeline.py'), f'--market={spec.slug}']
     if params.get('slug_url'):
         cmd.append(f'--slug-url={params["slug_url"]}')
     return cmd
 
 
-def _tt_pipeline_error() -> str | None:
-    """weekly_pipeline exits 0 after recording a failure, so check what it recorded."""
+def _pipeline_error(spec: MarketSpec) -> str | None:
+    """The pipeline exits 0 after recording a failure, so check what it recorded."""
     from .db import get_conn
     with get_conn() as conn:
         row = conn.execute(
-            'SELECT state, error_message FROM pipeline_runs ORDER BY tourn_date DESC LIMIT 1'
+            'SELECT state, error_message FROM pipeline_runs WHERE market = ? '
+            'ORDER BY tourn_date DESC LIMIT 1',
+            (spec.slug,),
         ).fetchone()
     if row and row[0] == 'failed':
         return row[1] or 'Pipeline failed'
     return None
 
 
-MARKETS: dict[str, Market] = {
-    'titled_tuesday': Market(
-        slug='titled_tuesday',
-        label='Titled Tuesday',
-        strategies=_TT_STRATEGIES,
-        next_event_date=_tt_next_date,
-        event_start=_tt_start,
-        previous_event_date=_tt_previous,
-        pipeline_ready=_tt_pipeline_ready,
+def _market_for(spec: MarketSpec) -> Market:
+    return Market(
+        slug=spec.slug,
+        label=spec.label,
+        spec=spec,
+        strategies=_standard_strategies(spec),
+        next_event_date=partial(_next_date, spec),
+        event_start=partial(_start, spec),
+        previous_event_date=_previous,
+        pipeline_ready=partial(_pipeline_ready, spec),
         ops={
-            'recompute': OpsJob('recompute', 'Recompute predictions', _tt_recompute_command),
-            'run_pipeline': OpsJob('run_pipeline', 'Run pipeline', _tt_pipeline_command,
-                                   _tt_pipeline_error),
+            'recompute': OpsJob('recompute', 'Recompute predictions', partial(_recompute_command, spec)),
+            'run_pipeline': OpsJob('run_pipeline', 'Run pipeline', partial(_pipeline_command, spec),
+                                   partial(_pipeline_error, spec)),
         },
         snapshots={
-            'edges': Snapshot(market_views.tt_edges_snapshot, 15),
-            'positions': Snapshot(market_views.tt_positions_snapshot, 30),
+            'edges': Snapshot(lambda client, d: market_views.edges_snapshot(client, d, spec), 15),
+            'positions': Snapshot(lambda client, d: market_views.positions_snapshot(client, d, spec), 30),
         },
-    ),
-}
+    )
+
+
+MARKETS: dict[str, Market] = {TITLED_TUESDAY.slug: _market_for(TITLED_TUESDAY)}
 
 
 class SubmissionError(ValueError):

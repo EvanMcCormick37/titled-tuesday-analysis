@@ -19,8 +19,9 @@ import numpy as np
 import pandas as pd
 
 from .config import N_SIMS
-from .db import get_conn, get_engine, write_df_replace
+from .db import get_conn, read_market_rows, replace_market_rows
 from .data import load_and_prepare, get_username_mappings, resolve_player_names
+from .markets import TITLED_TUESDAY, MarketSpec
 from .simulation import build_player_pool_score, run_simulation_score, build_results
 
 PRED_N_VALUES = [1, 3, 5, 8, 10]
@@ -47,6 +48,7 @@ def run_raw(
     tourn_date: str,
     save_to_db: bool = False,
     n_sims: int = N_SIMS,
+    spec: MarketSpec = TITLED_TUESDAY,
 ) -> RawRun:
     """Build player pool and run the baseline (unadjusted) simulation.
 
@@ -54,7 +56,7 @@ def run_raw(
     """
     print(f'Predicting for tournament date: {tourn_date}')
 
-    df, p_raw, app_counts = load_and_prepare()
+    df, p_raw, app_counts = load_and_prepare(spec=spec)
     players, p_play_raw, hist_composites, hist_wts = build_player_pool_score(
         df, p_raw, app_counts, min_appearances=5
     )
@@ -70,7 +72,7 @@ def run_raw(
     )
 
     if save_to_db:
-        _save_raw_to_db(results_raw, tourn_date)
+        _save_raw_to_db(results_raw, tourn_date, spec)
 
     return RawRun(results_raw, players, p_play_raw, hist_composites, hist_wts, p_raw)
 
@@ -85,6 +87,7 @@ def run_adjusted(
     raw_run: RawRun | None = None,
     save_official: bool = False,
     n_sims: int = N_SIMS,
+    spec: MarketSpec = TITLED_TUESDAY,
 ) -> AdjustedRun:
     """Apply attendance adjustments and run the adjusted simulation.
 
@@ -104,7 +107,7 @@ def run_adjusted(
     p_nudges                = resolve_player_names(p_nudges or {})
 
     if raw_run is None:
-        raw_run = run_raw(tourn_date, save_to_db=False, n_sims=n_sims)
+        raw_run = run_raw(tourn_date, save_to_db=False, n_sims=n_sims, spec=spec)
 
     players, p_play_raw, hist_composites, hist_wts, p_raw = (
         raw_run.players, raw_run.p_play, raw_run.hist_composites, raw_run.hist_wts, raw_run.p_raw
@@ -184,17 +187,17 @@ def run_adjusted(
     )
 
     if save_official:
-        _save_adjusted_to_db(results, tourn_date, altered)
+        _save_adjusted_to_db(results, tourn_date, altered, spec)
 
     return AdjustedRun(results, players, p_play_adj, hist_composites, hist_wts)
 
 
-def _save_raw_to_db(results_raw: pd.DataFrame, tourn_date: str) -> None:
+def _save_raw_to_db(results_raw: pd.DataFrame, tourn_date: str, spec: MarketSpec) -> None:
     keep_cols = ['p_participate'] + [f'P_top{k}_given_play' for k in PRED_N_VALUES]
     out = results_raw[keep_cols].reset_index()
     out['tourn_date'] = tourn_date
 
-    write_df_replace(out, 'latest_model_predictions_raw')
+    replace_market_rows(out, 'latest_model_predictions_raw', spec.slug)
     print(f'Saved {len(out):,} rows -> latest_model_predictions_raw (unadjusted)')
 
 
@@ -202,26 +205,28 @@ def _save_adjusted_to_db(
     results: pd.DataFrame,
     tourn_date: str,
     altered: set[str],
+    spec: MarketSpec,
 ) -> None:
     keep_cols = ['p_participate'] + [f'P_top{k}_given_play' for k in PRED_N_VALUES]
     out = results[keep_cols].reset_index()
     out['tourn_date'] = tourn_date
     out['attendance_altered'] = out['username'].isin(altered).astype(int)
 
-    write_df_replace(out, 'latest_model_predictions')
+    replace_market_rows(out, 'latest_model_predictions', spec.slug)
 
     n_altered = int(out['attendance_altered'].sum())
     print(f'Saved {len(out):,} rows -> latest_model_predictions ({n_altered} attendance_altered)')
 
 
-def load_adj_run_from_db(tourn_date: str | None = None) -> AdjustedRun:
+def load_adj_run_from_db(tourn_date: str | None = None,
+                         spec: MarketSpec = TITLED_TUESDAY) -> AdjustedRun:
     """Reconstruct AdjustedRun from saved DB predictions without re-simulating.
 
     Reads p_participate and P_top{N}_given_play from latest_model_predictions,
     then rebuilds pool arrays (players, hist_composites, hist_wts) from standings
     — fast (~5s), no MC simulation required.
     """
-    saved = pd.read_sql_query('SELECT * FROM latest_model_predictions', get_engine())
+    saved = read_market_rows('latest_model_predictions', spec.slug)
 
     if saved.empty:
         raise RuntimeError('No rows in latest_model_predictions — run run_adjusted() first.')
@@ -230,7 +235,7 @@ def load_adj_run_from_db(tourn_date: str | None = None) -> AdjustedRun:
     if tourn_date and saved_date != tourn_date:
         print(f'Warning: saved predictions are for {saved_date}, not {tourn_date}')
 
-    df, p_raw, app_counts = load_and_prepare()
+    df, p_raw, app_counts = load_and_prepare(spec=spec)
     players, _, hist_composites, hist_wts = build_player_pool_score(
         df, p_raw, app_counts, min_appearances=5
     )
@@ -247,12 +252,13 @@ def load_adj_run_from_db(tourn_date: str | None = None) -> AdjustedRun:
     return AdjustedRun(results, players, p_play, hist_composites, hist_wts)
 
 
-def load_raw_results_from_db(tourn_date: str | None = None) -> pd.DataFrame:
+def load_raw_results_from_db(tourn_date: str | None = None,
+                             spec: MarketSpec = TITLED_TUESDAY) -> pd.DataFrame:
     """Load raw (unadjusted) predictions from latest_model_predictions_raw.
 
     Returns DataFrame indexed by username with P_top{N} and ip_adv_top{N} columns added.
     """
-    saved = pd.read_sql_query('SELECT * FROM latest_model_predictions_raw', get_engine())
+    saved = read_market_rows('latest_model_predictions_raw', spec.slug)
 
     if saved.empty:
         raise RuntimeError('No rows in latest_model_predictions_raw — run run_raw() first.')
@@ -270,16 +276,16 @@ def load_raw_results_from_db(tourn_date: str | None = None) -> pd.DataFrame:
     return results_raw
 
 
-def next_tourn_date() -> str:
-    """Return the ISO date of the next Titled Tuesday (one week after the latest in DB)."""
+def next_tourn_date(spec: MarketSpec = TITLED_TUESDAY) -> str:
+    """Return the ISO date of the market's next event (one week after the latest in DB)."""
     with get_conn() as conn:
         last = conn.execute(
-            'SELECT MAX(date) FROM titled_tuesday_standings'
+            f'SELECT MAX(date) FROM {spec.model.standings_table}'
         ).fetchone()[0]
     return (pd.Timestamp(last) + pd.Timedelta(weeks=1)).date().isoformat()
 
 
-def load_adjustments(tourn_date: str) -> dict:
+def load_adjustments(tourn_date: str, market: str = TITLED_TUESDAY.slug) -> dict:
     """Read manual_adjustments for `tourn_date` and shape them for run_adjusted().
 
     Returns a dict with the kwarg names run_adjusted() expects:
@@ -294,10 +300,10 @@ def load_adjustments(tourn_date: str) -> dict:
             """
             SELECT player_name, adjustment_type, value
               FROM manual_adjustments
-             WHERE tourn_date = ?
+             WHERE market = ? AND tourn_date = ?
              ORDER BY created_at ASC
             """,
-            (tourn_date,),
+            (market, tourn_date),
         ).fetchall()
 
     cut: dict[str, None] = {}        # dicts preserve insertion order so last-write-wins is natural
