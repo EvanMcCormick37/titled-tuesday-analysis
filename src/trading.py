@@ -1,7 +1,13 @@
-"""Kalshi bid-placement and taker strategies for Titled Tuesday markets."""
+"""Kalshi bid-placement and taker strategies for Titled Tuesday markets.
+
+Each strategy has a read-only `plan_*` function returning a `Plan`, which
+`trade_plan.execute_plan` sends to Kalshi. The job worker uses those directly.
+The original `place_bids` / `place_fade_no_bids` / `take_trades` /
+`cancel_tt_bids` functions remain as print-based wrappers for the CLI scripts,
+notebook, and Telegram bot.
+"""
 from __future__ import annotations
 
-import concurrent.futures
 import re
 import time
 from datetime import datetime, timedelta
@@ -12,7 +18,8 @@ import pandas as pd
 from kalshi_core import KalshiClient, _to_kalshi_date, bid_cents, best_ask, apply_pullback, kalshi_order_price
 from .data import get_username_mappings
 from .db import get_engine
-from .kalshi_tt import _TT_EVENT_TEMPLATES, get_tt_asks
+from .kalshi_tt import _TT_EVENT_TEMPLATES, fetch_orderbooks, get_tt_asks
+from .trade_plan import CancelIntent, Emit, OrderIntent, Plan, execute_plan, format_plan, noop_emit, print_emit
 
 _TEMPLATE_N: dict[str, int] = {
     "KXTITLEDTUESDAY-{date}":   1,
@@ -78,7 +85,40 @@ def _parse_n(title: str) -> int:
     return val if val <= 20 else 1
 
 
-def place_bids(
+def _order_cents(order: dict) -> int | None:
+    field = "no_price_dollars" if order.get("outcome_side") == "no" else "yes_price_dollars"
+    try:
+        return round(float(order[field]) * 100)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _cancel_intent(order: dict) -> CancelIntent:
+    return CancelIntent(
+        order_id=order["order_id"],
+        ticker=order.get("ticker", ""),
+        side=order.get("outcome_side") or order.get("side") or "",
+        price_c=_order_cents(order),
+        qty=order.get("remaining_count", order.get("count")),
+    )
+
+
+def _fetch_tt_markets(
+    client: KalshiClient, date_str: str, sleep_read: float,
+) -> list[tuple[str, str, str, int]]:
+    """Return (ticker, title, yes_sub_title, n) for every market on the date."""
+    rows: list[tuple[str, str, str, int]] = []
+    for tmpl, n in _TEMPLATE_N.items():
+        for m in client.get_markets_by_event(tmpl.format(date=date_str)):
+            rows.append((m["ticker"], m.get("title", ""), m.get("yes_sub_title", ""), n))
+        if sleep_read:
+            time.sleep(sleep_read)
+    return rows
+
+
+# ── Plans (read-only) ────────────────────────────────────────────────────────
+
+def plan_place_bids(
     client: KalshiClient,
     tourn_date: str | None = None,
     count: int = 200,
@@ -86,237 +126,88 @@ def place_bids(
     max_discount: float = 10,
     side_filter: str | None = None,
     sleep_read: float = 0.05,
-    sleep_write: float = 0.10,
-    dry_run: bool = True,
-) -> dict:
-    """Place resting bids for all Titled Tuesday markets on tourn_date.
+    emit: Emit = noop_emit,
+) -> Plan:
+    """Plan resting bids for all Titled Tuesday markets on tourn_date.
 
-    tourn_date: YYYY-MM-DD; defaults to the next TT (resolved from the DB).
-    markup: divisor applied to fair price (bid = fair / markup). Default 1.5 → bid = 2/3 fair.
+    markup: divisor applied to fair price (bid = fair / markup).
     max_discount: maximum cents-off cap so bid >= fair - max_discount.
     side_filter: if "yes" or "no", only place bids on that side.
 
-    Returns a summary dict: {placed, cancelled, skipped, unmatched}.
+    Always reads open orders, so a preview shows the real cancel-and-replace set.
     """
     if tourn_date is None:
         from .pipeline import next_tourn_date
         tourn_date = next_tourn_date()
     expiry = _expiry_ts(tourn_date)
     date_str = _to_kalshi_date(tourn_date)
-    _, PLAYER_TO_USERNAME = get_username_mappings()
+    _, player_to_username = get_username_mappings()
 
-    # ── Phase 1: Reads ────────────────────────────────────────────────────────
-    print("Loading model predictions from DB...")
+    emit("phase", "Loading model predictions")
     preds = _load_predictions()
 
+    emit("phase", "Fetching open orders")
     open_by_key: dict[tuple[str, str], list[dict]] = {}
-    if not dry_run:
-        print("Fetching open orders...")
-        open_orders = client.get_open_orders()
-        time.sleep(sleep_read)
-        for o in open_orders:
-            if o.get("action") == "sell" and o.get("outcome_side") == "yes":
-                continue
-            side = o.get("outcome_side", "yes")
-            key = (o["ticker"], side)
-            open_by_key.setdefault(key, []).append(o)
-    else:
-        print("Skipping open orders fetch (dry run — cancel-and-replace not evaluated).")
-
-    print("Fetching markets and orderbooks...")
-    market_data: list[tuple[str, str, str, int, dict]] = []
-    for tmpl, n in _TEMPLATE_N.items():
-        event_ticker = tmpl.format(date=date_str)
-        markets = client.get_markets_by_event(event_ticker)
-        time.sleep(sleep_read)
-        for m in markets:
-            ticker = m["ticker"]
-            ob = client.get_orderbook(ticker)
-            time.sleep(sleep_read)
-            market_data.append((ticker, m.get("title", ""), m.get("yes_sub_title", ""), n, ob))
-
-    # ── Phase 2: Plan ─────────────────────────────────────────────────────────
-    plan: list[dict] = []
-    unmatched: list[str] = []
-
-    for ticker, title, subtitle, n, ob in market_data:
-        col = _N_TO_COL[n]
-
-        username = PLAYER_TO_USERNAME.get(subtitle)
-        if username is None:
-            unmatched.append(subtitle)
+    for o in client.get_open_orders():
+        if o.get("action") == "sell" and o.get("outcome_side") == "yes":
             continue
-        if username not in preds.index:
-            unmatched.append(subtitle)
+        open_by_key.setdefault((o["ticker"], o.get("outcome_side", "yes")), []).append(o)
+
+    emit("phase", "Fetching markets and orderbooks")
+    markets = _fetch_tt_markets(client, date_str, sleep_read)
+    books = fetch_orderbooks(client, [m[0] for m in markets])
+
+    plan = Plan(strategy="place_bids", tourn_date=tourn_date)
+    plan.stats["markets_scanned"] = len(markets)
+    cancel_ids_seen: set[str] = set()
+
+    for ticker, _title, subtitle, n in markets:
+        username = player_to_username.get(subtitle)
+        if username is None or username not in preds.index:
+            plan.unmatched.append(subtitle)
+            continue
+        ob = books.get(ticker)
+        if ob is None:
+            plan.skipped.append({"ticker": ticker, "reason": "orderbook unavailable"})
             continue
 
         row = preds.loc[username]
-        p_participate = float(row["p_participate"])
-        p_topn = float(row[col])
-
-        fair_yes = p_participate * p_topn
-        fair_no  = 1.0 - fair_yes
-
-        sides = [("yes", fair_yes), ("no", fair_no)]
+        fair_yes = float(row["p_participate"]) * float(row[_N_TO_COL[n]])
+        sides = [("yes", fair_yes), ("no", 1.0 - fair_yes)]
         if side_filter:
             sides = [(s, f) for s, f in sides if s == side_filter]
+
         for side, fair in sides:
-            key = (ticker, side)
             bid_c = bid_cents(fair, markup, max_discount)
             if bid_c is None:
-                plan.append({
+                plan.skipped.append({
                     "ticker": ticker, "side": side,
-                    "bid_c": None, "cancel": [],
-                    "skip_reason": f"fair={fair:.4f} maps to invalid bid",
+                    "reason": f"{side.upper()} fair={fair:.4f} maps to invalid bid",
                 })
                 continue
+            bid_c = apply_pullback(bid_c, best_ask(ob, side))
 
-            ask = best_ask(ob, side)
-            bid_c = apply_pullback(bid_c, ask)
-
-            existing = open_by_key.get(key, [])
+            existing = open_by_key.get((ticker, side), [])
+            to_cancel: list[dict] = []
             if existing:
                 price_field = "yes_price_dollars" if side == "yes" else "no_price_dollars"
-                min_existing = min(
-                    round(float(o[price_field]) * 100) for o in existing
-                )
+                min_existing = min(round(float(o[price_field]) * 100) for o in existing)
                 if bid_c <= min_existing:
-                    plan.append({
-                        "ticker": ticker, "side": side,
-                        "bid_c": bid_c,
-                        "cancel": [o["order_id"] for o in existing],
-                        "skip_reason": None,
-                    })
-                else:
-                    plan.append({
-                        "ticker": ticker, "side": side,
-                        "bid_c": bid_c, "cancel": [],
-                        "skip_reason": None,
-                    })
-            else:
-                plan.append({
-                    "ticker": ticker, "side": side,
-                    "bid_c": bid_c, "cancel": [],
-                    "skip_reason": None,
-                })
+                    to_cancel = existing
 
-    # ── Phase 3: Summary ──────────────────────────────────────────────────────
-    to_place  = [p for p in plan if p["skip_reason"] is None and p["bid_c"] is not None]
-    to_skip   = [p for p in plan if p["skip_reason"] is not None]
-    to_cancel = [oid for p in plan for oid in p["cancel"]]
-
-    print(f"\n{'[DRY RUN] ' if dry_run else ''}Bid placement plan for {tourn_date}:")
-    print(f"  Markets scanned : {len(market_data)}")
-    print(f"  Unmatched names : {len(unmatched)}")
-    print(f"  Bids to place   : {len(to_place)}")
-    print(f"  Orders to cancel: {len(to_cancel)}")
-    print(f"  Skipped         : {len(to_skip)}")
-
-    if unmatched:
-        print(f"\n  Unmatched player names:")
-        for name in unmatched:
-            print(f"    - {name!r}")
-
-    if to_skip:
-        print(f"\n  Skipped bids:")
-        for p in to_skip:
-            print(f"    {p['ticker']} {p['side'].upper():3s} — {p['skip_reason']}")
-
-    print(f"\n  Planned bids:")
-    for p in to_place:
-        cancel_note = f" (cancelling {len(p['cancel'])} existing)" if p["cancel"] else ""
-        print(f"    {p['ticker']} {p['side'].upper():3s} @ {p['bid_c']}¢ × {count}{cancel_note}")
-
-    if dry_run:
-        print("\n[DRY RUN] No orders placed or cancelled.")
-        return {
-            "placed": 0, "cancelled": 0,
-            "skipped": len(to_skip), "unmatched": unmatched,
-        }
-
-    # ── Phase 4: Execute ──────────────────────────────────────────────────────
-    cancelled = 0
-    placed    = 0
-
-    for p in to_place:
-        for oid in p["cancel"]:
-            try:
-                client.cancel_order(oid)
-                cancelled += 1
-                print(f"  Cancelled {oid}")
-            except Exception as e:
-                print(f"  WARNING: could not cancel {oid}: {e}")
-            time.sleep(sleep_write)
-
-    for p in to_place:
-        try:
-            client.place_order(
-                ticker=p["ticker"],
-                side=p["side"],
-                count=count,
-                price=p["bid_c"],
-                expiration_ts=expiry,
-                dry_run=False,
-            )
-            placed += 1
-            print(f"  Placed {p['ticker']} {p['side'].upper()} @ {p['bid_c']}¢")
-        except Exception as e:
-            print(f"  WARNING: could not place {p['ticker']} {p['side'].upper()}: {e}")
-        time.sleep(sleep_write)
-
-    print(f"\nDone. Placed {placed}, cancelled {cancelled}, skipped {len(to_skip)}.")
-    return {
-        "placed": placed, "cancelled": cancelled,
-        "skipped": len(to_skip), "unmatched": unmatched,
-    }
+            for o in to_cancel:
+                if o["order_id"] not in cancel_ids_seen:
+                    cancel_ids_seen.add(o["order_id"])
+                    plan.cancels.append(_cancel_intent(o))
+            plan.orders.append(OrderIntent(
+                kind="place", ticker=ticker, side=side, count=count, price_c=bid_c,
+                expiration_ts=expiry, label=subtitle,
+                meta={"n": n, "fair": round(fair, 4), "replaces": len(to_cancel)},
+            ))
+    return plan
 
 
-def cancel_tt_bids(
-    client: KalshiClient,
-    tourn_date: str,
-    dry_run: bool = True,
-) -> dict:
-    """Cancel all resting TT bids for `tourn_date`.
-
-    Returns a summary dict: {matched, cancelled, orders}.
-    `orders` is the list of resting-order dicts that were (or would be) cancelled,
-    so the UI can show the user what's about to happen before they confirm.
-    """
-    date_str = _to_kalshi_date(tourn_date)
-    tt_pat = re.compile(
-        rf"(?:KXTITLEDTUESDAY-{date_str}|KXTITLEDTUESTOP-{date_str}T\d+)-"
-    )
-
-    all_orders = client.get_open_orders()
-    tt_orders = [o for o in all_orders if tt_pat.search(o.get("ticker", ""))]
-
-    print(f"{'[DRY RUN] ' if dry_run else ''}Cancelling resting TT bids for {tourn_date}:")
-    print(f"  Total open orders   : {len(all_orders)}")
-    print(f"  TT orders to cancel : {len(tt_orders)}")
-
-    for o in tt_orders:
-        side  = o.get("side", "?")
-        price = o.get("price", "?")
-        qty   = o.get("remaining_count", o.get("count", "?"))
-        print(f"    {o['ticker']} side={side} price={price} qty={qty} id={o['order_id']}")
-
-    cancelled = 0
-    if not dry_run:
-        for o in tt_orders:
-            try:
-                client.cancel_order(o["order_id"])
-                cancelled += 1
-            except Exception as e:  # noqa: BLE001
-                print(f"    WARNING: could not cancel {o['order_id']}: {e}")
-
-    return {
-        "matched":   len(tt_orders),
-        "cancelled": cancelled,
-        "orders":    tt_orders,
-    }
-
-
-def place_fade_no_bids(
+def plan_fade_no_bids(
     client: KalshiClient,
     tourn_date: str,
     discount_cents: int = 15,
@@ -325,185 +216,157 @@ def place_fade_no_bids(
     min_bid_cents: int = 1,
     max_bid_cents: int = 99,
     sleep_read: float = 0.05,
-    sleep_write: float = 0.10,
-    dry_run: bool = True,
-) -> dict:
-    """Place resting NO bids priced at (fair_NO_given_plays − discount) cents,
-    with expiry `minutes_after_start` minutes after tournament start (11:00 ET).
+    emit: Emit = noop_emit,
+) -> Plan:
+    """Plan resting NO bids at (fair_NO_given_plays − discount) cents, expiring
+    `minutes_after_start` minutes after tournament start (11:00 ET).
 
     Strategy — fade retail overpayment of YES when a low-attendance star shows
-    up on the roster. The bid prices NO using the player's **conditional**
-    chance of making top-N given they play (`P_top{N}_given_play`), ignoring
-    p_participate — because the fade thesis assumes the player has already
-    shown up and retail is panic-buying YES on that confirmation. Expiration
-    at 11:10 ET (default) gives roughly 10 minutes of post-start trading
-    before round-1 results start meaningfully moving the odds.
+    up on the roster. Prices NO using `P_top{N}_given_play`, ignoring
+    p_participate, because the fade assumes the player has already shown up.
 
-    Pricing per market:
-        fair_no_cents  = round((1 − P_top{N}_given_play) × 100)
-        target_bid     = fair_no_cents − discount_cents  (clamped to [min, max])
-        edge           = fair_no_cents − target_bid  (= discount_cents by default)
-
-    Order management (per ticker) — only touches NO bids whose expiration is
-    at or after tournament start (11:00 ET on tourn_date). The 9 AM place_bids
-    NO orders are therefore never cancelled by this strategy:
-        - No existing post-start NO bid              → place a new one at `target_bid`
-        - Existing post-start NO bid at `target_bid` → leave it (idempotent re-runs)
-        - Existing post-start NO bid at other price  → cancel + replace at `target_bid`
-
-    Returns: {placed, cancelled, skipped, unmatched, expiry_iso, plan}.
+    Only NO bids expiring at or after tournament start are managed, so the
+    9 AM place_bids NO orders are never cancelled by this strategy:
+        - No existing post-start NO bid              → place at target
+        - Existing post-start NO bid at target       → leave it (idempotent)
+        - Existing post-start NO bid at other price  → cancel + replace
     """
     expiry = _expiry_ts_after_start(tourn_date, minutes_after_start)
     expiry_iso = datetime.fromtimestamp(expiry, _ET).isoformat()
     tourn_start_ts = _expiry_ts_after_start(tourn_date, 0)
-    date_str   = _to_kalshi_date(tourn_date)
-    _, PLAYER_TO_USERNAME = get_username_mappings()
+    date_str = _to_kalshi_date(tourn_date)
+    _, player_to_username = get_username_mappings()
 
-    # ── Phase 1: Reads ────────────────────────────────────────────────────────
-    print(f"Loading model predictions from DB...")
+    emit("phase", "Loading model predictions")
     preds = _load_predictions()
 
+    emit("phase", "Fetching open NO orders")
     open_by_ticker: dict[str, list[dict]] = {}
-    if not dry_run:
-        print("Fetching open NO orders...")
-        for o in client.get_open_orders():
-            if o.get("outcome_side") != "no":
-                continue
-            if o.get("action") == "sell":
-                continue
-            open_by_ticker.setdefault(o["ticker"], []).append(o)
-        time.sleep(sleep_read)
+    for o in client.get_open_orders():
+        if o.get("outcome_side") != "no" or o.get("action") == "sell":
+            continue
+        open_by_ticker.setdefault(o["ticker"], []).append(o)
 
-    print("Fetching markets...")
-    market_rows: list[tuple[str, str, str, int]] = []  # (ticker, title, subtitle, n)
-    for tmpl, n in _TEMPLATE_N.items():
-        event_ticker = tmpl.format(date=date_str)
-        for m in client.get_markets_by_event(event_ticker):
-            market_rows.append((m["ticker"], m.get("title", ""),
-                                m.get("yes_sub_title", ""), n))
-        time.sleep(sleep_read)
+    emit("phase", "Fetching markets")
+    markets = _fetch_tt_markets(client, date_str, sleep_read)
 
-    # ── Phase 2: Plan ─────────────────────────────────────────────────────────
-    plan: list[dict] = []
-    unmatched: list[str] = []
-    skipped:   list[dict] = []
+    plan = Plan(strategy="fade_no_bids", tourn_date=tourn_date,
+                stats={"markets_scanned": len(markets), "expires": expiry_iso},
+                extra={"expiry_iso": expiry_iso})
 
-    for ticker, _title, subtitle, n in market_rows:
-        username = PLAYER_TO_USERNAME.get(subtitle)
+    for ticker, _title, subtitle, n in markets:
+        username = player_to_username.get(subtitle)
         if username is None or username not in preds.index:
-            unmatched.append(subtitle)
+            plan.unmatched.append(subtitle)
             continue
 
-        col = _N_TO_COL[n]
-        p_cond = float(preds.loc[username, col])  # P(top-N | plays)
+        p_cond = float(preds.loc[username, _N_TO_COL[n]])
         fair_no_cents = round((1.0 - p_cond) * 100)
-        target_bid    = fair_no_cents - discount_cents
+        target_bid = fair_no_cents - discount_cents
 
         if target_bid < min_bid_cents or target_bid > max_bid_cents:
-            skipped.append({
+            plan.skipped.append({
                 "ticker": ticker, "subtitle": subtitle,
                 "reason": f"target bid {target_bid}¢ outside [{min_bid_cents},{max_bid_cents}] "
                           f"(P(top-{n}|plays)={p_cond:.3f})",
             })
             continue
 
-        # Only touch NO bids that expire at-or-after tournament start — these
-        # are prior fade-era orders. Pre-start NO bids (e.g. 9 AM place_bids
-        # orders) are deliberately left alone.
         existing_post_start = [
             o for o in open_by_ticker.get(ticker, [])
             if (ts := _parse_kalshi_expiration(o)) is not None and ts >= tourn_start_ts
         ]
-        cancel_ids: list[str] = []
-        if existing_post_start:
-            # If any post-start order sits at exactly `target_bid`, treat the
-            # whole set as idempotent and move on. Otherwise cancel all
-            # post-start NO bids on this ticker and replace with the new one.
-            if any(round(float(o.get("no_price_dollars", 0)) * 100) == target_bid
-                   for o in existing_post_start):
-                skipped.append({
-                    "ticker": ticker, "subtitle": subtitle,
-                    "reason": f"NO bid already resting at {target_bid}¢ with post-start expiry",
-                })
-                continue
-            cancel_ids = [o["order_id"] for o in existing_post_start]
+        if any(round(float(o.get("no_price_dollars", 0)) * 100) == target_bid
+               for o in existing_post_start):
+            plan.skipped.append({
+                "ticker": ticker, "subtitle": subtitle,
+                "reason": f"NO bid already resting at {target_bid}¢ with post-start expiry",
+            })
+            continue
 
-        plan.append({
-            "ticker": ticker, "subtitle": subtitle, "n": n,
-            "p_cond": p_cond, "fair_no_cents": fair_no_cents,
-            "bid_c": target_bid, "cancel": cancel_ids,
-        })
+        plan.cancels.extend(_cancel_intent(o) for o in existing_post_start)
+        plan.orders.append(OrderIntent(
+            kind="place", ticker=ticker, side="no", count=count, price_c=target_bid,
+            expiration_ts=expiry, label=subtitle,
+            meta={"n": n, "p_cond": p_cond, "fair_no_cents": fair_no_cents,
+                  "cancel": [o["order_id"] for o in existing_post_start]},
+        ))
+    plan.orders.sort(key=lambda o: o.price_c)
+    return plan
 
-    # ── Phase 3: Summary ──────────────────────────────────────────────────────
-    print(f"\n{'[DRY RUN] ' if dry_run else ''}Fade-NO plan for {tourn_date} "
-          f"(discount={discount_cents}¢, expiry={expiry_iso}):")
-    print(f"  Markets scanned : {len(market_rows)}")
-    print(f"  Unmatched names : {len(unmatched)}")
-    print(f"  Bids to place   : {len(plan)}")
-    print(f"  Orders to cancel: {sum(len(p['cancel']) for p in plan)}")
-    print(f"  Skipped         : {len(skipped)}")
 
-    if unmatched:
-        print(f"\n  Unmatched player names:")
-        for name in unmatched[:20]:
-            print(f"    - {name!r}")
-        if len(unmatched) > 20:
-            print(f"    ... (+{len(unmatched) - 20} more)")
+def plan_take_trades(
+    client: KalshiClient,
+    tourn_date: str,
+    min_roi: float = 1.5,
+    min_qty: int = 10,
+    max_qty: int = 200,
+    best_per_event: bool = True,
+    sleep_read: float = 0.05,
+    emit: Emit = noop_emit,
+) -> Plan:
+    """Plan fill-or-kill taker orders on levels whose ROI clears `min_roi`.
 
-    if skipped:
-        print(f"\n  Skipped markets:")
-        for s in skipped[:20]:
-            print(f"    {s['ticker']} ({s['subtitle']}) — {s['reason']}")
-        if len(skipped) > 20:
-            print(f"    ... (+{len(skipped) - 20} more)")
+    best_per_event: if True, only the single highest-ROI trade per N-category.
+        If False, every qualifying level per (ticker, side).
+    min_qty: levels with fewer available contracts are skipped as iceberg decoys.
+    max_qty: cap on contracts purchased per level.
+    """
+    emit("phase", "Fetching live asks")
+    df, unmatched = compute_edges(client, tourn_date, sleep_read=sleep_read)
+    plan = Plan(strategy="take_trades", tourn_date=tourn_date, unmatched=unmatched,
+                stats={"levels_scanned": len(df), "edge_count": 0, "thin_skipped": 0})
+    if df.empty:
+        return plan
 
-    if plan:
-        print(f"\n  Planned NO bids (fair - {discount_cents}¢):")
-        for p in sorted(plan, key=lambda x: x["bid_c"]):
-            tag = f" (cancelling {len(p['cancel'])})" if p["cancel"] else ""
-            print(f"    {p['ticker']:48s} N={p['n']}  P(top|plays)={p['p_cond']:.3f}  "
-                  f"fairNO={p['fair_no_cents']}¢  bid={p['bid_c']}¢{tag}  [{p['subtitle']}]")
+    has_volume = df["Quantity Available"] >= min_qty
+    has_edge   = df["ROI"] > min_roi
+    plan.stats["thin_skipped"] = int((has_edge & ~has_volume).sum())
 
-    if dry_run:
-        print("\n[DRY RUN] No orders placed or cancelled.")
-        return {
-            "placed": 0, "cancelled": 0,
-            "skipped": len(skipped), "unmatched": unmatched,
-            "expiry_iso": expiry_iso, "plan": plan,
-        }
+    qualifying = df[has_edge & has_volume]
+    if best_per_event:
+        edge = qualifying.sort_values("ROI", ascending=False).drop_duplicates(subset=["n"]).copy()
+    else:
+        edge = qualifying.sort_values("Ask Price ($)").drop_duplicates(
+            subset=["Market Ticker", "Side"]).copy()
 
-    # ── Phase 4: Execute ──────────────────────────────────────────────────────
-    cancelled = 0
-    placed    = 0
-    for p in plan:
-        for oid in p["cancel"]:
-            try:
-                client.cancel_order(oid)
-                cancelled += 1
-                print(f"  Cancelled {oid}")
-            except Exception as e:  # noqa: BLE001
-                print(f"  WARNING: could not cancel {oid}: {e}")
-            time.sleep(sleep_write)
+    edge["order_qty"] = edge["Quantity Available"].clip(upper=max_qty).astype(int)
+    plan.stats["edge_count"] = len(edge)
+    plan.stats["mode"] = "best-per-event" if best_per_event else "all-qualifying"
 
-    for p in plan:
-        try:
-            client.place_order(
-                ticker=p["ticker"], side="no", count=count, price=p["bid_c"],
-                expiration_ts=expiry, dry_run=False,
-            )
-            placed += 1
-            print(f"  Placed {p['ticker']} NO @ {p['bid_c']}¢ (expires {expiry_iso})")
-        except Exception as e:  # noqa: BLE001
-            print(f"  WARNING: could not place {p['ticker']} NO: {e}")
-        time.sleep(sleep_write)
+    for _, row in edge.sort_values("ROI", ascending=False).iterrows():
+        plan.orders.append(OrderIntent(
+            kind="take", ticker=row["Market Ticker"], side=row["Side"].lower(),
+            count=int(row["order_qty"]), price_c=round(row["Ask Price ($)"] * 100),
+            label=row["Player Name"],
+            meta={"n": int(row["n"]), "roi": round(float(row["ROI"]), 3),
+                  "ev": round(float(row["EV"]), 3),
+                  "available": int(row["Quantity Available"])},
+        ))
+    return plan
 
-    print(f"\nDone. Placed {placed}, cancelled {cancelled}, skipped {len(skipped)}.")
-    return {
-        "placed": placed, "cancelled": cancelled,
-        "skipped": len(skipped), "unmatched": unmatched,
-        "expiry_iso": expiry_iso, "plan": plan,
-    }
 
+def plan_cancel_bids(
+    client: KalshiClient,
+    tourn_date: str,
+    emit: Emit = noop_emit,
+) -> Plan:
+    """Plan cancelling every resting TT order for `tourn_date`."""
+    date_str = _to_kalshi_date(tourn_date)
+    tt_pat = re.compile(rf"(?:KXTITLEDTUESDAY-{date_str}|KXTITLEDTUESTOP-{date_str}T\d+)-")
+
+    emit("phase", "Fetching open orders")
+    all_orders = client.get_open_orders()
+    tt_orders = [o for o in all_orders if tt_pat.search(o.get("ticker", ""))]
+    return Plan(
+        strategy="cancel_bids", tourn_date=tourn_date,
+        cancels=[_cancel_intent(o) for o in tt_orders],
+        stats={"open_orders": len(all_orders), "tt_orders": len(tt_orders)},
+        extra={"orders": tt_orders},
+    )
+
+
+# ── Shared edge calculation ──────────────────────────────────────────────────
 
 def compute_edges(
     client: KalshiClient,
@@ -521,8 +384,7 @@ def compute_edges(
         Quantity Available, n, username, EV, Order Price, Total Cost,
         Expected Return, ROI
 
-    Shared between `take_trades` (filter → fire) and the Edges dashboard tab
-    (filter → display).
+    Shared between `take_trades` (filter → fire) and the Edges view (filter → display).
     """
     _, PLAYER_TO_USERNAME = get_username_mappings()
 
@@ -568,6 +430,75 @@ def compute_edges(
     return df, unmatched
 
 
+# ── Print-based wrappers (CLI scripts, notebook, Telegram bot) ───────────────
+
+def place_bids(
+    client: KalshiClient,
+    tourn_date: str | None = None,
+    count: int = 200,
+    markup: float = 1.5,
+    max_discount: float = 10,
+    side_filter: str | None = None,
+    sleep_read: float = 0.05,
+    sleep_write: float = 0.10,
+    dry_run: bool = True,
+) -> dict:
+    """Plan and (unless dry_run) place resting bids. Returns {placed, cancelled, skipped, unmatched}."""
+    plan = plan_place_bids(client, tourn_date, count, markup, max_discount, side_filter,
+                           sleep_read, emit=print_emit)
+    print(format_plan(plan, dry_run))
+    if dry_run:
+        return {"placed": 0, "cancelled": 0, "skipped": len(plan.skipped), "unmatched": plan.unmatched}
+    result = execute_plan(client, plan, print_emit, sleep_write=sleep_write)
+    print(f"\nDone. Placed {result.placed}, cancelled {result.cancelled}, skipped {len(plan.skipped)}.")
+    return {"placed": result.placed, "cancelled": result.cancelled,
+            "skipped": len(plan.skipped), "unmatched": plan.unmatched}
+
+
+def cancel_tt_bids(
+    client: KalshiClient,
+    tourn_date: str,
+    dry_run: bool = True,
+) -> dict:
+    """Cancel all resting TT bids. Returns {matched, cancelled, orders}."""
+    plan = plan_cancel_bids(client, tourn_date, emit=print_emit)
+    print(format_plan(plan, dry_run))
+    result = execute_plan(client, plan, print_emit, sleep_write=0) if not dry_run else None
+    return {"matched": len(plan.cancels),
+            "cancelled": result.cancelled if result else 0,
+            "orders": plan.extra["orders"]}
+
+
+def place_fade_no_bids(
+    client: KalshiClient,
+    tourn_date: str,
+    discount_cents: int = 15,
+    count: int = 200,
+    minutes_after_start: int = 10,
+    min_bid_cents: int = 1,
+    max_bid_cents: int = 99,
+    sleep_read: float = 0.05,
+    sleep_write: float = 0.10,
+    dry_run: bool = True,
+) -> dict:
+    """Plan and (unless dry_run) place fade NO bids.
+
+    Returns {placed, cancelled, skipped, unmatched, expiry_iso, plan}.
+    """
+    plan = plan_fade_no_bids(client, tourn_date, discount_cents, count, minutes_after_start,
+                             min_bid_cents, max_bid_cents, sleep_read, emit=print_emit)
+    print(format_plan(plan, dry_run))
+    rows = [{"ticker": o.ticker, "subtitle": o.label, "bid_c": o.price_c, **o.meta}
+            for o in plan.orders]
+    base = {"skipped": len(plan.skipped), "unmatched": plan.unmatched,
+            "expiry_iso": plan.extra["expiry_iso"], "plan": rows}
+    if dry_run:
+        return {"placed": 0, "cancelled": 0, **base}
+    result = execute_plan(client, plan, print_emit, sleep_write=sleep_write)
+    print(f"\nDone. Placed {result.placed}, cancelled {result.cancelled}, skipped {len(plan.skipped)}.")
+    return {"placed": result.placed, "cancelled": result.cancelled, **base}
+
+
 def take_trades(
     client: KalshiClient,
     tourn_date: str,
@@ -579,95 +510,27 @@ def take_trades(
     dry_run: bool = True,
     budget_remaining: float | None = None,
 ) -> dict:
-    """Fetch live asks, compute EV, and fire qualifying taker orders.
+    """Plan and (unless dry_run) fire taker orders.
 
-    best_per_event: if True (default), fires only the single highest-ROI trade per
-        N-category. If False, fires every qualifying level per (ticker, side).
-    min_qty: levels with fewer available contracts are skipped as iceberg decoys.
-    max_qty: cap on contracts purchased per level.
     budget_remaining: if set, cancels the batch if proposed exposure exceeds this.
 
     Returns {placed, failed, skipped, unmatched, edge_count, exposure, budget_exceeded}.
+    On a live run `exposure` counts only orders that actually filled.
     """
-    df, unmatched = compute_edges(client, tourn_date, sleep_read=sleep_read, verbose=True)
-    if df.empty:
-        print("No asks found.")
-        return {"placed": 0, "failed": 0, "skipped": 0, "unmatched": unmatched, "edge_count": 0}
+    plan = plan_take_trades(client, tourn_date, min_roi, min_qty, max_qty, best_per_event,
+                            sleep_read, emit=print_emit)
+    print(format_plan(plan, dry_run))
+    base = {"unmatched": plan.unmatched, "edge_count": plan.stats["edge_count"],
+            "skipped": plan.stats["levels_scanned"] - plan.stats["edge_count"]}
 
-    has_volume   = df["Quantity Available"] >= min_qty
-    has_edge     = df["ROI"] > min_roi
-    thin_skipped = int((has_edge & ~has_volume).sum())
-
-    qualifying = df[has_edge & has_volume]
-    if best_per_event:
-        edge = (
-            qualifying
-            .sort_values("ROI", ascending=False)
-            .drop_duplicates(subset=["n"])
-            .copy()
-        )
-    else:
-        edge = (
-            qualifying
-            .sort_values("Ask Price ($)")
-            .drop_duplicates(subset=["Market Ticker", "Side"])
-            .copy()
-        )
-    edge["order_qty"] = edge["Quantity Available"].clip(upper=max_qty).astype(int)
-    proposed_exposure = float((edge["Ask Price ($)"] * edge["order_qty"]).sum())
-
-    mode_label = "best-per-event" if best_per_event else "all-qualifying"
-    print(f"\n{'[DRY RUN] ' if dry_run else ''}Taker trade plan for {tourn_date} (ROI > {min_roi}, mode={mode_label}):")
-    print(f"  Levels scanned  : {len(df)}")
-    print(f"  Edge trades     : {len(edge)}")
-    print(f"  Thin (skipped)  : {thin_skipped}  (ROI OK but qty < {min_qty})")
-    print(f"  Unmatched names : {len(unmatched)}")
-
-    if unmatched:
-        print(f"\n  Unmatched:")
-        for name in unmatched:
-            print(f"    - {name!r}")
-
-    if edge.empty:
-        print("  No trades to place.")
-        return {"placed": 0, "failed": 0, "skipped": len(df), "unmatched": unmatched, "edge_count": 0, "exposure": 0.0, "budget_exceeded": False}
-
-    print(f"\n  Planned taker orders (proposed exposure: ${proposed_exposure:.2f}):")
-    for _, row in edge.sort_values("ROI", ascending=False).iterrows():
-        ask_c = round(row["Ask Price ($)"] * 100)
-        print(
-            f"    {row['Market Ticker']} {row['Side']:3s} @ {ask_c}¢"
-            f"  ROI={row['ROI']:.3f}  EV={row['EV']:.3f}"
-            f"  qty={row['order_qty']} (avail={int(row['Quantity Available'])})"
-        )
-
-    if budget_remaining is not None and proposed_exposure > budget_remaining:
-        print(f"\n  Budget check: proposed ${proposed_exposure:.2f} exceeds remaining ${budget_remaining:.2f}. Cancelling batch.")
-        return {"placed": 0, "failed": 0, "skipped": len(df) - len(edge), "unmatched": unmatched, "edge_count": len(edge), "exposure": 0.0, "budget_exceeded": True}
-
+    if budget_remaining is not None and plan.exposure > budget_remaining:
+        print(f"\n  Budget check: proposed ${plan.exposure:.2f} exceeds remaining "
+              f"${budget_remaining:.2f}. Cancelling batch.")
+        return {"placed": 0, "failed": 0, "exposure": 0.0, "budget_exceeded": True, **base}
     if dry_run:
-        print("\n[DRY RUN] No orders placed.")
-        return {"placed": 0, "failed": 0, "skipped": len(df) - len(edge), "unmatched": unmatched, "edge_count": len(edge), "exposure": proposed_exposure, "budget_exceeded": False}
+        return {"placed": 0, "failed": 0, "exposure": plan.exposure, "budget_exceeded": False, **base}
 
-    def _take_one(row: pd.Series) -> tuple[bool, str, str, int]:
-        ticker = row["Market Ticker"]
-        side   = row["Side"].lower()
-        ask_c  = round(row["Ask Price ($)"] * 100)
-        qty    = int(row["order_qty"])
-        try:
-            client.take_order(ticker=ticker, side=side, count=qty, price=ask_c, dry_run=False)
-            print(f"  Placed {ticker} {side.upper()} @ {ask_c}¢ × {qty}")
-            return (True, ticker, side, ask_c)
-        except Exception as e:
-            print(f"  FAILED {ticker} {side.upper()} @ {ask_c}¢ × {qty}: {e}")
-            return (False, ticker, side, ask_c)
-
-    rows = [row for _, row in edge.iterrows()]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(rows)) as executor:
-        futures = [executor.submit(_take_one, row) for row in rows]
-        results = [f.result() for f in concurrent.futures.as_completed(futures)]
-
-    placed = sum(1 for ok, *_ in results if ok)
-    failed = len(results) - placed
-    print(f"\nDone. Placed {placed}, failed {failed}, skipped {len(df) - len(edge)}.")
-    return {"placed": placed, "failed": failed, "skipped": len(df) - len(edge), "unmatched": unmatched, "edge_count": len(edge), "exposure": proposed_exposure, "budget_exceeded": False}
+    result = execute_plan(client, plan, print_emit)
+    print(f"\nDone. Placed {result.placed}, failed {result.failed}, skipped {base['skipped']}.")
+    return {"placed": result.placed, "failed": result.failed,
+            "exposure": result.filled_exposure, "budget_exceeded": False, **base}

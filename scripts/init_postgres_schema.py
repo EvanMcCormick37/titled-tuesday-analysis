@@ -320,6 +320,9 @@ def main() -> None:
     with get_conn() as conn:
         for stmt in DDL:
             conn.execute(stmt)
+        conn.commit()
+        from src.job_queue import init_schema
+        init_schema()
         rows = conn.execute(
             "SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename"
         ).fetchall()

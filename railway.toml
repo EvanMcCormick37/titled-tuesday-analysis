@@ -34,8 +34,10 @@ dockerfilePath = "Dockerfile"
 [deploy]
 # Default start command — Railway cron overrides nothing here, it just invokes
 # the container with this CMD on each schedule tick.
-startCommand = "python scripts/weekly_pipeline.py"
-restartPolicyType = "NEVER"
+# No startCommand here: values in this file override the dashboard for every
+# service using it. Each service sets its own start command in the dashboard;
+# with none set, the Dockerfile CMD (the weekly pipeline) runs.
+# Restart policy is also per-service: Never for tt-cron, On Failure for the rest.
 # healthcheckPath has no meaning for a cron job; leave unset.
 
 # ── Env vars required (set per-service in Railway UI) ────────────────────────
@@ -54,6 +56,18 @@ restartPolicyType = "NEVER"
 # tt-bot only:
 #   TELEGRAM_BOT_TOKEN        = <from @BotFather>
 #   TELEGRAM_CHAT_ID          = <your private chat id — positive int>
+#
+# tt-api (React dashboard + JSON API):
+#   Start command: /bin/sh -c "exec python -m uvicorn api.main:app --host 0.0.0.0 --port $PORT"
+#   (Dockerfile start commands get no shell, so $PORT needs the sh -c wrapper.)
+#   Healthcheck path: /api/me
+#   Env: shared vars + DASHBOARD_PASSWORD. Restart policy ON_FAILURE.
+#
+# tt-worker (trade queue, recomputes, live Kalshi snapshots):
+#   Start command: python scripts/trade_worker.py
+#   Env: shared vars + RAILWAY_DEPLOYMENT_DRAINING_SECONDS=30.
+#   Not a web service. Exactly one replica. Restart policy ON_FAILURE.
+#   Deploy this BEFORE any tt-bot update: bot confirm buttons only add queue jobs.
 #
 # tt-bot deploy notes:
 #   - Start command: python app/telegram_bot.py

@@ -22,6 +22,8 @@ Three services + one Postgres plugin, all sharing the single `Dockerfile` at the
 | `tt-cron` | `python scripts/weekly_pipeline.py` | Weekly scrape → broadcasts refresh → raw MC. Cron: `0 19 * * 2` (UTC — 15:00 EDT / 14:00 EST) |
 | `tt-app` | `python -m streamlit run app/dashboard.py --server.port=$PORT --server.address=0.0.0.0` | Mobile-friendly Streamlit dashboard — primary user interface |
 | `tt-bot` | `python app/telegram_bot.py` | Telegram push alerts + command surface, bound to one chat |
+| `tt-api` | `/bin/sh -c "exec python -m uvicorn api.main:app --host 0.0.0.0 --port $PORT"` | FastAPI + built React dashboard (`web/`). Replaces `tt-app` at cutover |
+| `tt-worker` | `python scripts/trade_worker.py` | Runs the trade queue, recomputes, pipeline retries, and live Kalshi snapshots. Run exactly one replica; restart policy ON_FAILURE |
 
 **Important Railway gotcha:** Cron expressions are evaluated in UTC regardless of the `TZ` env var. Use numeric day-of-week (`2` = Tuesday), not the `TUE` alias. `TZ=America/New_York` only affects the container's clock inside Python (which matters for `_most_recent_tuesday()`).
 
@@ -112,6 +114,20 @@ Lichess   ─┤→ scrapers → Postgres (Railway) or SQLite (local)
 - **`scripts/trigger_adjusted.py`** — `run_adjusted` entry point. Reads `manual_adjustments` for the upcoming tourn_date, re-simulates, writes `latest_model_predictions`, flips the matching `pipeline_runs` row to `completed`.
 - **`app/dashboard.py`** — Streamlit entry. Six tabs: Odds / Attendance / Pipeline / Portfolio / Trade / Jobs. Gated by `DASHBOARD_PASSWORD`.
 - **`app/telegram_bot.py`** — python-telegram-bot v21 Application. Push alerts via `StateWatcher` (30s poll of `pipeline_runs`). Read-only commands (/status /odds /top /conflicts /positions /orders) + write commands with inline Confirm/Cancel buttons (/place /take /fade /cancel /recompute /retry /cut /keep /override). All handlers gated to `TELEGRAM_CHAT_ID`.
+
+### Trade queue
+
+All dashboard and Telegram trading goes through one Postgres-backed queue. `tt-api` and `tt-bot` only add jobs; `tt-worker` is the only process that sends them.
+
+- **`src/trade_plan.py`** — `Plan`, and `execute_plan()`, the single code path that sends orders. Progress goes through an `emit` callback, not `print`.
+- **`src/trading.py`** — read-only `plan_*` functions; the older `place_bids` etc. are print-based wrappers for the CLI and notebook.
+- **`src/strategies.py`** — registry of markets, strategies, param schemas, ops jobs, and snapshots. Add a market here. Forms in the UI are generated from the param schemas.
+- **`src/job_queue.py`** — `trade_jobs`, `trade_job_events`, `market_snapshots`. Created automatically by `init_schema()` on API and worker start.
+- **`src/job_runner.py`** — `JobRunner` and `Worker`.
+
+Rules: jobs **re-plan when they fire**, and a plan above the approved `max_exposure` halts as `needs_review`. Spending strategies also halt if the prior week's `pipeline_runs` row isn't `completed`. One normal-lane job runs per market (enforced by a partial unique index), and recomputes share that lane because they briefly empty the predictions table. The kill switch (`enqueue_kill`) uses the priority lane. Live jobs are never auto-retried: a job whose worker dies becomes `interrupted`. Unless given `not_after`, a one-shot expires 15 minutes after its intended start and a loop ends at event start. For a loop, `max_exposure` is the total budget.
+
+Tests: `python -m pytest tests` (fake Kalshi client; set `TEST_PG_URL` to a disposable Postgres to also run against Postgres — tables are dropped). Frontend: `cd web && npm run dev` with the API on port 8000. `DASHBOARD_PASSWORD` is required (login fails closed); set `TT_INSECURE_COOKIE=1` for plain-http local testing.
 
 ### Key modules
 

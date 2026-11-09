@@ -79,6 +79,8 @@ def main() -> None:
         )
     with get_conn() as conn:
         init(conn)
+        from src.job_queue import init_schema
+        init_schema()
         tables = conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' "
             "AND name IN ('manual_adjustments','pipeline_runs','job_runs') "

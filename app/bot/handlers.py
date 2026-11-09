@@ -227,6 +227,64 @@ async def cmd_orders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         formatters.orders_list(tt_orders), parse_mode=ParseMode.HTML)
 
 
+# ── Queue submission ─────────────────────────────────────────────────────────
+# Confirm buttons add a job to the same queue the dashboard uses, so the bot and
+# dashboard can't trade over each other.
+
+_MARKET = 'titled_tuesday'
+_CAP_HEADROOM = 1.10   # room for small price moves between preview and fire
+_JOB_WATCH_SECONDS = 30 * 60
+
+
+def _queue_trade(client: Any, strategy: str, tourn: str, params: dict) -> Callable[[], dict]:
+    def _submit() -> dict:
+        from src import strategies
+        plan = strategies.preview(client, _MARKET, strategy, params, tourn)
+        if not plan.orders and not plan.cancels:
+            print('Nothing to do: the fresh plan has no orders.')
+            return {}
+        job_id = strategies.submit(
+            market=_MARKET, strategy=strategy, tourn_date=tourn, params=params,
+            max_exposure=max(round(plan.exposure * _CAP_HEADROOM, 2), 0.01),
+            created_by='telegram',
+        )
+        print(f'Queued as job #{job_id} (cap ${plan.exposure * _CAP_HEADROOM:.2f}).')
+        return {'job_id': job_id}
+    return _submit
+
+
+def _queue_ops(name: str, params: dict | None = None) -> Callable[[], dict]:
+    def _submit() -> dict:
+        from src import strategies
+        job_id = strategies.submit_ops(_MARKET, name, params, created_by='telegram')
+        print(f'Queued as job #{job_id}.')
+        return {'job_id': job_id}
+    return _submit
+
+
+async def _report_job_outcome(message: Any, job_id: int, action: str) -> None:
+    """Tell the chat how a queued job ended, or that it needs attention."""
+    from src import job_queue
+    deadline = time.monotonic() + _JOB_WATCH_SECONDS
+    while time.monotonic() < deadline:
+        await asyncio.sleep(3)
+        job = await asyncio.to_thread(job_queue.get_job, job_id)
+        if job is None:
+            return
+        if job['status'] == 'needs_review':
+            await message.reply_text(
+                f'{action} (job #{job_id}) needs review: {job["review_reason"]}')
+            return
+        if job['status'] in job_queue.TERMINAL_STATUSES:
+            s = job.get('summary') or {}
+            detail = job.get('error') or (
+                f'{s.get("placed", 0)} sent, {s.get("cancelled", 0)} cancelled, '
+                f'{s.get("failed", 0)} failed' if s else 'done')
+            await message.reply_text(f'{action} (job #{job_id}): {job["status"]} — {detail}')
+            return
+    await message.reply_text(f'{action} (job #{job_id}) is still running after 30 minutes.')
+
+
 # ── Write-command scaffolding ────────────────────────────────────────────────
 
 async def _preview_and_stash(
@@ -253,17 +311,18 @@ async def _gated(update: Update, require_completed: bool = True) -> str | None:
     """Return the upcoming TT date iff the pipeline is in `completed`, else send
     an error and return None. Set `require_completed=False` for commands that
     don't need pipeline freshness (e.g. /retry)."""
-    tourn = db_reads.next_tourn_date_str()
+    from src.strategies import MARKETS
+    market = MARKETS[_MARKET]
+    tourn = await asyncio.to_thread(market.next_event_date)
     if not tourn:
         await update.effective_message.reply_text('No upcoming TT resolved.')
         return None
     if not require_completed:
         return tourn
-    s = db_reads.current_status()
-    if s.state != 'completed':
+    if not await asyncio.to_thread(market.pipeline_ready, tourn):
         await update.effective_message.reply_text(
-            f'Pipeline state is <code>{s.state}</code> — '
-            f'trades blocked until <code>completed</code>.',
+            f'Predictions for <code>{tourn}</code> are not marked completed — '
+            f'trades blocked until they are.',
             parse_mode=ParseMode.HTML)
         return None
     return tourn
@@ -281,11 +340,11 @@ async def cmd_place(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text(f'Kalshi: {e}')
         return
     from src.trading import place_bids
-    kwargs = dict(client=client, tourn_date=tourn, count=200, markup=1.5, max_discount=15.0)
+    kwargs = dict(count=200, markup=1.5, max_discount=15.0)
     await _preview_and_stash(
         update, 'place_bids',
-        dry_run_fn=lambda: place_bids(dry_run=True,  **kwargs),
-        live_executor=lambda: place_bids(dry_run=False, **kwargs),
+        dry_run_fn=lambda: place_bids(client=client, tourn_date=tourn, dry_run=True, **kwargs),
+        live_executor=_queue_trade(client, 'place_bids', tourn, kwargs),
     )
 
 
@@ -299,12 +358,11 @@ async def cmd_fade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text(f'Kalshi: {e}')
         return
     from src.trading import place_fade_no_bids
-    kwargs = dict(client=client, tourn_date=tourn, discount_cents=15,
-                  count=200, minutes_after_start=10)
+    kwargs = dict(discount_cents=15, count=200, minutes_after_start=10)
     await _preview_and_stash(
         update, 'place_fade_no_bids',
-        dry_run_fn=lambda: place_fade_no_bids(dry_run=True,  **kwargs),
-        live_executor=lambda: place_fade_no_bids(dry_run=False, **kwargs),
+        dry_run_fn=lambda: place_fade_no_bids(client=client, tourn_date=tourn, dry_run=True, **kwargs),
+        live_executor=_queue_trade(client, 'fade_no_bids', tourn, kwargs),
     )
 
 
@@ -318,12 +376,11 @@ async def cmd_take(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.effective_message.reply_text(f'Kalshi: {e}')
         return
     from src.trading import take_trades
-    kwargs = dict(client=client, tourn_date=tourn, min_roi=1.5, min_qty=25,
-                  max_qty=200, best_per_event=True)
+    kwargs = dict(min_roi=1.5, min_qty=25, max_qty=200, best_per_event=True)
     await _preview_and_stash(
         update, 'take_trades',
-        dry_run_fn=lambda: take_trades(dry_run=True,  **kwargs),
-        live_executor=lambda: take_trades(dry_run=False, **kwargs),
+        dry_run_fn=lambda: take_trades(client=client, tourn_date=tourn, dry_run=True, **kwargs),
+        live_executor=_queue_trade(client, 'take_trades', tourn, kwargs),
     )
 
 
@@ -337,10 +394,17 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.effective_message.reply_text(f'Kalshi: {e}')
         return
     from src.trading import cancel_tt_bids
+
+    def _kill() -> dict:
+        from src import job_queue
+        job_id = job_queue.enqueue_kill(_MARKET, tourn, created_by='telegram')
+        print(f'Kill switch queued as job #{job_id}. Queued trades were dropped.')
+        return {'job_id': job_id}
+
     await _preview_and_stash(
         update, 'cancel_tt_bids',
         dry_run_fn=lambda: cancel_tt_bids(client=client, tourn_date=tourn, dry_run=True),
-        live_executor=lambda: cancel_tt_bids(client=client, tourn_date=tourn, dry_run=False),
+        live_executor=_kill,
     )
 
 
@@ -355,9 +419,7 @@ async def cmd_retry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f'Pipeline is <code>{s.state}</code> — nothing to retry.',
             parse_mode=ParseMode.HTML)
         return
-    from scripts.weekly_pipeline import run_pipeline
-    kwargs = {'slug_override': url} if url else {}
-    executor = lambda: run_pipeline(**kwargs)
+    executor = _queue_ops('run_pipeline', {'slug_url': url} if url else {})
     # No separate dry-run for pipeline retry — show what will happen in text, then confirm.
     label = f'retry (step {s.failed_step}' + (f', url={url}' if url else '') + ')'
     plan = PendingPlan(action=label, description=label, executor=executor)
@@ -374,11 +436,10 @@ async def cmd_recompute(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not tourn:
         await update.effective_message.reply_text('No upcoming TT resolved.')
         return
-    from scripts.trigger_adjusted import trigger_adjusted
     plan = PendingPlan(
         action='recompute',
         description='run_adjusted',
-        executor=lambda: trigger_adjusted(tourn),
+        executor=_queue_ops('recompute'),
     )
     token = _stash(plan)
     rows = db_reads.adjustments_for(tourn)
@@ -486,3 +547,5 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await q.message.reply_text(
         formatters.live_result(plan.action, result if isinstance(result, dict) else {}, output or ''),
         parse_mode=ParseMode.HTML)
+    if isinstance(result, dict) and 'job_id' in result:
+        asyncio.create_task(_report_job_outcome(q.message, result['job_id'], plan.action))

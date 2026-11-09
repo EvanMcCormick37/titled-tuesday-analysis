@@ -12,6 +12,9 @@ __pycache__
 # Local-only artefacts
 notebooks
 logs
+tests
+web/node_modules
+web/dist
 
 # Historical cache we're deleting in Phase 0 anyway — never belongs in the image
 data/lichess_dumps

@@ -37,6 +37,23 @@ def get_tt_markets(
     return markets
 
 
+def fetch_orderbooks(client: KalshiClient, tickers: list[str]) -> dict[str, dict]:
+    """Bulk-fetch orderbooks, retrying any ticker the batch response left out.
+
+    A ticker that still can't be fetched is absent from the result, so callers
+    can skip it instead of mistaking it for an empty book.
+    """
+    books = client.get_orderbooks(tickers) if tickers else {}
+    for ticker in tickers:
+        if ticker in books:
+            continue
+        try:
+            books[ticker] = client.get_orderbook(ticker)
+        except Exception as e:
+            print(f"Could not retrieve orderbook for {ticker}: {e}")
+    return books
+
+
 def get_tt_asks(
     client: KalshiClient,
     event_date: Union[date, str, None] = None,
@@ -46,31 +63,32 @@ def get_tt_asks(
 
     Each entry: Market Ticker, Market Title, Player Name,
                 Ask Price ($), Quantity Available, Side ('YES' | 'NO')
+
+    `sleep` is retained for call-site compatibility; orderbooks are now fetched
+    in bulk, so there is no per-market request to throttle.
     """
     markets = get_tt_markets(client, event_date)
+    books = fetch_orderbooks(client, [m["ticker"] for m in markets])
     all_asks = []
     for market in markets:
         ticker   = market["ticker"]
         title    = market.get("title", "")
         subtitle = market.get("yes_sub_title", "")
-        try:
-            ob = client.get_orderbook(ticker)
-            for price_str, qty_str in ob.get("yes_dollars") or []:
-                all_asks.append({
-                    "Market Ticker": ticker, "Market Title": title, "Player Name": subtitle,
-                    "Ask Price ($)": 1.0 - float(price_str),
-                    "Quantity Available": float(qty_str), "Side": "NO",
-                })
-            for price_str, qty_str in ob.get("no_dollars") or []:
-                all_asks.append({
-                    "Market Ticker": ticker, "Market Title": title, "Player Name": subtitle,
-                    "Ask Price ($)": 1.0 - float(price_str),
-                    "Quantity Available": float(qty_str), "Side": "YES",
-                })
-        except Exception as e:
-            print(f"Could not retrieve orderbook for {ticker}: {e}")
-        if sleep:
-            time.sleep(sleep)
+        ob = books.get(ticker)
+        if ob is None:
+            continue
+        for price_str, qty_str in ob.get("yes_dollars") or []:
+            all_asks.append({
+                "Market Ticker": ticker, "Market Title": title, "Player Name": subtitle,
+                "Ask Price ($)": 1.0 - float(price_str),
+                "Quantity Available": float(qty_str), "Side": "NO",
+            })
+        for price_str, qty_str in ob.get("no_dollars") or []:
+            all_asks.append({
+                "Market Ticker": ticker, "Market Title": title, "Player Name": subtitle,
+                "Ask Price ($)": 1.0 - float(price_str),
+                "Quantity Available": float(qty_str), "Side": "YES",
+            })
     return all_asks
 
 
@@ -78,8 +96,13 @@ def get_tt_positions_df(
     client: KalshiClient,
     event_date: Union[date, str, None] = None,
     sleep: float = 0.05,
+    fees_by_ticker: Optional[dict[str, float]] = None,
 ) -> pd.DataFrame:
     """Fetch current TT positions from Kalshi API, with fee-inclusive cost basis.
+
+    Pass `fees_by_ticker` to supply fees directly instead of reading the local
+    kalshi-core `fills` DB.
+
 
     Joins Kalshi's live position data against the local kalshi-core `fills`
     DB so transaction fees are reflected in `cost_incl_fees` and
@@ -133,31 +156,25 @@ def get_tt_positions_df(
 
     # Fee-inclusive cost basis. kalshi_core.db.get_fills reads from the
     # central ~/.kalshi/data/kalshi.db populated by sync_fills(client).
-    fees_by_ticker: dict[str, float] = {}
-    try:
-        from kalshi_core import get_fills
-        fills = get_fills()
-        if not fills.empty and "fee_cost" in fills.columns:
-            fees_by_ticker = fills.groupby("ticker")["fee_cost"].sum().to_dict()
-    except Exception as e:
-        print(f"  Warning: could not load fills for fee lookup: {e}")
+    if fees_by_ticker is None:
+        fees_by_ticker = {}
+        try:
+            from kalshi_core import get_fills
+            fills = get_fills()
+            if not fills.empty and "fee_cost" in fills.columns:
+                fees_by_ticker = fills.groupby("ticker")["fee_cost"].sum().to_dict()
+        except Exception as e:
+            print(f"  Warning: could not load fills for fee lookup: {e}")
 
     tt["fees"] = tt["ticker"].map(fees_by_ticker).fillna(0.0).astype(float)
     tt["cost_incl_fees"]      = tt["cost"] + tt["fees"]
     tt["avg_price_incl_fees"] = tt["cost_incl_fees"] / tt["volume"]
 
-    market_titles: dict[str, str] = {}
-    for ticker in tt["ticker"]:
-        try:
-            mkt = client.get_market(ticker).get("market", {})
-            market_titles[ticker] = mkt.get("yes_sub_title", "")
-        except Exception as e:
-            print(f"  Warning: could not fetch {ticker}: {e}")
-            market_titles[ticker] = ""
-        if sleep:
-            time.sleep(sleep)
-
-    tt["marketTitle"] = tt["ticker"].map(market_titles)
+    market_titles = {
+        m["ticker"]: m.get("yes_sub_title", "")
+        for m in client.get_markets_by_tickers(tt["ticker"].tolist())
+    }
+    tt["marketTitle"] = tt["ticker"].map(market_titles).fillna("")
     return tt[["ticker", "marketTitle", "n", "position", "volume",
                "cost", "fees", "cost_incl_fees",
                "avg_price", "avg_price_incl_fees"]].reset_index(drop=True)

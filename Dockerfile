@@ -5,6 +5,13 @@
 #     installs it in editable mode on container start.
 #   - Railway / CI: pass GH_TOKEN as a build arg → pip installs kalshi-core from
 #     a private GitHub repo at build time, so no mount is needed at runtime.
+FROM node:22-slim AS web
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY web/ ./
+RUN npm run build
+
 FROM python:3.13-slim
 
 ARG GH_TOKEN=""
@@ -36,6 +43,7 @@ COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 COPY . /app/
+COPY --from=web /web/dist /app/web/dist
 
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["python", "scripts/weekly_pipeline.py"]
