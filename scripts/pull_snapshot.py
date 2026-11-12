@@ -37,6 +37,8 @@ from src.multi_market_schema import migrate
 # Operational state with no analytical use.
 _SKIPPED_TABLES = {'trade_jobs', 'trade_job_events', 'market_snapshots'}
 _CHUNK_ROWS = 50_000
+# Backfilled locally and not yet on Railway.
+_LOCAL_ONLY_TABLES = ('bullet_brawl_tournaments', 'bullet_brawl_standings')
 
 
 def _source_engine(url: str):
@@ -132,6 +134,26 @@ def apply_local_schema(path: Path) -> None:
         db.DB_PATH = original
 
 
+def keep_local_only_rows(partial: Path, previous: Path) -> None:
+    """Carry over locally backfilled tables that are still empty on Railway."""
+    if not previous.exists():
+        return
+    conn = sqlite3.connect(partial)
+    try:
+        conn.execute('ATTACH DATABASE ? AS previous', (str(previous),))
+        for table in _LOCAL_ONLY_TABLES:
+            try:
+                has_rows = conn.execute(f'SELECT 1 FROM previous.{table} LIMIT 1').fetchone()
+            except sqlite3.DatabaseError:
+                continue    # the old file doesn't have this table
+            if has_rows and not conn.execute(f'SELECT 1 FROM {table} LIMIT 1').fetchone():
+                conn.execute(f'INSERT INTO {table} SELECT * FROM previous.{table}')
+                print(f'  {table:<34} kept from the local copy')
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def pull(url: str, dest: Path) -> dict[str, int]:
     dest.parent.mkdir(parents=True, exist_ok=True)
     partial = dest.with_suffix('.partial')
@@ -139,6 +161,7 @@ def pull(url: str, dest: Path) -> dict[str, int]:
     try:
         counts = copy_tables(url, partial)
         apply_local_schema(partial)
+        keep_local_only_rows(partial, dest)
     except BaseException:
         partial.unlink(missing_ok=True)
         raise

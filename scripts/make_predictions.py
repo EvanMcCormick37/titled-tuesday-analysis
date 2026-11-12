@@ -3,7 +3,7 @@
 Generate official MC model predictions for the next Titled Tuesday.
 
 Reads attendance adjustments from the `manual_adjustments` DB table (populated
-by the dashboard, Telegram bot, or notebook) and passes them to run_adjusted().
+by the dashboard or notebook) and passes them to run_adjusted().
 
 Usage
 -----

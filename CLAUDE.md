@@ -6,31 +6,30 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Purpose
 
-Production Python trading system for betting on chess.com's weekly **Titled Tuesday** blitz tournament using Kalshi prediction markets. The system:
-1. Scrapes historical TT standings from chess.com + concurrent-event broadcast data from Lichess
+Production Python trading system for betting on chess.com's weekly **Titled Tuesday** blitz tournament and **Bullet Brawl** 1+0 arena using Kalshi prediction markets. The system:
+1. Scrapes historical standings from chess.com + concurrent-event broadcast data from Lichess
 2. Predicts each player's probability of attending and finishing in the top N (Monte Carlo)
 3. Places and executes orders on Kalshi using those fair-value estimates
 
-As of 2026-10, the system is deployed on **Railway** across three services sharing one Docker image + one Postgres instance. Local development against SQLite still works unchanged via the dual-backend DB layer.
+As of 2026-10, the system is deployed on **Railway** across several services sharing one Docker image + one Postgres instance. Local development against SQLite still works unchanged via the dual-backend DB layer.
 
 ## Deployment (Railway)
 
-Three services + one Postgres plugin, all sharing the single `Dockerfile` at the repo root:
+Services + one Postgres plugin, all sharing the single `Dockerfile` at the repo root:
 
 | Service | Start command | Purpose |
 |---|---|---|
-| `tt-cron` | `python scripts/weekly_pipeline.py` | Weekly scrape → broadcasts refresh → raw MC. Cron: `0 19 * * 2` (UTC — 15:00 EDT / 14:00 EST) |
+| `tt-cron` | `python scripts/weekly_pipeline.py` | Titled Tuesday weekly scrape → broadcasts refresh → raw MC. Cron: `0 19 * * 2` (UTC — 15:00 EDT / 14:00 EST) |
+| `bb-cron` | `python scripts/weekly_pipeline.py --market bullet_brawl` | The same pipeline for Bullet Brawl. Cron: `0 20 * * 6` (UTC — Saturday 16:00 EDT / 15:00 EST) |
 | `tt-app` | `python -m streamlit run app/dashboard.py --server.port=$PORT --server.address=0.0.0.0` | Mobile-friendly Streamlit dashboard — primary user interface |
-| `tt-bot` | `python app/telegram_bot.py` | Telegram push alerts + command surface, bound to one chat |
 | `tt-api` | `/bin/sh -c "exec python -m uvicorn api.main:app --host 0.0.0.0 --port $PORT"` | FastAPI + built React dashboard (`web/`). Replaces `tt-app` at cutover |
 | `tt-worker` | `python scripts/trade_worker.py` | Runs the trade queue, recomputes, pipeline retries, and live Kalshi snapshots. Run exactly one replica; restart policy ON_FAILURE |
 
-**Important Railway gotcha:** Cron expressions are evaluated in UTC regardless of the `TZ` env var. Use numeric day-of-week (`2` = Tuesday), not the `TUE` alias. `TZ=America/New_York` only affects the container's clock inside Python (which matters for `_most_recent_tuesday()`).
+**Important Railway gotcha:** Cron expressions are evaluated in UTC regardless of the `TZ` env var. Use numeric day-of-week (`2` = Tuesday, `6` = Saturday), not the `TUE` alias. `TZ=America/New_York` only affects the container's clock inside Python (which matters for `_most_recent_tuesday()`).
 
 Env vars (set in Railway UI, per service unless noted):
 - **Shared:** `DATABASE_URL` (from Postgres plugin), `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_B64` (base64 of `~/.kalshi/trading-key.txt`), `KALSHI_ENV=prod`, `TZ=America/New_York`, `GH_TOKEN` (PAT for installing private `kalshi-core`)
 - **tt-app only:** `DASHBOARD_PASSWORD`
-- **tt-bot only:** `TELEGRAM_BOT_TOKEN` (from BotFather), `TELEGRAM_CHAT_ID`
 
 The `Dockerfile` installs `kalshi-core` at build time from a private GitHub repo using `GH_TOKEN`. Local dev can bind-mount `/opt/kalshi-core` instead — `docker-entrypoint.sh` handles both paths.
 
@@ -44,15 +43,20 @@ pip install -r requirements.txt
 
 # Full weekly pipeline (scrape → broadcasts → raw MC → adjustments_pending)
 python scripts/weekly_pipeline.py
+python scripts/weekly_pipeline.py --market bullet_brawl
 
 # Just scrape new TT standings
 python scripts/scraping/update_titled_tuesday.py
+
+# Just scrape new Bullet Brawl standings (or pass an event URL; --enrich-only fills in player names)
+python scripts/scraping/update_bullet_brawl.py
 
 # Weekly broadcast refresh (Lichess PGN dumps + attendance_conflicts rebuild)
 python scripts/scraping/update_broadcasts.py
 
 # Re-run `run_adjusted` against the current manual_adjustments table
 python scripts/trigger_adjusted.py
+python scripts/trigger_adjusted.py --market bullet_brawl
 
 # Walk-forward joint backtest of score vs perf-rating MC (writes to `backtest` table)
 python scripts/run_backtest.py
@@ -71,11 +75,13 @@ python scripts/take_trades.py
 # Cancel all resting TT orders
 python scripts/cancel_bids.py
 
-# ── Dashboard / bot (local dev) ─────────────────────────────────────────────
+# ── Dashboard (local dev) ───────────────────────────────────────────────────
 
-python -m streamlit run app/dashboard.py
-python app/telegram_bot.py
+python -m uvicorn api.main:app --reload     # React dashboard API (all markets)
+python -m streamlit run app/dashboard.py    # legacy Streamlit app (Titled Tuesday only)
 ```
+
+The trading CLI scripts above cover Titled Tuesday only; trade Bullet Brawl from the React dashboard.
 
 The `notebooks/command-center.ipynb` remains the richest interactive control surface for exploratory analysis, though for day-to-day production use the Streamlit dashboard has superseded it.
 
@@ -98,11 +104,11 @@ Lichess   ─┤→ scrapers → Postgres (Railway) or SQLite (local)
            │                                        ↓
            │                                latest_model_predictions
            │                                        ↓
-           │              ┌─────────────────────────┼──────────────────────────┐
-           │              ↓                         ↓                          ↓
-           │       app/dashboard.py          app/telegram_bot.py        src/trading.py
-           │       (Streamlit UI)            (push alerts + cmds)       (place / take / cancel / fade)
-           │              │                         │                          ↓
+           │              ┌─────────────────────────┴──────────────────────────┐
+           │              ↓                                                    ↓
+           │       api/main.py + web/                                   src/trading.py
+           │       (React dashboard)                                    (place / take / cancel / fade)
+           │              │                                                    ↓
            └─ pipeline_runs                                              kalshi_core.KalshiClient
               (state machine for                                               ↓
               the whole weekly cycle)                                      Kalshi API
@@ -110,14 +116,14 @@ Lichess   ─┤→ scrapers → Postgres (Railway) or SQLite (local)
 
 ### Entry points (where to start reading)
 
-- **`scripts/weekly_pipeline.py`** — orchestrates the three pre-trade steps (`scrape_tt → update_broadcasts → run_raw`) as a resumable state machine. Writes to `pipeline_runs` + `job_runs`. On any failure, halts with `state='failed'`, `error_kind` classified for the dashboard/bot to show an appropriate retry UI.
+- **`scripts/weekly_pipeline.py`** — orchestrates a market's three pre-trade steps (`MarketSpec.pipeline_steps`: `scrape_tt` or `scrape_bb` → `update_broadcasts → run_raw`) as a resumable state machine. Writes to `pipeline_runs` + `job_runs`. On any failure, halts with `state='failed'`, `error_kind` classified for the dashboard to show an appropriate retry UI.
 - **`scripts/trigger_adjusted.py`** — `run_adjusted` entry point. Reads `manual_adjustments` for the upcoming tourn_date, re-simulates, writes `latest_model_predictions`, flips the matching `pipeline_runs` row to `completed`.
-- **`app/dashboard.py`** — Streamlit entry. Six tabs: Odds / Attendance / Pipeline / Portfolio / Trade / Jobs. Gated by `DASHBOARD_PASSWORD`.
-- **`app/telegram_bot.py`** — python-telegram-bot v21 Application. Push alerts via `StateWatcher` (30s poll of `pipeline_runs`). Read-only commands (/status /odds /top /conflicts /positions /orders) + write commands with inline Confirm/Cancel buttons (/place /take /fade /cancel /recompute /retry /cut /keep /override). All handlers gated to `TELEGRAM_CHAT_ID`.
+- **`api/main.py`** + **`web/`** — FastAPI + React dashboard for every registered market (market picker in the top bar). Pages: Trade / Edges / Portfolio / Odds / Attendance / Pipeline / Logs. Gated by `DASHBOARD_PASSWORD`.
+- **`app/dashboard.py`** — legacy Streamlit entry, Titled Tuesday only. Six tabs: Odds / Attendance / Pipeline / Portfolio / Trade / Jobs.
 
 ### Trade queue
 
-All dashboard and Telegram trading goes through one Postgres-backed queue. `tt-api` and `tt-bot` only add jobs; `tt-worker` is the only process that sends them.
+All dashboard trading goes through one Postgres-backed queue. `tt-api` only adds jobs; `tt-worker` is the only process that sends them.
 
 - **`src/trade_plan.py`** — `Plan`, and `execute_plan()`, the single code path that sends orders. Progress goes through an `emit` callback, not `print`.
 - **`src/trading.py`** — read-only `plan_*` functions; the older `place_bids` etc. are print-based wrappers for the CLI and notebook.
@@ -144,8 +150,13 @@ Notebooks and backtests run against a local SQLite copy of Railway, in the `tt` 
 - `pipeline_runs`, `manual_adjustments`, `attendance_conflicts`, both latest-predictions tables, `historical_predictions` and `backtest` have a `market` column. Always filter on it, and write predictions with `db.replace_market_rows`.
 - Each market keeps its raw results in its own tables (`titled_tuesday_standings`, `bullet_brawl_standings`).
 - `scripts/migrate_multi_market.py` applies this schema to an existing database. It is idempotent.
-- The Telegram bot and Streamlit app cover Titled Tuesday only.
-- Bullet Brawl is defined but unregistered: it still needs an ingest step, a tuned `ModelConfig` and a `PIPELINES` entry in `scripts/weekly_pipeline.py`.
+- The Streamlit app and the trading CLI scripts cover Titled Tuesday only; the React dashboard covers every registered market.
+- `ModelConfig.score_noise_sigma` (score points) sets a market's Gaussian smoothing in `run_raw` and `run_adjusted`. Titled Tuesday's is 0; Bullet Brawl's is 10, the winner of its sigma backtest. `ModelConfig.played_filter` is the SQL condition for a row that counts as attending; Bullet Brawl uses `games > 0`.
+- `python scripts/run_backtest.py --market bullet_brawl` runs the sigma comparison, and `notebooks/bullet-brawl-backtest.ipynb` runs or reuses it and shows the results. Add a market's backtest to `PROFILES` in that script.
+- Adding a market: a `MarketSpec` (with `pipeline_steps` and `event_url_example`), a scrape function and `PIPELINES` entry in `scripts/weekly_pipeline.py`, registration in `MARKETS`, and a Railway cron service.
+- Bullet Brawl is registered and runs the same weekly workflow as Titled Tuesday. Chess.com has no Bullet Brawl listing page, so `scripts/scraping/update_bullet_brawl.py` finds each new event in the monthly game archives of the most frequent recent players, confirms it against the tournament API, and then enriches new accounts with at least `MIN_APPEARANCES` games into `player_information`. If no archive has the event yet, the step fails with `listing_missing_slug` and the Pipeline page takes the URL.
+- Usernames keep chess.com's capitalization in every table, one spelling per account. The tournament API lists Bullet Brawl players in lowercase, so ingestion takes the case from the player's games and then adopts the spelling already on record (`bullet_brawl_ingest.known_usernames`: Titled Tuesday first, then `player_information`). Never lowercase usernames; compare case-insensitively when checking whether an account exists. `scripts/fix_bullet_brawl_username_case.py` repaired the first backfill, which had lowercased them.
+- `scripts/scraping/backfill_bullet_brawl.py` loads history into local SQLite and writes `data/bullet_brawl_backfill_report.csv`. `scripts/push_bullet_brawl_history.py` copies that history and the enriched player names to Railway (run once). `pull_snapshot.py` keeps the local rows until Railway has its own.
 
 ### Key modules
 
@@ -189,8 +200,7 @@ app/
     banner.py           ← Persistent status strip reading pipeline_runs
     state.py            ← Cached DB loaders (st.cache_data) — current_status,
                            load_predictions, username_to_player_map, ...
-                           Re-exports PipelineStatus NamedTuple from app/bot/db_reads.py.
-    telegram_bot.py     ← tt-bot entry (shares the project; just a different start cmd)
+                           Also defines the PipelineStatus NamedTuple.
     tabs/
         odds.py         ← Three Plotly views (chances / fair prices / table) + N selector
         adjustments.py  ← Form writes manual_adjustments; "Save & recompute" fires trigger_adjusted
@@ -198,16 +208,6 @@ app/
         portfolio.py    ← get_tt_positions_df + fee-inclusive metrics; Sync fills button
         trade.py        ← Place / Fade / Take / Cancel sub-sections, each two-tap confirm
         jobs.py         ← Paginated job_runs log viewer
-    bot/
-        __init__.py
-        db_reads.py     ← Non-cached mirrors of app/state.py (bot has no st context).
-                           Also home of the shared PipelineStatus NamedTuple.
-        formatters.py   ← Pure text builders for Telegram (HTML parse_mode)
-        alerts.py       ← StateWatcher — polls pipeline_runs every 30s, diffs vs
-                           in-memory last-seen, pushes transition alerts.
-        handlers.py     ← Command + callback handlers. Write commands stash a
-                           PendingPlan behind a 10-char token with 10-min TTL;
-                           inline Confirm/Cancel buttons re-run with dry_run=False.
 ```
 
 ### Database schema
@@ -218,7 +218,7 @@ Postgres on Railway (schema defined in `scripts/init_postgres_schema.py`); SQLit
 - `titled_tuesday_standings` — per-player results per tournament. `date` is `TIMESTAMPTZ` on Postgres; the scraper writes `pd.Timestamp(f'{date} 00:00:00+00:00')` to send a real timestamp (not a VARCHAR, which Postgres refuses to implicit-cast).
 - `titled_tuesday_tournaments` — tournament metadata (date, num_players, winner, url).
 - `player_information` — Chess.com enrichment. `is_default=1` marks the canonical username when a player has multiple accounts.
-- `attendance_conflicts` — (date, player_name, username) rows for TT dates where a player had an unavoidable broadcast-round conflict. Rebuilt at the end of `update_broadcasts.py` (weekly) or standalone via `scripts/build_attendance_conflicts.py`. Consumed by `load_and_prepare()` so `p_participate` reflects attendance rate on conflict-free weeks.
+- `attendance_conflicts` — (market, date, player_name, username) rows for event dates where a player had an unavoidable broadcast-round conflict. Rebuilt per market at the end of `update_broadcasts.py` (weekly) or standalone via `scripts/build_attendance_conflicts.py --market <slug>`. Consumed by `load_and_prepare()` so `p_participate` reflects attendance rate on conflict-free weeks.
 - `other_events` / `other_event_rounds` / `other_event_participants` — concurrent OTB tournaments parsed from Lichess monthly PGN dumps.
 
 **Predictions:**
@@ -230,7 +230,7 @@ Postgres on Railway (schema defined in `scripts/init_postgres_schema.py`); SQLit
 **Orchestration (new in the Railway deploy):**
 - `pipeline_runs` — one row per weekly cycle. `(tourn_date UNIQUE, state, current_step, failed_step, error_kind, error_message, started_at, completed_at)`. `state ∈ {running, adjustments_pending, completed, failed}`. `error_kind ∈ {listing_missing_slug, http_error, computation_error, unknown}`.
 - `job_runs` — fine-grained log of every step. `(pipeline_run_id FK, job_name, started_at, ended_at, status, summary JSONB, log_tail)`. Many `job_runs` rows roll up to one `pipeline_runs`.
-- `manual_adjustments` — `(tourn_date, player_name, adjustment_type, value, created_at, created_by)`. `adjustment_type ∈ {cut, keep, override, nudge, global_nudge}`. Consumed by `load_adjustments()`. Dashboard writes `created_by='dashboard'`; bot writes `created_by='telegram'`.
+- `manual_adjustments` — `(tourn_date, player_name, adjustment_type, value, created_at, created_by)`. `adjustment_type ∈ {cut, keep, override, nudge, global_nudge}`. Consumed by `load_adjustments()`. Dashboard writes `created_by='dashboard'`.
 
 **Kalshi (via kalshi-core shared DB at `~/.kalshi/data/kalshi.db`):**
 - `fills` — account-level trade history including `fee_cost`.
@@ -241,12 +241,12 @@ See `../kalshi-core/CLAUDE.md` for the kalshi-core API.
 ### Pipeline state machine
 
 ```
-         [cron fires on Tuesday]
+         [cron fires on Tuesday (TT) or Saturday (BB)]
                  ↓
-         ┌─ scrape_tt ───────────┐
+         ┌─ scrape_tt / scrape_bb ┐
          │                       │
-         │   listing_missing_slug → state=failed  (user supplies URL via /retry <url>)
-         │   http_error           → state=failed  (user hits /retry)
+         │   listing_missing_slug → state=failed  (user pastes the URL on the Pipeline page)
+         │   http_error           → state=failed  (user hits Retry pipeline)
          ↓                       │
          update_broadcasts       │
          │                       │
@@ -256,30 +256,32 @@ See `../kalshi-core/CLAUDE.md` for the kalshi-core API.
          │                       │
          │   computation_error   → state=failed
          ↓                       │
-         state = adjustments_pending  (bot pushes alert; user opens dashboard)
+         state = adjustments_pending  (user opens the Attendance page)
                  ↓
          [user edits manual_adjustments]
                  ↓
-         [user taps "Save & recompute" or sends /recompute]
+         [user taps "Save & recompute"]
                  ↓
          run_adjusted
                  ↓
-         state = completed  (bot pushes alert; trade commands unlock)
+         state = completed  (trading unlocks)
 ```
 
-The dashboard **Trade** tab and bot write commands refuse to fire when `pipeline_runs.state != 'completed'` (stale-data guard), with an explicit override checkbox for the dashboard case.
+Spending jobs refuse to fire when the prior event's `pipeline_runs.state != 'completed'` (stale-data guard), unless submitted with the override.
 
 ### Username / player-name mapping
 
-Chess.com usernames (in standings) map to display names via `player_information.player_name`. Kalshi market tickers use these display names. `is_default=1` marks the most-recently-active username per player.
+Chess.com usernames (in standings) map to display names via `player_information.player_name`. Kalshi contracts are labelled with these display names. `is_default=1` marks the most-recently-active Titled Tuesday username per player.
+
+Players sometimes use a different account per event, so trading and `run_adjusted` use `data.market_player_to_username(usernames, spec)`: among a player's accounts in the market's predictions, the one seen most recently in that market wins. `data.match_player` looks a Kalshi name up exactly, then falls back to an unambiguous word-set match (e.g. "Renato Terry" for "Renato Terry Celis"). Names that still don't match show as unmatched on the Edges page; add them to `_PLAYER_ALIASES` in `src/data.py`.
 
 ### Kalshi market tickers
 
-Two event ticker patterns, defined in `src/kalshi_tt.py`:
-- `KXTITLEDTUESDAY-{date}-{PLAYER}` — winner market (N=1)
-- `KXTITLEDTUESTOP-{date}T{N}-{PLAYER}` — top-N markets (N=3, 5, 8)
+Each `MarketSpec` defines a winner series and a top-N series:
+- `KXTITLEDTUESDAY-{date}-{PLAYER}` / `KXBULLETBRAWL-{date}-{PLAYER}` — winner market (N=1)
+- `KXTITLEDTUESTOP-{date}T{N}-{PLAYER}` / `KXBULLETBRAWLTOP-{date}T{N}-{PLAYER}` — top-N markets (N=3, 5, 8)
 
-`{date}` is in Kalshi's `YYMONDD` format (e.g. `26SEP16`), produced by `_to_kalshi_date()` from `kalshi_core`. Ticker parsing in `trading.py` extracts N and player name from these patterns.
+`{date}` is in Kalshi's `YYMONDD` format (e.g. `26SEP16`), produced by `_to_kalshi_date()` from `kalshi_core`. `MarketSpec.n_from_ticker` extracts N from these patterns.
 
 ### API cache
 

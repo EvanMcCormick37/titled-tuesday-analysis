@@ -20,6 +20,8 @@ class ModelConfig:
     min_participation_rate: float
     season_shift_date: str | None = None
     season_shift_factor: float = 1.0
+    score_noise_sigma: float = 0.0     # Gaussian noise on each sampled score, in score points
+    played_filter: str | None = None   # SQL condition for a standings row that counts as attending
 
 
 @dataclass(frozen=True)
@@ -37,6 +39,10 @@ class MarketSpec:
     model: ModelConfig
     prediction_ns: tuple[int, ...] = (1, 3, 5, 8, 10)
     timezone: str = 'America/New_York'
+    # Weekly pipeline steps, in order. The runner in scripts/weekly_pipeline.py and
+    # the dashboard's Pipeline page both read this.
+    pipeline_steps: tuple[str, ...] = ('scrape', 'update_broadcasts', 'run_raw')
+    event_url_example: str = 'https://www.chess.com/tournament/live/…'
 
     @property
     def traded_ns(self) -> tuple[int, ...]:

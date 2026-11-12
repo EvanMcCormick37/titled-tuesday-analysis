@@ -1,5 +1,5 @@
 """
-Top-level pipeline entry point for Titled Tuesday MC predictions.
+Top-level pipeline entry point for weekly top-N MC predictions.
 
 Two public functions:
 
@@ -18,9 +18,9 @@ from typing import NamedTuple
 import numpy as np
 import pandas as pd
 
-from .config import N_SIMS
+from .config import N_SIMS, SCORE_COMPOSITE_SCALE
 from .db import get_conn, read_market_rows, replace_market_rows
-from .data import load_and_prepare, get_username_mappings, resolve_player_names
+from .data import load_and_prepare, market_player_to_username, match_player, resolve_player_names
 from .markets import TITLED_TUESDAY, MarketSpec
 from .simulation import build_player_pool_score, run_simulation_score, build_results
 
@@ -65,6 +65,7 @@ def run_raw(
     plays_ct, topn_ct = run_simulation_score(
         players, p_play_raw, hist_composites, hist_wts,
         n_sims=n_sims, n_values=PRED_N_VALUES,
+        noise_sigma=spec.model.score_noise_sigma * SCORE_COMPOSITE_SCALE,
     )
     results_raw = build_results(
         players, p_play_raw, plays_ct, topn_ct,
@@ -113,36 +114,36 @@ def run_adjusted(
         raw_run.players, raw_run.p_play, raw_run.hist_composites, raw_run.hist_wts, raw_run.p_raw
     )
 
-    # ── Resolve player names → usernames ─────────────────────────────────────
-    _, PLAYER_TO_USERNAME = get_username_mappings()
+    # ── Resolve player names → this market's usernames ───────────────────────
+    name_map = market_player_to_username(p_raw.index, spec)
 
     nudges: dict[str, float] = {}
     for name, delta in p_nudges.items():
-        u = PLAYER_TO_USERNAME.get(name)
+        u = match_player(name, name_map)
         if u is None:
-            print(f'  Warning: p_nudges key {name!r} not found in player_information')
+            print(f'  Warning: p_nudges key {name!r} not in this market player pool')
         else:
             nudges[u] = float(delta)
 
     overrides: dict[str, float] = {}
     for name in cut_players:
-        u = PLAYER_TO_USERNAME.get(name)
+        u = match_player(name, name_map)
         if u is None:
-            print(f'  Warning: cut_players entry {name!r} not found in player_information')
+            print(f'  Warning: cut_players entry {name!r} not in this market player pool')
         else:
             overrides[u] = 0.0
 
     for name, val in p_participate_overrides.items():
-        u = PLAYER_TO_USERNAME.get(name)
+        u = match_player(name, name_map)
         if u is None:
-            print(f'  Warning: p_participate_overrides key {name!r} not found in player_information')
+            print(f'  Warning: p_participate_overrides key {name!r} not in this market player pool')
         else:
             overrides[u] = float(val)
 
     for name in keep_players:
-        u = PLAYER_TO_USERNAME.get(name)
+        u = match_player(name, name_map)
         if u is None:
-            print(f'  Warning: keep_players entry {name!r} not found in player_information')
+            print(f'  Warning: keep_players entry {name!r} not in this market player pool')
         else:
             overrides[u] = 1.0
 
@@ -180,6 +181,7 @@ def run_adjusted(
     plays_ct_adj, topn_ct_adj = run_simulation_score(
         players, p_play_adj, hist_composites, hist_wts,
         n_sims=n_sims, n_values=PRED_N_VALUES,
+        noise_sigma=spec.model.score_noise_sigma * SCORE_COMPOSITE_SCALE,
     )
     results = build_results(
         players, p_play_adj, plays_ct_adj, topn_ct_adj,

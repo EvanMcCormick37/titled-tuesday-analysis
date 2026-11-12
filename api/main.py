@@ -108,6 +108,8 @@ def markets() -> list[dict]:
         'label': m.label,
         'n_values': list(m.spec.prediction_ns),
         'traded_ns': list(m.spec.traded_ns),
+        'pipeline_steps': list(m.spec.pipeline_steps),
+        'event_url_example': m.spec.event_url_example,
         'strategies': [{
             'name': s.name, 'label': s.label, 'description': s.description,
             'spends': s.spends, 'can_loop': s.can_loop,
@@ -297,10 +299,15 @@ class AdjustmentsBody(BaseModel):
 def get_adjustments(slug: str) -> dict:
     market = _market(slug)
     date = market.next_event_date()
-    with get_conn() as conn:
-        names = [r[0] for r in conn.execute(
-            'SELECT DISTINCT player_name FROM player_information WHERE player_name IS NOT NULL '
-            'ORDER BY player_name').fetchall()]
+    pool = _load_predictions(slug, adjusted=False)
+    if pool.empty:
+        with get_conn() as conn:
+            names = [r[0] for r in conn.execute(
+                'SELECT DISTINCT player_name FROM player_information WHERE player_name IS NOT NULL '
+                'ORDER BY player_name').fetchall()]
+    else:
+        # Suggest this market's player pool only; nobody outside it can be adjusted.
+        names = sorted(pool['player'].dropna().unique().tolist())
     return {'event_date': date, 'adjustments': load_adjustments(date, slug), 'players': names}
 
 

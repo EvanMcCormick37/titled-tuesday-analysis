@@ -43,6 +43,12 @@ _PLAYER_ALIASES:dict[str, str] = {
     'V Pranav':'Pranav Venkatesh',
     'Pranesh M':'Pranesh Munirethinam',
     "D Gukesh": "Gukesh D",
+    # Bullet Brawl contract names
+    'Alexandre Edisherashvili':'Aleksandre Edisherashvili',
+    'Johnatan Bakalchuk':'Johnathan Bakalchuk',
+    'Aleksandr Logachiov':'Alexander Logachiov',
+    'Brayan Steven Chavez':'Brayan Stiven Chavez Duero',
+    'Witold Lechowski':'Witek Lechowski',
 }
 
 _USERNAME_TO_PLAYER:dict | None = None
@@ -149,6 +155,91 @@ def get_username_mappings() -> tuple[dict, dict]:
     return _USERNAME_TO_PLAYER, _PLAYER_TO_USERNAME
 
 
+# ── Per-market name → username ────────────────────────────────────────────────
+
+_MARKET_MAP_TTL_SECONDS = 600
+_market_latest_cache: dict[str, tuple[float, dict[str, str]]] = {}
+
+
+def _norm_words(name: str) -> frozenset[str]:
+    """Lowercase words with diacritics and punctuation removed."""
+    import re
+    import unicodedata
+    plain = ''.join(c for c in unicodedata.normalize('NFD', name or '') if unicodedata.category(c) != 'Mn')
+    return frozenset(re.findall(r"[a-z0-9]+", plain.lower()))
+
+
+def _latest_appearance(spec: MarketSpec) -> dict[str, str]:
+    """username → latest event date in this market's standings. Cached for ten minutes."""
+    import time
+    cached = _market_latest_cache.get(spec.slug)
+    if cached and time.monotonic() - cached[0] < _MARKET_MAP_TTL_SECONDS:
+        return cached[1]
+    with get_conn() as conn:
+        rows = conn.execute(
+            f'SELECT username, MAX(CAST(date AS TEXT)) FROM {spec.model.standings_table} GROUP BY username'
+        ).fetchall()
+    latest = {u: str(d) for u, d in rows}
+    _market_latest_cache[spec.slug] = (time.monotonic(), latest)
+    return latest
+
+
+def market_player_to_username(usernames, spec: MarketSpec = TITLED_TUESDAY) -> dict[str, str]:
+    """Player name → the account that player uses in this market.
+
+    A player can have several chess.com accounts and use a different one per
+    event, so the global default (most recent in Titled Tuesday) is not enough.
+    Only usernames in `usernames` (normally the prediction index) are candidates;
+    among a player's candidates the one seen most recently in this market wins,
+    then the global default. Aliases are added, and a candidate with no known
+    display name maps from its own username.
+    """
+    pool = set(usernames)
+    latest = _latest_appearance(spec)
+    with get_conn() as conn:
+        _ensure_is_default(conn)
+        rows = conn.execute(
+            'SELECT username, player_name, is_default FROM player_information WHERE player_name IS NOT NULL'
+        ).fetchall()
+    best: dict[str, tuple[tuple, str]] = {}
+    named: set[str] = set()
+    for username, name, is_default in rows:
+        if username not in pool:
+            continue
+        named.add(username)
+        key = (latest.get(username, ''), bool(is_default), username)
+        if name not in best or key > best[name][0]:
+            best[name] = (key, username)
+    out = {name: u for name, (_, u) in best.items()}
+    for alias, canonical in _PLAYER_ALIASES.items():
+        if canonical in out and alias not in out:
+            out[alias] = out[canonical]
+    for username in pool - named:
+        out.setdefault(username, username)
+    return out
+
+
+def match_player(name: str, name_to_username: dict[str, str]) -> str | None:
+    """Look up a betting-line name, falling back to an unambiguous word-set match.
+
+    Kalshi often drops or adds a name part ("Renato Terry" for "Renato Terry
+    Celis"). A fallback match needs at least two shared words, every word of the
+    shorter name present in the longer one, and exactly one such candidate.
+    """
+    if name in name_to_username:
+        return name_to_username[name]
+    words = _norm_words(name)
+    if len(words) < 2:
+        return None
+    hits = {u for cand, u in name_to_username.items()
+            if len(cw := _norm_words(cand)) >= 2 and (cw <= words or words <= cw)}
+    return hits.pop() if len(hits) == 1 else None
+
+
+def invalidate_market_maps() -> None:
+    _market_latest_cache.clear()
+
+
 # ── Attendance-conflict Z_part reduction ──────────────────────────────────────
 
 def _conflict_z_deduction(conn, ref: pd.Timestamp,
@@ -239,6 +330,8 @@ def load_and_prepare(scheduling_conflict=None, cut_players=None, keep_players=No
 
     engine = get_engine()
     q = f"SELECT * FROM {model.standings_table} WHERE date >= '{model.data_cutoff}'"
+    if model.played_filter:
+        q += f' AND {model.played_filter}'
     if as_of:
         q += f" AND substr(CAST(date AS TEXT), 1, 10) < '{ref.date()}'"
     df = pd.read_sql_query(q, engine)

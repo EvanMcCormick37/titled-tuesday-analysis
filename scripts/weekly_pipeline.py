@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""Weekly data pipeline — the single scheduled entry point.
+"""Weekly data pipeline — the scheduled entry point for every market.
 
-Titled Tuesday runs the three pre-trade steps as one resumable state machine
-(see src/pipeline_runner.py):
+Each market runs its pre-trade steps as one resumable state machine
+(see src/pipeline_runner.py). The step names come from the MarketSpec:
 
-    scrape_tt → update_broadcasts → run_raw → ADJUSTMENTS_PENDING
+    Titled Tuesday:  scrape_tt → update_broadcasts → run_raw → ADJUSTMENTS_PENDING
+    Bullet Brawl:    scrape_bb → update_broadcasts → run_raw → ADJUSTMENTS_PENDING
 
 Usage:
     python scripts/weekly_pipeline.py
+    python scripts/weekly_pipeline.py --market bullet_brawl
     python scripts/weekly_pipeline.py --resume update_broadcasts
     python scripts/weekly_pipeline.py --slug-url https://chess.com/tournament/live/titled-tuesday-blitz-...
 """
@@ -31,7 +33,7 @@ sys.path.insert(0, str(PROJECT_ROOT / 'scripts' / 'scraping'))
 
 import requests  # for RequestException classification
 
-from src.markets import TITLED_TUESDAY
+from src.markets import BULLET_BRAWL, TITLED_TUESDAY, MarketSpec
 from src.pipeline import run_raw, next_tourn_date
 from src.pipeline_runner import PipelineDef
 from src.pipeline_runner import run_pipeline as run_market_pipeline
@@ -43,8 +45,7 @@ from update_titled_tuesday import (
     process as process_slug,
 )
 from update_broadcasts import run as run_update_broadcasts
-
-STEPS = ('scrape_tt', 'update_broadcasts', 'run_raw')
+import update_bullet_brawl
 
 
 def _classify_error(step: str, exc: BaseException) -> str:
@@ -85,14 +86,14 @@ def step_scrape_tt(slug_override: str | None = None) -> dict:
     return {'mode': 'listing', 'slugs': new}
 
 
-def step_update_broadcasts() -> dict:
-    return run_update_broadcasts(months=2)
+def step_update_broadcasts(spec: MarketSpec = TITLED_TUESDAY) -> dict:
+    return run_update_broadcasts(months=2, spec=spec)
 
 
-def step_run_raw() -> dict:
-    """Run the raw (unadjusted) MC simulation for the upcoming TT."""
-    target = next_tourn_date()
-    raw = run_raw(target, save_to_db=True)
+def step_run_raw(spec: MarketSpec = TITLED_TUESDAY) -> dict:
+    """Run the raw (unadjusted) MC simulation for the market's next event."""
+    target = next_tourn_date(spec)
+    raw = run_raw(target, save_to_db=True, spec=spec)
     return {
         'tourn_date_predicted': target,
         'pool_size':            len(raw.players),
@@ -100,14 +101,28 @@ def step_run_raw() -> dict:
     }
 
 
-def _run_tt_step(step: str, slug_override: str | None) -> dict:
-    if step == 'scrape_tt':
-        return step_scrape_tt(slug_override=slug_override)
-    return {'update_broadcasts': step_update_broadcasts, 'run_raw': step_run_raw}[step]()
+def _step_runner(spec: MarketSpec, scrape):
+    """(step, slug_override) -> summary, for a market whose first step is `scrape`."""
+    first = spec.pipeline_steps[0]
+
+    def run_step(step: str, slug_override: str | None) -> dict:
+        if step == first:
+            return scrape(slug_override)
+        if step == 'update_broadcasts':
+            return step_update_broadcasts(spec)
+        if step == 'run_raw':
+            return step_run_raw(spec)
+        raise ValueError(f'{spec.slug} has no step {step!r}')
+    return run_step
+
+
+def _pipeline(spec: MarketSpec, scrape) -> PipelineDef:
+    return PipelineDef(spec, spec.pipeline_steps, _step_runner(spec, scrape), _classify_error)
 
 
 PIPELINES = {
-    TITLED_TUESDAY.slug: PipelineDef(TITLED_TUESDAY, STEPS, _run_tt_step, _classify_error),
+    TITLED_TUESDAY.slug: _pipeline(TITLED_TUESDAY, lambda url: step_scrape_tt(slug_override=url)),
+    BULLET_BRAWL.slug:   _pipeline(BULLET_BRAWL, update_bullet_brawl.run),
 }
 
 

@@ -2,17 +2,20 @@
 """
 Walk-forward joint backtest of MC ranking-signal variants.
 
-For every Titled Tuesday from --start (default 2025-11-04, the first single-
-session TT) to the latest tournament in the DB, restricts training data to
-everything before that date and runs the MC pipeline once per selected model.
+For every event of --market from --start to the latest event in the DB, restricts
+training data to everything before that date and runs the MC pipeline once per
+selected model.
 
-Supported models (--models):
+Titled Tuesday models (--models):
   score                (score*10000 + tiebreak)   — production default
   perf                 performance_rating (aroc-based Elo estimate)
   score_smooth         score-composite with WIDE gaussian smoothing   (sigma = 0.5 score-points)
   score_smooth_narrow  score-composite with NARROW gaussian smoothing (sigma ~ 2x tiebreak scale)
 
-Attendance is computed from the single-session era only (>= 2025-09-02),
+Bullet Brawl models:
+  score, score_smooth_3, score_smooth_10   (gaussian sigma of 0, 3 and 10 score-points)
+
+Titled Tuesday attendance is computed from the single-session era only (>= 2025-09-02),
 regardless of how far back skill history is allowed to reach.
 
 Each run is recorded in data/backtests.db with its settings and git commit, so
@@ -27,12 +30,14 @@ Usage
     python scripts/run_backtest.py --models score_smooth_narrow
     python scripts/run_backtest.py --start 2025-11-04 --sims 100000
     python scripts/run_backtest.py --sample 3         # quick smoke test
+    python scripts/run_backtest.py --market bullet_brawl --notes "sigma comparison"
 """
 
 import argparse
 import sqlite3
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -42,32 +47,54 @@ import numpy as np
 import pandas as pd
 
 from src.config import (
-    DB_PATH, N_SIMS, DATA_START,
+    DB_PATH, N_SIMS, DATA_START, SCORE_COMPOSITE_SCALE,
     SCORE_GAUSSIAN_KERNEL_SIGMA_WIDE, SCORE_GAUSSIAN_KERNEL_SIGMA_NARROW,
 )
 from src import backtest_runs
 from src.data import load_and_prepare
 from src.db import is_postgres
-from src.markets import TITLED_TUESDAY
+from src.markets import BULLET_BRAWL, TITLED_TUESDAY, MarketSpec
 from src.simulation import (
     build_player_pool_score, build_player_pool_perf,
     run_simulation_ranked, build_results,
 )
 
-BACKTEST_START     = '2025-11-04'
 N_VALUES           = [1, 3, 5, 8, 10]
 BASE_SEED          = 42
 MIN_APP            = 5
-ALL_MODELS         = ('score', 'perf', 'score_smooth', 'score_smooth_narrow')
-DEFAULT_MODELS     = ALL_MODELS
 
-# Per-model gaussian-smoothing sigma applied to sampled signals in run_simulation_ranked.
-# Units are composite-signal units (score * SCORE_COMPOSITE_SCALE + tiebreak).
-MODEL_NOISE_SIGMA = {
-    'score':               0.0,
-    'perf':                0.0,
-    'score_smooth':        SCORE_GAUSSIAN_KERNEL_SIGMA_WIDE,
-    'score_smooth_narrow': SCORE_GAUSSIAN_KERNEL_SIGMA_NARROW,
+
+@dataclass(frozen=True)
+class BacktestProfile:
+    spec: MarketSpec
+    start: str
+    attendance_start: str | None
+    # Gaussian sigma per model, in composite-signal units (score * SCORE_COMPOSITE_SCALE + tiebreak).
+    noise_sigma: dict[str, float]
+
+
+PROFILES = {
+    TITLED_TUESDAY.slug: BacktestProfile(
+        spec=TITLED_TUESDAY,
+        start='2025-11-04',      # the first single-session Titled Tuesday
+        attendance_start=DATA_START,
+        noise_sigma={
+            'score':               0.0,
+            'perf':                0.0,
+            'score_smooth':        SCORE_GAUSSIAN_KERNEL_SIGMA_WIDE,
+            'score_smooth_narrow': SCORE_GAUSSIAN_KERNEL_SIGMA_NARROW,
+        },
+    ),
+    BULLET_BRAWL.slug: BacktestProfile(
+        spec=BULLET_BRAWL,
+        start='2024-01-06',      # leaves all of 2023 as starting history
+        attendance_start=None,
+        noise_sigma={
+            'score':           0.0,
+            'score_smooth_3':  3 * SCORE_COMPOSITE_SCALE,
+            'score_smooth_10': 10 * SCORE_COMPOSITE_SCALE,
+        },
+    ),
 }
 
 
@@ -93,16 +120,10 @@ def _ensure_table(conn: sqlite3.Connection) -> None:
 
 def _run_one_model(
     kind: str, df, p_participate, app_counts,
-    n_sims: int, seed: int,
+    n_sims: int, seed: int, noise_sigma: float,
 ) -> pd.DataFrame:
-    if kind in ('score', 'score_smooth', 'score_smooth_narrow'):
-        pool = build_player_pool_score(df, p_participate, app_counts,
-                                       min_appearances=MIN_APP)
-    elif kind == 'perf':
-        pool = build_player_pool_perf(df, p_participate, app_counts,
-                                      min_appearances=MIN_APP)
-    else:
-        raise ValueError(f'unknown model kind: {kind}')
+    builder = build_player_pool_perf if kind == 'perf' else build_player_pool_score
+    pool = builder(df, p_participate, app_counts, min_appearances=MIN_APP)
 
     players, p_play, hist_signals, hist_wts = pool
     if len(players) < max(N_VALUES):
@@ -111,7 +132,7 @@ def _run_one_model(
     plays_ct, topn_ct = run_simulation_ranked(
         players, p_play, hist_signals, hist_wts,
         n_sims=n_sims, n_values=N_VALUES, seed=seed,
-        noise_sigma=MODEL_NOISE_SIGMA[kind],
+        noise_sigma=noise_sigma,
     )
     return build_results(
         players, p_play, plays_ct, topn_ct,
@@ -119,18 +140,17 @@ def _run_one_model(
     )
 
 
-def _fetch_actuals(conn: sqlite3.Connection, tourn_date: str) -> pd.DataFrame:
+def _fetch_actuals(conn: sqlite3.Connection, spec: MarketSpec, tourn_date: str) -> pd.DataFrame:
     """Return {username -> rank} for players who played on tourn_date."""
+    played = f' AND {spec.model.played_filter}' if spec.model.played_filter else ''
     return pd.read_sql_query(
-        """SELECT username, rank
-           FROM titled_tuesday_standings
-           WHERE date(date) = ?""",
+        f'SELECT username, rank FROM {spec.model.standings_table} WHERE date(date) = ?{played}',
         conn, params=(tourn_date,),
     ).set_index('username')
 
 
 def _write(
-    conn: sqlite3.Connection, store: sqlite3.Connection, run_id: int,
+    conn: sqlite3.Connection, store: sqlite3.Connection, run_id: int, market: str,
     tourn_date: str, model: str, results: pd.DataFrame, actuals: pd.DataFrame,
 ) -> int:
     out = results[['p_participate'] +
@@ -142,43 +162,55 @@ def _write(
     out.insert(0, 'tourn_date', tourn_date)
 
     conn.execute(
-        "DELETE FROM backtest WHERE market = 'titled_tuesday' AND tourn_date = ? AND model = ?",
-        (tourn_date, model),
+        'DELETE FROM backtest WHERE market = ? AND tourn_date = ? AND model = ?',
+        (market, tourn_date, model),
     )
-    out.to_sql('backtest', conn, if_exists='append', index=False)
+    out.assign(market=market).to_sql('backtest', conn, if_exists='append', index=False)
     backtest_runs.save_predictions(store, run_id, out)
     return len(out)
 
 
 def run_backtest(
-    start_date: str = BACKTEST_START,
+    market: str = TITLED_TUESDAY.slug,
+    start_date: str | None = None,
     n_sims: int     = N_SIMS,
     base_seed: int  = BASE_SEED,
     sample: int     = None,
-    attendance_start: str = DATA_START,
-    models: tuple  = DEFAULT_MODELS,
+    attendance_start: str | None = None,
+    models: tuple | None = None,
     notes: str     = None,
 ) -> int:
-    """Run the walk-forward backtest and return its run_id."""
+    """Run the walk-forward backtest and return its run_id.
+
+    start_date and models default to the market's profile. attendance_start is used
+    as given: None computes attendance from full history with any season shift.
+    """
     if is_postgres():
         raise RuntimeError('Backtests run on the local SQLite snapshot. Unset DATABASE_URL.')
 
-    model_config = TITLED_TUESDAY.model
+    profile = PROFILES[market]
+    start_date = start_date or profile.start
+    models = tuple(models or profile.noise_sigma)
+    unknown = set(models) - set(profile.noise_sigma)
+    if unknown:
+        raise ValueError(f'{market} has no models {sorted(unknown)}; choose from {list(profile.noise_sigma)}')
+    model_config = profile.spec.model
     settings = {
         'start_date': start_date, 'attendance_start': attendance_start, 'n_sims': n_sims,
         'base_seed': base_seed, 'sample': sample, 'n_values': N_VALUES, 'min_appearances': MIN_APP,
-        'noise_sigma': {m: MODEL_NOISE_SIGMA[m] for m in models},
+        'noise_sigma': {m: profile.noise_sigma[m] for m in models},
         'skill_decay': model_config.skill_decay,
         'participation_decay': model_config.participation_decay,
         'min_participation_rate': model_config.min_participation_rate,
         'data_cutoff': model_config.data_cutoff,
-        'season_shift_applied': attendance_start is None,
+        'season_shift_applied': attendance_start is None and model_config.season_shift_date is not None,
+        'played_filter': model_config.played_filter,
     }
     store = backtest_runs.connect()
-    run_id = backtest_runs.start_run(store, TITLED_TUESDAY.slug, models, settings, notes)
+    run_id = backtest_runs.start_run(store, market, models, settings, notes)
     print(f'Backtest run {run_id}')
     try:
-        _run_events(run_id, store, start_date, n_sims, base_seed, sample, attendance_start, models)
+        _run_events(run_id, store, profile, start_date, n_sims, base_seed, sample, attendance_start, models)
     except BaseException as exc:
         backtest_runs.finish_run(store, run_id, f'{type(exc).__name__}: {exc}')
         raise
@@ -189,16 +221,14 @@ def run_backtest(
     return run_id
 
 
-def _run_events(run_id, store, start_date, n_sims, base_seed, sample, attendance_start, models) -> None:
+def _run_events(run_id, store, profile, start_date, n_sims, base_seed, sample, attendance_start, models) -> None:
     t0 = time.time()
+    spec = profile.spec
 
     conn = sqlite3.connect(DB_PATH)
     _ensure_table(conn)
     rows = conn.execute(
-        """SELECT DISTINCT date(date) AS d
-           FROM titled_tuesday_standings
-           WHERE date(date) >= ?
-           ORDER BY d""",
+        f'SELECT DISTINCT date(date) AS d FROM {spec.model.standings_table} WHERE date(date) >= ? ORDER BY d',
         (start_date,),
     ).fetchall()
     dates = [r[0] for r in rows]
@@ -213,33 +243,35 @@ def _run_events(run_id, store, start_date, n_sims, base_seed, sample, attendance
         print(f'[{i+1:>3}/{n_total}] {t_date}')
 
         df, p_participate, app_counts = load_and_prepare(
-            as_of=t_date, attendance_start=attendance_start,
+            as_of=t_date, attendance_start=attendance_start, spec=spec,
         )
         if df.empty:
             print('  SKIP: no historical data before this date')
             continue
 
-        actuals = _fetch_actuals(conn, t_date)
+        actuals = _fetch_actuals(conn, spec, t_date)
         if actuals.empty:
             print('  SKIP: no actuals for this date')
             continue
 
-        n_perf_avail = df['performance_rating'].notna().sum()
-        n_perf_total = len(df)
-        perf_coverage = n_perf_avail / n_perf_total if n_perf_total else 0
-        if perf_coverage < 0.90:
-            print(f'  WARN: perf-rating coverage {perf_coverage:.1%} '
-                  f'({n_perf_avail:,}/{n_perf_total:,} hist rows)')
+        if 'perf' in models:
+            n_perf_avail = df['performance_rating'].notna().sum()
+            n_perf_total = len(df)
+            perf_coverage = n_perf_avail / n_perf_total if n_perf_total else 0
+            if perf_coverage < 0.90:
+                print(f'  WARN: perf-rating coverage {perf_coverage:.1%} '
+                      f'({n_perf_avail:,}/{n_perf_total:,} hist rows)')
 
         for j, model in enumerate(models):
             results = _run_one_model(
                 model, df, p_participate, app_counts,
                 n_sims=n_sims, seed=base_seed + i * 10 + j,
+                noise_sigma=profile.noise_sigma[model],
             )
             if results.empty:
                 print(f'  SKIP {model}: pool too small')
                 continue
-            n_written = _write(conn, store, run_id, t_date, model, results, actuals)
+            n_written = _write(conn, store, run_id, spec.slug, t_date, model, results, actuals)
             n_played  = int(results.index.isin(actuals.index).sum())
             print(f'  {model:5s}: pool={len(results):,}  '
                   f'played={n_played:,}  rows_written={n_written:,}')
@@ -257,21 +289,21 @@ if __name__ == '__main__':
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument('--start',            default=BACKTEST_START)
-    parser.add_argument('--attendance-start', default=DATA_START)
+    parser.add_argument('--market',           choices=sorted(PROFILES), default=TITLED_TUESDAY.slug)
+    parser.add_argument('--start',            help="default: the market's first backtest date")
+    parser.add_argument('--attendance-start', help="default: the market's attendance window")
     parser.add_argument('--sims',             type=int, default=N_SIMS)
     parser.add_argument('--sample',           type=int, default=None)
-    parser.add_argument('--models',           nargs='+', default=list(DEFAULT_MODELS),
-                        choices=list(ALL_MODELS),
-                        help='which model variants to run')
+    parser.add_argument('--models',           nargs='+', help="which model variants to run (default: all for the market)")
     parser.add_argument('--notes', help='what this run is testing; shown in the run list')
     args = parser.parse_args()
 
     run_backtest(
+        market           = args.market,
         start_date       = args.start,
         n_sims           = args.sims,
         sample           = args.sample,
-        attendance_start = args.attendance_start,
-        models           = tuple(args.models),
+        attendance_start = args.attendance_start or PROFILES[args.market].attendance_start,
+        models           = args.models,
         notes            = args.notes,
     )

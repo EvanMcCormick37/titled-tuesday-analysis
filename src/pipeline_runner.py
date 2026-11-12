@@ -2,7 +2,7 @@
 
 Steps are strictly ordered. A failure halts the run, records
 `pipeline_runs.state = 'failed'` with a classified `error_kind`, and the dashboard
-or Telegram bot can resume from the failed step. Each step must be idempotent.
+can resume from the failed step. Each step must be idempotent.
 """
 from __future__ import annotations
 

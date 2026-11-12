@@ -7,7 +7,7 @@ import pytest
 
 from src import data, db
 from src.data import load_and_prepare
-from src.markets import TITLED_TUESDAY
+from src.markets import BULLET_BRAWL, TITLED_TUESDAY
 
 EVENTS = pd.date_range('2026-06-02', '2026-11-03', freq='7D')
 POST_SHIFT = EVENTS[EVENTS >= pd.Timestamp(TITLED_TUESDAY.model.season_shift_date)]
@@ -42,6 +42,23 @@ def _shift_weights(as_of: str, dates) -> np.ndarray:
     k = np.array([(pd.Timestamp(as_of) - d) // pd.Timedelta(weeks=1) for d in dates])
     shift = np.where(dates < pd.Timestamp(model.season_shift_date), model.season_shift_factor, 1.0)
     return model.participation_decay ** k * shift
+
+
+def test_bullet_brawl_zero_game_rows_do_not_count_as_attending():
+    dates = pd.date_range('2026-09-05', '2026-10-31', freq='7D')
+    rows = [{'date': f'{d.date()} 00:00:00+00:00', 'tournament_slug': f'b{d.date()}', 'rank': r, 'username': u,
+             'score': 100.0 if games else 0.0, 'tie_break': 0.0, 'games': games}
+            for d in dates
+            for r, (u, games) in enumerate([('always', 20), ('registered', 0)], 1)]
+    rows += [{**rows[0], 'username': 'once', 'rank': 3.0}]
+    pd.DataFrame(rows).to_sql('bullet_brawl_standings', db.get_engine(), index=False)
+
+    df, p_participate, _ = load_and_prepare(as_of='2026-11-07', spec=BULLET_BRAWL)
+
+    assert 'registered' not in set(df['username'])
+    assert 'registered' not in p_participate.index
+    assert p_participate['always'] == pytest.approx(1.0)
+    assert p_participate['once'] < 0.2
 
 
 def test_season_shift_date():

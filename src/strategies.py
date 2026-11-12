@@ -15,7 +15,7 @@ from typing import Any, Callable, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import job_queue, market_views, trading
-from .markets import TITLED_TUESDAY, MarketSpec
+from .markets import BULLET_BRAWL, TITLED_TUESDAY, MarketSpec
 from .trade_plan import Emit, Plan
 
 
@@ -201,7 +201,7 @@ def _market_for(spec: MarketSpec) -> Market:
     )
 
 
-MARKETS: dict[str, Market] = {TITLED_TUESDAY.slug: _market_for(TITLED_TUESDAY)}
+MARKETS: dict[str, Market] = {s.slug: _market_for(s) for s in (TITLED_TUESDAY, BULLET_BRAWL)}
 
 
 class SubmissionError(ValueError):

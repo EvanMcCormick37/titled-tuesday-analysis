@@ -232,8 +232,24 @@ def test_event_date_helpers():
     assert TITLED_TUESDAY.most_recent_event(date(2026, 11, 9)) == date(2026, 11, 3)
 
 
-def test_bullet_brawl_cannot_be_traded_yet():
-    assert BB not in strategies.MARKETS
+def test_bullet_brawl_is_registered_with_its_own_spec():
+    market = strategies.MARKETS[BB]
+    assert market.spec is BULLET_BRAWL
+    assert set(market.strategies) == set(strategies.MARKETS[TT].strategies)
+    assert BULLET_BRAWL.pipeline_steps[0] == 'scrape_bb'
+    assert BULLET_BRAWL.model.score_noise_sigma == 10.0
+    assert TITLED_TUESDAY.model.score_noise_sigma == 0.0
+
+
+def test_every_market_has_a_pipeline():
+    import sys
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    sys.path[:0] = [str(root / 'scripts'), str(root / 'scripts' / 'scraping')]
+    import weekly_pipeline
+    assert set(weekly_pipeline.PIPELINES) == set(strategies.MARKETS)
+    for slug, defn in weekly_pipeline.PIPELINES.items():
+        assert defn.steps == strategies.MARKETS[slug].spec.pipeline_steps
 
 
 class _BrawlClient:
@@ -253,7 +269,7 @@ def test_trading_uses_the_spec(monkeypatch):
                          index=pd.Index(['a'], name='username'))
     seen = []
     monkeypatch.setattr(trading, '_load_predictions', lambda market: seen.append(market) or preds)
-    monkeypatch.setattr(trading, 'get_username_mappings', lambda: ({}, {'Player A': 'a'}))
+    monkeypatch.setattr(trading, 'market_player_to_username', lambda usernames, spec: {'Player A': 'a'})
     client = _BrawlClient()
     plan = trading.plan_place_bids(client, '2026-11-14', count=1, sleep_read=0, spec=BULLET_BRAWL)
     assert seen == [BB]

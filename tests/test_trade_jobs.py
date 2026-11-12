@@ -104,8 +104,8 @@ def model(monkeypatch):
         'P_top8_given_play': [0.8, 0.5],
     }, index=pd.Index(['a', 'b'], name='username'))
     monkeypatch.setattr(trading, '_load_predictions', lambda market=MARKET: preds.copy())
-    monkeypatch.setattr(trading, 'get_username_mappings',
-                        lambda: ({}, {'Player A': 'a', 'Player B': 'b'}))
+    monkeypatch.setattr(trading, 'market_player_to_username',
+                        lambda usernames, spec: {'Player A': 'a', 'Player B': 'b'})
 
 
 def submit_take(backend=None, **kw):

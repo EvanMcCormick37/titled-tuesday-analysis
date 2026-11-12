@@ -10,8 +10,6 @@ import { LogEntry } from './Logs';
 type Run = { id: number; tourn_date: string; state: string; failed_step: string | null; error_kind: string | null; started_at: string | null; completed_at: string | null };
 type Data = { runs: Run[]; steps: LogRow[] };
 
-const STEPS = ['scrape_tt', 'update_broadcasts', 'run_raw'];
-
 export default function Pipeline() {
   const { market, status, openJob, toast } = useApp();
   const queryClient = useQueryClient();
@@ -46,7 +44,7 @@ export default function Pipeline() {
         {q.error && <ErrorNote error={q.error} />}
         {p?.state === 'failed' && p.error_kind === 'listing_missing_slug' ? (
           <form className="row" onSubmit={(e) => { e.preventDefault(); run.mutate(url); }}>
-            <input aria-label="Tournament URL" placeholder="https://www.chess.com/tournament/live/titled-tuesday-blitz-…" value={url} onChange={(e) => setUrl(e.target.value)} />
+            <input aria-label="Tournament URL" placeholder={market.event_url_example} value={url} onChange={(e) => setUrl(e.target.value)} />
             <button className="btn primary" disabled={!url.trim() || run.isPending}>Scrape this URL</button>
           </form>
         ) : (
@@ -57,7 +55,7 @@ export default function Pipeline() {
         )}
         <h3>Steps</h3>
         <ol className="steps">
-          {STEPS.map((name) => {
+          {market.pipeline_steps.map((name) => {
             const s = latestByStep.get(name);
             return <LogEntry key={name} title={humanize(name)} row={s} />;
           })}

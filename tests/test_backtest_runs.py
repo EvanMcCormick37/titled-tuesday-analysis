@@ -114,6 +114,22 @@ def test_snapshot_copies_data_and_skips_operational_tables(postgres, tmp_path, m
     conn.close()
 
 
+def test_snapshot_keeps_locally_backfilled_tables(postgres, tmp_path, monkeypatch):
+    import pull_snapshot
+    monkeypatch.delenv('DATABASE_URL', raising=False)
+    dest = tmp_path / 'copy.db'
+    pull_snapshot.pull(postgres, dest)
+    conn = sqlite3.connect(dest)
+    conn.execute("INSERT INTO bullet_brawl_standings (tournament_slug, username) VALUES ('s', 'u')")
+    conn.commit()
+    conn.close()
+
+    pull_snapshot.pull(postgres, dest)
+    conn = sqlite3.connect(dest)
+    assert conn.execute('SELECT COUNT(*) FROM bullet_brawl_standings').fetchone()[0] == 1
+    conn.close()
+
+
 def test_snapshot_connection_is_read_only(postgres):
     import pull_snapshot
     import sqlalchemy
@@ -138,3 +154,29 @@ def test_failed_snapshot_keeps_the_existing_file(postgres, tmp_path, monkeypatch
     with pytest.raises(RuntimeError):
         pull_snapshot.pull(postgres, dest)
     assert dest.read_text() == 'previous' and not dest.with_suffix('.partial').exists()
+
+
+def _backtest_module():
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'scripts'))
+    import run_backtest
+    return run_backtest
+
+
+def test_bullet_brawl_backtest_sigmas_are_in_score_points():
+    profile = _backtest_module().PROFILES['bullet_brawl']
+    assert profile.noise_sigma == {'score': 0.0, 'score_smooth_3': 30_000.0, 'score_smooth_10': 100_000.0}
+
+
+def test_actuals_leave_out_registered_players_who_never_played():
+    import sqlite3
+    run_backtest = _backtest_module()
+    conn = sqlite3.connect(':memory:')
+    conn.execute('CREATE TABLE bullet_brawl_standings (date TEXT, username TEXT, rank REAL, games INTEGER)')
+    conn.executemany('INSERT INTO bullet_brawl_standings VALUES (?, ?, ?, ?)', [
+        ('2026-11-07 00:00:00+00:00', 'played', 1.0, 20),
+        ('2026-11-07 00:00:00+00:00', 'no_show', 90.0, 0),
+    ])
+    actuals = run_backtest._fetch_actuals(conn, run_backtest.BULLET_BRAWL, '2026-11-07')
+    assert list(actuals.index) == ['played']

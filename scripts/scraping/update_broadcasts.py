@@ -37,6 +37,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 sys.path.insert(0, str(PROJECT_ROOT / 'scripts'))
 
 from src.db import get_conn, table_columns, upsert_many
+from src.markets import SPECS, TITLED_TUESDAY, MarketSpec
 from build_attendance_conflicts import build_attendance_conflicts
 
 BASE_URL = 'https://database.lichess.org/broadcast'
@@ -239,8 +240,8 @@ def _upsert(conn, ev: dict, rnd: dict) -> None:
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
-def run(months: int = 2) -> dict:
-    """Refresh the last `months` months of broadcast data; rebuild conflicts.
+def run(months: int = 2, spec: MarketSpec = TITLED_TUESDAY) -> dict:
+    """Refresh the last `months` months of broadcast data; rebuild `spec`'s conflicts.
 
     Returns a summary dict suitable for stashing in `job_runs.summary`.
     """
@@ -254,10 +255,10 @@ def run(months: int = 2) -> dict:
         _upsert(conn, ev, rnd)
 
         print('Rebuilding attendance_conflicts ...')
-        n_conflicts = build_attendance_conflicts(conn)
+        n_conflicts = build_attendance_conflicts(conn, spec)
         n_dates, n_users = conn.execute(
-            "SELECT COUNT(DISTINCT date), COUNT(DISTINCT username) FROM attendance_conflicts "
-            "WHERE market = 'titled_tuesday'"
+            'SELECT COUNT(DISTINCT date), COUNT(DISTINCT username) FROM attendance_conflicts '
+            'WHERE market = ?', (spec.slug,)
         ).fetchone()
 
     return {
@@ -276,8 +277,10 @@ def main() -> None:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--months', type=int, default=2,
                     help='how many trailing months to refresh (default 2)')
+    ap.add_argument('--market', choices=sorted(SPECS), default=TITLED_TUESDAY.slug,
+                    help='whose attendance_conflicts to rebuild')
     args = ap.parse_args()
-    summary = run(months=args.months)
+    summary = run(months=args.months, spec=SPECS[args.market])
     print(f'OK — {summary}')
 
 

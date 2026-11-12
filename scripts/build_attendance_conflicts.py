@@ -1,8 +1,9 @@
 """
 build_attendance_conflicts.py — Populate the attendance_conflicts table.
 
-A conflict is a (TT date, player) pair where the player was in a concurrent
-OTB broadcast whose earliest-start-UTC date lands on a Titled Tuesday.  These
+A conflict is a (event date, player) pair where the player was in a concurrent
+OTB broadcast whose earliest-start-UTC date lands on one of the market's event
+dates.  These
 weeks are excluded from EWMA participation-rate calculations in
 src.data.load_and_prepare() so that p_participate reflects the player's
 attendance rate on weeks where they had no unavoidable conflict.
@@ -11,8 +12,10 @@ Each run replaces only the given market's rows; defaults to Titled Tuesday.
 
 Usage:
     python scripts/build_attendance_conflicts.py
+    python scripts/build_attendance_conflicts.py --market bullet_brawl
 """
 
+import argparse
 import sys
 import unicodedata
 from collections import defaultdict
@@ -22,7 +25,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.db import get_conn
-from src.markets import TITLED_TUESDAY, MarketSpec
+from src.markets import SPECS, TITLED_TUESDAY, MarketSpec
 
 
 def _norm_name(s: str) -> str:
@@ -43,18 +46,25 @@ def build_attendance_conflicts(conn, spec: MarketSpec = TITLED_TUESDAY) -> int:
         f'SELECT DISTINCT substr(CAST(date AS TEXT), 1, 10) FROM {spec.model.standings_table}'
     ).fetchall()}
 
-    # 2. norm(player_name) → (username, player_name), preferring is_default=1
+    # 2. norm(player_name) → (username, player_name). A player's account seen most
+    #    recently in this market wins, then is_default, so the conflict lands on the
+    #    account whose attendance it corrects.
+    latest = dict(conn.execute(
+        f'SELECT username, MAX(CAST(date AS TEXT)) FROM {spec.model.standings_table} GROUP BY username'
+    ).fetchall())
     pi_rows = conn.execute(
         'SELECT username, player_name, is_default FROM player_information '
         'WHERE player_name IS NOT NULL'
     ).fetchall()
-    name_to_player: dict[str, tuple[str, str]] = {}
+    ranked: dict[str, tuple[tuple, str, str]] = {}
     for uname, pname, is_def in pi_rows:
         n = _norm_name(pname)
         if not n:
             continue
-        if n not in name_to_player or is_def:
-            name_to_player[n] = (uname, pname)
+        key = (str(latest.get(uname) or ''), bool(is_def))
+        if n not in ranked or key > ranked[n][0]:
+            ranked[n] = (key, uname, pname)
+    name_to_player = {n: (u, p) for n, (_, u, p) in ranked.items()}
 
     # 3. broadcast → set of TT-date rounds
     broadcast_tt_dates: dict[str, set[str]] = defaultdict(set)
@@ -96,15 +106,18 @@ def build_attendance_conflicts(conn, spec: MarketSpec = TITLED_TUESDAY) -> int:
 
 
 def main() -> None:
-    print('Building attendance_conflicts...')
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument('--market', choices=sorted(SPECS), default=TITLED_TUESDAY.slug)
+    spec = SPECS[ap.parse_args().market]
+    print(f'Building attendance_conflicts for {spec.label}...')
     conn = get_conn()
     try:
-        build_attendance_conflicts(conn)
+        build_attendance_conflicts(conn, spec)
         n_dates, n_users = conn.execute(
-            "SELECT COUNT(DISTINCT date), COUNT(DISTINCT username) FROM attendance_conflicts "
-            "WHERE market = 'titled_tuesday'"
+            'SELECT COUNT(DISTINCT date), COUNT(DISTINCT username) FROM attendance_conflicts '
+            'WHERE market = ?', (spec.slug,)
         ).fetchone()
-        print(f'  Distinct TT dates with any conflict: {n_dates}')
+        print(f'  Distinct event dates with any conflict: {n_dates}')
         print(f'  Distinct players with any conflict:  {n_users}')
     finally:
         conn.close()

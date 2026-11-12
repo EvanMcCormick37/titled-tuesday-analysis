@@ -1,28 +1,28 @@
-# Railway service config for Titled Tuesday — Phase 1 (tt-cron only).
+# Railway service config shared by every service in the project.
 #
-# Phases 2+ will add tt-app (Streamlit) and tt-bot (Telegram) as additional
-# services in the same Railway project. Each service is created via the
-# Railway UI pointing at this repo; this file provides the build + default
-# deploy config shared by all services.
+# Each service is created via the Railway UI pointing at this repo; this file
+# provides the build + default deploy config they share.
 #
-# To create the three services:
+# To create the services:
 #   1. Railway → New Service → GitHub Repo → EvanMcCormick37/titled-tuesday-analysis (branch: mobile-production)
 #   2. For each service, override the start command in the UI:
 #        tt-cron → python scripts/weekly_pipeline.py
+#        bb-cron → python scripts/weekly_pipeline.py --market bullet_brawl
 #        tt-app  → python -m streamlit run app/dashboard.py --server.port=$PORT --server.address=0.0.0.0
-#        tt-bot  → python app/telegram_bot.py
 #      Use `python -m streamlit` (not bare `streamlit`) — the module form is
 #      PATH-independent and avoids "executable not found" errors on PaaS hosts
 #      that run start commands through a stripped-down shell.
-#   3. For tt-cron only: set the cron schedule in the UI (Settings → Cron Schedule).
-#      Expression: 0 19 * * 2    (Tuesdays at 19:00 UTC = 15:00 EDT / 14:00 EST)
+#   3. For the cron services: set the cron schedule in the UI (Settings → Cron Schedule).
+#      tt-cron: 0 19 * * 2    (Tuesdays at 19:00 UTC = 15:00 EDT / 14:00 EST)
+#      bb-cron: 0 20 * * 6    (Saturdays at 20:00 UTC = 16:00 EDT / 15:00 EST;
+#                              the 2-hour arena starts at 12:00 ET)
 #      Railway cron expressions are evaluated in UTC regardless of the TZ env
 #      var — the TZ var only affects what the container's clock returns inside
 #      Python (which matters for _most_recent_tuesday()). Use numeric day-of-week
-#      (2 = Tuesday), not the "TUE" alias — Railway's parser doesn't accept it.
+#      (2 = Tuesday, 6 = Saturday), not the "TUE" alias — Railway's parser doesn't accept it.
 #   4. Set the shared env vars listed below on each service (or on the project).
 #
-# Shared build:  all three services use the Dockerfile at the repo root and
+# Shared build:  all services use the Dockerfile at the repo root and
 # pass GH_TOKEN as a build arg so pip can install the private kalshi-core.
 
 [build]
@@ -37,7 +37,7 @@ dockerfilePath = "Dockerfile"
 # No startCommand here: values in this file override the dashboard for every
 # service using it. Each service sets its own start command in the dashboard;
 # with none set, the Dockerfile CMD (the weekly pipeline) runs.
-# Restart policy is also per-service: Never for tt-cron, On Failure for the rest.
+# Restart policy is also per-service: Never for tt-cron and bb-cron, On Failure for the rest.
 # healthcheckPath has no meaning for a cron job; leave unset.
 
 # ── Env vars required (set per-service in Railway UI) ────────────────────────
@@ -53,9 +53,8 @@ dockerfilePath = "Dockerfile"
 #   PORT                      = (auto-provided by Railway)
 #   DASHBOARD_PASSWORD        = <long random>
 #
-# tt-bot only:
-#   TELEGRAM_BOT_TOKEN        = <from @BotFather>
-#   TELEGRAM_CHAT_ID          = <your private chat id — positive int>
+# bb-cron: shared vars only. Before its first run, copy the local Bullet Brawl
+#   history to Railway with scripts/push_bullet_brawl_history.py.
 #
 # tt-api (React dashboard + JSON API):
 #   Start command: /bin/sh -c "exec python -m uvicorn api.main:app --host 0.0.0.0 --port $PORT"
@@ -67,14 +66,4 @@ dockerfilePath = "Dockerfile"
 #   Start command: python scripts/trade_worker.py
 #   Env: shared vars + RAILWAY_DEPLOYMENT_DRAINING_SECONDS=30.
 #   Not a web service. Exactly one replica. Restart policy ON_FAILURE.
-#   Deploy this BEFORE any tt-bot update: bot confirm buttons only add queue jobs.
-#
-# tt-bot deploy notes:
-#   - Start command: python app/telegram_bot.py
-#   - Not a web service — no PORT needed, don't expose any ports.
-#   - restartPolicyType = ON_FAILURE in the UI (unlike tt-cron, this is long-running).
-#   - Pushes alerts on every pipeline_runs state change (completed / failed /
-#     adjustments_pending). Startup also fires an alert for any sticky
-#     failed/adjustments_pending state so a bot restart doesn't miss events.
-#   - All commands are gated to TELEGRAM_CHAT_ID; messages from any other chat
-#     are silently dropped.
+#   Serves every registered market (Titled Tuesday, Bullet Brawl).

@@ -8,7 +8,6 @@ on success.
 
 Called by:
     - the Streamlit dashboard's "Save & recompute" button (via import),
-    - the Telegram bot's /recompute command (via import),
     - this CLI, for local use.
 
 Usage:

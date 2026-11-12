@@ -3,8 +3,8 @@
 Each strategy has a read-only `plan_*` function returning a `Plan`, which
 `trade_plan.execute_plan` sends to Kalshi. The job worker uses those directly.
 The original `place_bids` / `place_fade_no_bids` / `take_trades` /
-`cancel_tt_bids` functions remain as print-based wrappers for the CLI scripts,
-notebook, and Telegram bot.
+`cancel_tt_bids` functions remain as print-based wrappers for the CLI scripts
+and notebook.
 
 Every `plan_*` takes a `spec`, defaulting to Titled Tuesday.
 """
@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from kalshi_core import KalshiClient, _to_kalshi_date, bid_cents, best_ask, apply_pullback, kalshi_order_price
-from .data import get_username_mappings
+from .data import market_player_to_username, match_player
 from .db import read_market_rows
 from .kalshi_markets import fetch_orderbooks, get_asks
 from .markets import TITLED_TUESDAY, MarketSpec
@@ -116,10 +116,10 @@ def plan_place_bids(
         tourn_date = next_tourn_date(spec)
     expiry = _expiry_ts(tourn_date, spec)
     date_str = _to_kalshi_date(tourn_date)
-    _, player_to_username = get_username_mappings()
 
     emit("phase", "Loading model predictions")
     preds = _load_predictions(spec.slug)
+    player_to_username = market_player_to_username(preds.index, spec)
 
     emit("phase", "Fetching open orders")
     open_by_key: dict[tuple[str, str], list[dict]] = {}
@@ -137,7 +137,7 @@ def plan_place_bids(
     cancel_ids_seen: set[str] = set()
 
     for ticker, _title, subtitle, n in markets:
-        username = player_to_username.get(subtitle)
+        username = match_player(subtitle, player_to_username)
         if username is None or username not in preds.index:
             plan.unmatched.append(subtitle)
             continue
@@ -211,10 +211,10 @@ def plan_fade_no_bids(
     expiry_iso = datetime.fromtimestamp(expiry, ZoneInfo(spec.timezone)).isoformat()
     tourn_start_ts = _expiry_ts_after_start(tourn_date, 0, spec)
     date_str = _to_kalshi_date(tourn_date)
-    _, player_to_username = get_username_mappings()
 
     emit("phase", "Loading model predictions")
     preds = _load_predictions(spec.slug)
+    player_to_username = market_player_to_username(preds.index, spec)
 
     emit("phase", "Fetching open NO orders")
     open_by_ticker: dict[str, list[dict]] = {}
@@ -231,7 +231,7 @@ def plan_fade_no_bids(
                 extra={"expiry_iso": expiry_iso})
 
     for ticker, _title, subtitle, n in markets:
-        username = player_to_username.get(subtitle)
+        username = match_player(subtitle, player_to_username)
         if username is None or username not in preds.index:
             plan.unmatched.append(subtitle)
             continue
@@ -364,11 +364,10 @@ def compute_edges(
 
     Shared between `take_trades` (filter → fire) and the Edges view (filter → display).
     """
-    _, PLAYER_TO_USERNAME = get_username_mappings()
-
     if verbose:
         print("Loading model predictions from DB...")
     preds = _load_predictions(spec.slug)
+    name_map = market_player_to_username(preds.index, spec)
     for n in [1, 3, 5, 8, 10]:
         col_given = f"P_top{n}_given_play"
         if col_given in preds.columns:
@@ -384,7 +383,7 @@ def compute_edges(
         return pd.DataFrame(), []
 
     df = pd.DataFrame(all_asks)
-    df["username"] = df["Player Name"].map(lambda name: PLAYER_TO_USERNAME.get(name))
+    df["username"] = df["Player Name"].map(lambda name: match_player(name, name_map))
 
     unmatched = df[df["username"].isna()]["Player Name"].unique().tolist()
     df = df[df["username"].notna()].copy()
@@ -407,7 +406,7 @@ def compute_edges(
     return df, unmatched
 
 
-# ── Print-based wrappers (CLI scripts, notebook, Telegram bot) ───────────────
+# ── Print-based wrappers (CLI scripts, notebook) ────────────────────────────
 
 def place_bids(
     client: KalshiClient,

@@ -7,12 +7,27 @@ trigger within one refresh after it finishes.
 from __future__ import annotations
 
 from datetime import date, timedelta
+from typing import NamedTuple
 
 import pandas as pd
 import streamlit as st
 
-from app.bot.db_reads import MARKET, PipelineStatus  # shared with the bot
 from src.db import get_conn, read_market_rows
+
+MARKET = 'titled_tuesday'   # the Streamlit app only covers Titled Tuesday
+
+
+class PipelineStatus(NamedTuple):
+    """One pipeline_runs row, as the banner and tabs read it."""
+    id:            int | None
+    tourn_date:    str | None
+    state:         str              # 'running' | 'adjustments_pending' | 'completed' | 'failed' | 'absent'
+    current_step:  str | None
+    failed_step:   str | None
+    error_kind:    str | None
+    error_message: str | None
+    started_at:    str | None
+    completed_at:  str | None
 
 __all__ = ['PipelineStatus', 'current_status', 'load_predictions',
            'username_to_player_map', 'all_player_names', 'next_tourn_date_str',
