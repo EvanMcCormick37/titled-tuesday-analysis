@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import date
 from functools import partial
 
 import pandas as pd
@@ -255,3 +256,19 @@ def test_edges_payload_is_json_safe(date_patched):
     row = payload['rows'][0]
     assert row['roi'] > 1.2 and row['side'] == 'YES'
     assert pd.notna(row['ev'])
+
+
+@pytest.mark.parametrize('latest_run, today, missing', [
+    ('2026-11-03', date(2026, 11, 12), True),    # cron never ran for Nov 10
+    (None, date(2026, 11, 12), True),
+    ('2026-11-10', date(2026, 11, 12), False),   # ran (whatever its state)
+    ('2026-11-03', date(2026, 11, 10), False),   # event day: cron still to come
+])
+def test_pipeline_missing_flags_a_skipped_event(latest_run, today, missing):
+    assert api_main.pipeline_missing(TITLED_TUESDAY, latest_run, today) is missing
+
+
+def test_status_reports_the_latest_event(authed):
+    data = authed.get(f'/api/markets/{MARKET}/status').json()
+    assert data['latest_event'] == TITLED_TUESDAY.most_recent_event().isoformat()
+    assert isinstance(data['pipeline_missing'], bool)

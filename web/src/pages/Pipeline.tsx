@@ -41,6 +41,7 @@ export default function Pipeline() {
       <section className="card stack">
         <h2>Pipeline{p ? ` · ${humanize(p.state)}` : ''}</h2>
         {p?.state === 'failed' && p.error_message && <p className="note bad">{p.error_message}</p>}
+        {status?.pipeline_missing && <p className="note bad">No pipeline run was recorded for {status.latest_event}. The scheduled run may not have started.</p>}
         {q.error && <ErrorNote error={q.error} />}
         {p?.state === 'failed' && p.error_kind === 'listing_missing_slug' ? (
           <form className="row" onSubmit={(e) => { e.preventDefault(); run.mutate(url); }}>
@@ -49,7 +50,7 @@ export default function Pipeline() {
           </form>
         ) : (
           <div className="row wrap">
-            {(!p || p.state === 'failed') && <button className="btn primary" disabled={run.isPending} onClick={() => run.mutate(undefined)}>{p ? 'Retry pipeline' : 'Run pipeline'}</button>}
+            {(!p || p.state === 'failed' || status?.pipeline_missing) && <button className="btn primary" disabled={run.isPending} onClick={() => run.mutate(undefined)}>{status?.pipeline_missing ? `Run pipeline for ${status.latest_event}` : p ? 'Retry pipeline' : 'Run pipeline'}</button>}
             <button className="btn" disabled={recompute.isPending} onClick={() => recompute.mutate()}>Recompute predictions</button>
           </div>
         )}

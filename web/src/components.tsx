@@ -66,7 +66,9 @@ export function Banner({ status, onGoPipeline }: { status: Status | undefined; o
   if (!status.worker_online) {
     items.push(['bad', 'Trade worker is offline. Queued trades will not run until it is back.']);
   }
-  if (!p) items.push(['neutral', 'No pipeline run yet.']);
+  if (status.pipeline_missing) {
+    items.push(['bad', <>No pipeline run for {status.latest_event}. <button className="link" onClick={onGoPipeline}>Open pipeline</button></>]);
+  } else if (!p) items.push(['neutral', 'No pipeline run yet.']);
   else if (p.state === 'failed') {
     items.push(['bad', <>Pipeline failed at {p.failed_step ? humanize(p.failed_step) : 'unknown step'}. <button className="link" onClick={onGoPipeline}>Open pipeline</button></>]);
   } else if (p.state === 'running') {

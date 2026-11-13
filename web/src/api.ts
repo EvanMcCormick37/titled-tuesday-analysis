@@ -70,6 +70,8 @@ export type Status = {
   event_start: string;
   trade_ready: boolean;
   pipeline: PipelineRow | null;
+  latest_event: string;
+  pipeline_missing: boolean;
   worker_online: boolean;
 };
 

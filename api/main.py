@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -118,6 +118,16 @@ def markets() -> list[dict]:
     } for m in strat.MARKETS.values()]
 
 
+def pipeline_missing(spec, latest_run_date: str | None, today: date | None = None) -> bool:
+    """True once the latest event day has passed without any pipeline run for it,
+    e.g. when the cron couldn't start. The Pipeline page then offers a run."""
+    today = today or date.today()
+    latest_event = spec.most_recent_event(today)
+    if latest_event >= today:
+        return False        # event day itself: the cron hasn't had its chance yet
+    return latest_run_date is None or str(latest_run_date)[:10] < latest_event.isoformat()
+
+
 @api.get('/markets/{slug}/status')
 def status(slug: str) -> dict:
     market = _market(slug)
@@ -143,6 +153,8 @@ def status(slug: str) -> dict:
         'event_start': q.iso(market.event_start(event_date)),
         'trade_ready': market.pipeline_ready(event_date),
         'pipeline': pipeline,
+        'latest_event': market.spec.most_recent_event().isoformat(),
+        'pipeline_missing': pipeline_missing(market.spec, pipeline['tourn_date'] if pipeline else None),
         'worker_online': online,
     }
 
