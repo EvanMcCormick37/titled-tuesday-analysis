@@ -21,7 +21,6 @@ type Draft = {
   fallback: number;
   cap: string;
   rehearsal: boolean;
-  overrideStale: boolean;
 };
 
 function defaults(s: Strategy): Params {
@@ -71,7 +70,7 @@ function DraftForm({ draft, strategies, update, onQueued }: {
   update: (patch: Partial<Draft>) => void;
   onQueued: () => void;
 }) {
-  const { market, status, toast } = useApp();
+  const { market, toast } = useApp();
   const queryClient = useQueryClient();
   const strategy = strategies.find((s) => s.name === draft.strategy)!;
   const paramsKey = JSON.stringify(draft.params);
@@ -95,7 +94,6 @@ function DraftForm({ draft, strategies, update, onQueued }: {
       params: draft.params,
       max_exposure: needsCap ? Number(draft.cap) : null,
       run_at: draft.timing === 'later' ? new Date(draft.runAt).toISOString() : null,
-      override_stale: draft.overrideStale,
       dry_run: draft.rehearsal,
       loop_interval_min: isLoop ? draft.interval : null,
       loop_fallback_hours: isLoop ? draft.fallback : null,
@@ -107,11 +105,11 @@ function DraftForm({ draft, strategies, update, onQueued }: {
     },
   });
 
+  // Previewing is optional: every job re-plans when it fires anyway. If predictions
+  // aren't marked complete at that point, the worker holds the job for review.
   const blocked =
-    !previewCurrent ||
     (needsCap && !(Number(draft.cap) > 0)) ||
-    (draft.timing === 'later' && !draft.runAt) ||
-    (status !== undefined && !status.trade_ready && strategy.spends && !draft.overrideStale && !draft.rehearsal && draft.timing === 'now');
+    (draft.timing === 'later' && !draft.runAt);
 
   const verb = draft.rehearsal ? 'Queue rehearsal' : draft.timing === 'later' ? 'Schedule live trade' : isLoop ? 'Start live loop' : 'Queue live trade';
   const capText = needsCap && Number(draft.cap) > 0 ? ` · cap ${usd(Number(draft.cap))}` : '';
@@ -148,7 +146,7 @@ function DraftForm({ draft, strategies, update, onQueued }: {
             <h3>{draft.plan.orders.length} order(s), {draft.plan.cancels.length} cancel(s)</h3>
             <strong>{usd(draft.plan.exposure)}</strong>
           </div>
-          {!previewCurrent && <p className="note warn">Settings changed. Preview again before queueing.</p>}
+          {!previewCurrent && <p className="note warn">Settings changed since this preview.</p>}
           {draft.plan.orders.length + draft.plan.cancels.length === 0
             ? <p className="muted">Nothing qualifies right now.</p>
             : <PlanTable plan={draft.plan} />}
@@ -197,18 +195,10 @@ function DraftForm({ draft, strategies, update, onQueued }: {
           </label>
         )}
 
-        {status && !status.trade_ready && strategy.spends && !draft.rehearsal && (
-          <label className="check warn-text">
-            <input type="checkbox" checked={draft.overrideStale} onChange={(e) => update({ overrideStale: e.target.checked })} />
-            Predictions aren't marked complete. Trade on them anyway.
-          </label>
-        )}
-
         {submit.error && <ErrorNote error={submit.error} />}
         <button className="btn primary" disabled={blocked || submit.isPending} onClick={() => submit.mutate()}>
           {submit.isPending ? 'Adding…' : `${verb}${capText}`}
         </button>
-        {!previewCurrent && <small className="muted center-text">Preview the orders first.</small>}
       </section>
     </div>
   );
@@ -255,7 +245,7 @@ export default function Trade() {
   const makeDraft = (): Draft => ({
     key: nextKey.current++, strategy: strategies[0].name, params: defaults(strategies[0]),
     plan: null, planFor: '', timing: 'now', runAt: '', loop: false, interval: 15, fallback: 1,
-    cap: '', rehearsal: false, overrideStale: false,
+    cap: '', rehearsal: false,
   });
   const [drafts, setDrafts] = useState<Draft[]>(() => [makeDraft()]);
   const [currentKey, setCurrentKey] = useState(drafts[0].key);

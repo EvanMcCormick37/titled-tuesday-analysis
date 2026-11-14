@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { req } from '../api';
 import { useApp } from '../App';
 import { Empty, ErrorNote } from '../components';
@@ -14,6 +14,7 @@ export default function Pipeline() {
   const { market, status, openJob, toast } = useApp();
   const queryClient = useQueryClient();
   const [url, setUrl] = useState('');
+  useEffect(() => setUrl(''), [market.slug]);   // a URL belongs to one market
   const q = useQuery({
     queryKey: ['pipeline', market.slug],
     queryFn: () => req<Data>(`/markets/${market.slug}/pipeline`),
@@ -34,7 +35,14 @@ export default function Pipeline() {
   });
 
   const p = status?.pipeline;
-  const latestByStep = new Map((q.data?.steps ?? []).map((s) => [s.job_name, s]));
+  const canRun = !p || p.state === 'failed' || !!status?.pipeline_missing;
+  const needsUrl = !status?.pipeline_missing && p?.state === 'failed' && p.error_kind === 'listing_missing_slug';
+  const hasUrl = !!url.trim();
+  const runLabel = status?.pipeline_missing
+    ? `Run pipeline for ${status.latest_event}${hasUrl ? ' with this URL' : ''}`
+    : hasUrl ? (p ? 'Retry with this URL' : 'Run with this URL')
+    : p ? 'Retry pipeline' : 'Run pipeline';
+  const latestByStep =new Map((q.data?.steps ?? []).map((s) => [s.job_name, s]));
 
   return (
     <div className="stack">
@@ -43,14 +51,24 @@ export default function Pipeline() {
         {p?.state === 'failed' && p.error_message && <p className="note bad">{p.error_message}</p>}
         {status?.pipeline_missing && <p className="note bad">No pipeline run was recorded for {status.latest_event}. The scheduled run may not have started.</p>}
         {q.error && <ErrorNote error={q.error} />}
-        {p?.state === 'failed' && p.error_kind === 'listing_missing_slug' ? (
-          <form className="row" onSubmit={(e) => { e.preventDefault(); run.mutate(url); }}>
-            <input aria-label="Tournament URL" placeholder={market.event_url_example} value={url} onChange={(e) => setUrl(e.target.value)} />
-            <button className="btn primary" disabled={!url.trim() || run.isPending}>Scrape this URL</button>
+        {canRun && (
+          <form className="stack" onSubmit={(e) => { e.preventDefault(); run.mutate(url.trim() || undefined); }}>
+            <label className="stack">
+              <span className="muted">
+                {needsUrl
+                  ? `Chess.com tournament URL for ${market.label} (required: the event wasn't found automatically)`
+                  : `Chess.com tournament URL for ${market.label} (optional: leave blank to find the event automatically)`}
+              </span>
+              <input aria-label="Tournament URL" placeholder={market.event_url_example} value={url} onChange={(e) => setUrl(e.target.value)} />
+            </label>
+            <div className="row wrap">
+              <button className="btn primary" disabled={run.isPending || (needsUrl && !url.trim())}>{runLabel}</button>
+              <button type="button" className="btn" disabled={recompute.isPending} onClick={() => recompute.mutate()}>Recompute predictions</button>
+            </div>
           </form>
-        ) : (
+        )}
+        {!canRun && (
           <div className="row wrap">
-            {(!p || p.state === 'failed' || status?.pipeline_missing) && <button className="btn primary" disabled={run.isPending} onClick={() => run.mutate(undefined)}>{status?.pipeline_missing ? `Run pipeline for ${status.latest_event}` : p ? 'Retry pipeline' : 'Run pipeline'}</button>}
             <button className="btn" disabled={recompute.isPending} onClick={() => recompute.mutate()}>Recompute predictions</button>
           </div>
         )}

@@ -8,8 +8,39 @@ import { pct } from '../format';
 type Row = { player: string; p_participate: number; p_given_play: number; p_top: number; yes_price: number; no_price: number };
 type Data = { rows: Row[]; pool_size: number; tourn_date: string | null };
 
-function Bar({ value, max }: { value: number; max: number }) {
-  return <div className="bar-track"><div className="bar" style={{ width: `${max > 0 ? (value / max) * 100 : 0}%` }} /></div>;
+function Bar({ value, max, adv }: { value: number; max: number; adv?: number }) {
+  return (
+    <div className="bar-track">
+      <div className="bar" data-adv={adv} style={{ width: `${max > 0 ? (value / max) * 100 : 0}%` }} />
+    </div>
+  );
+}
+
+// If-plays advantage = P(top N | plays) / P(top N). Since P(top N) = P(plays) × P(top N | plays),
+// this works out to 1 / P(plays): high values mark players whose attendance moves the price most.
+function advantage(r: Row): number {
+  if (r.p_top > 0) return r.p_given_play / r.p_top;
+  return r.p_participate > 0 ? 1 / r.p_participate : Infinity;
+}
+
+// Upper bounds of the color steps; anything at or above the last bound takes the top step.
+const ADV_BOUNDS = [1.25, 1.5, 2, 3];
+const ADV_LABELS = ['Under 1.25×', '1.25–1.5×', '1.5–2×', '2–3×', '3× and up'];
+
+function advStep(a: number): number {
+  const i = ADV_BOUNDS.findIndex((b) => a < b);
+  return i === -1 ? ADV_BOUNDS.length : i;
+}
+
+function AdvLegend() {
+  return (
+    <div className="adv-legend" aria-label="Bar color: if-plays advantage">
+      <strong>If-plays advantage</strong>
+      {ADV_LABELS.map((l, i) => (
+        <span key={l}><i className="swatch" data-adv={i} />{l}</span>
+      ))}
+    </div>
+  );
 }
 
 export default function Odds() {
@@ -44,14 +75,21 @@ export default function Odds() {
       {q.data && rows.length === 0 && <Empty>No predictions yet. Run the pipeline, then recompute.</Empty>}
 
       {view === 'chances' && rows.length > 0 && (
-        <div className="chart" role="img" aria-label={`Chance of ${label} by player. Exact values are in the Table view.`}>
-          {rows.slice(0, 30).map((r) => (
-            <div key={r.player} className="chart-row" title={`P(plays) ${pct(r.p_participate)} · P(${label} | plays) ${pct(r.p_given_play)}`}>
-              <span className="chart-name">{r.player}</span>
-              <Bar value={r.p_top} max={maxP} />
-              <span className="num">{pct(r.p_top)}</span>
-            </div>
-          ))}
+        <div className="stack">
+          <AdvLegend />
+          <div className="chart" role="img" aria-label={`Chance of ${label} by player, colored by if-plays advantage. Exact values are in the Table view.`}>
+            {rows.slice(0, 30).map((r) => {
+              const adv = advantage(r);
+              return (
+                <div key={r.player} className="chart-row"
+                     title={`P(plays) ${pct(r.p_participate)} · P(${label} | plays) ${pct(r.p_given_play)} · if-plays advantage ${adv.toFixed(2)}×`}>
+                  <span className="chart-name">{r.player}</span>
+                  <Bar value={r.p_top} max={maxP} adv={advStep(adv)} />
+                  <span className="num">{pct(r.p_top)}</span>
+                </div>
+              );
+            })}
+          </div>
         </div>
       )}
 
@@ -73,12 +111,13 @@ export default function Odds() {
       {view === 'table' && rows.length > 0 && (
         <div className="table-wrap">
           <table>
-            <thead><tr><th>Player</th><th className="num">P(plays)</th><th className="num">P(top | plays)</th><th className="num">P(top)</th><th className="num">YES ¢</th><th className="num">NO ¢</th></tr></thead>
+            <thead><tr><th>Player</th><th className="num">P(plays)</th><th className="num">P(top | plays)</th><th className="num">P(top)</th><th className="num">If-plays adv.</th><th className="num">YES ¢</th><th className="num">NO ¢</th></tr></thead>
             <tbody>
               {rows.map((r) => (
                 <tr key={r.player}>
                   <td>{r.player}</td><td className="num">{pct(r.p_participate, 2)}</td>
                   <td className="num">{pct(r.p_given_play, 2)}</td><td className="num">{pct(r.p_top, 2)}</td>
+                  <td className="num">{Number.isFinite(advantage(r)) ? `${advantage(r).toFixed(2)}×` : '—'}</td>
                   <td className="num">{r.yes_price.toFixed(1)}</td><td className="num">{r.no_price.toFixed(1)}</td>
                 </tr>
               ))}

@@ -198,6 +198,20 @@ def test_runner_resumes_from_failed_step(database):
     assert calls == ['one', 'two', 'two']
 
 
+def test_pasted_url_restarts_at_the_scrape_step(database):
+    calls = []
+
+    def flaky(step, slug):
+        calls.append((step, slug))
+        if step == 'two' and len(calls) == 2:
+            raise RuntimeError('boom')
+        return {}
+
+    assert run_pipeline(_defn(flaky))['failed_step'] == 'two'
+    assert run_pipeline(_defn(flaky), slug_override='u')['state'] == 'adjustments_pending'
+    assert calls[2:] == [('one', 'u'), ('two', 'u')]
+
+
 # ── Specs ────────────────────────────────────────────────────────────────────
 
 def test_titled_tuesday_tickers_unchanged():

@@ -51,6 +51,21 @@ def is_postgres() -> bool:
     return _database_url() is not None
 
 
+# libpq options so a dead or unreachable connection raises instead of hanging
+# forever: a 10 s connect limit, keepalives that drop a silent peer after about
+# a minute, and a 60 s limit on sent data going unacknowledged. A query that is
+# legitimately slow, or waiting on a lock, is unaffected: the server still
+# answers keepalives while it works.
+PG_CONNECT_ARGS: dict[str, int] = {
+    'connect_timeout': 10,
+    'keepalives': 1,
+    'keepalives_idle': 30,
+    'keepalives_interval': 10,
+    'keepalives_count': 3,
+    'tcp_user_timeout': 60_000,  # milliseconds
+}
+
+
 # ── DB-API wrapper ────────────────────────────────────────────────────────────
 
 class _ConnWrapper:
@@ -163,7 +178,7 @@ def get_conn() -> _ConnWrapper:
     url = _database_url()
     if url is not None:
         import psycopg
-        return _ConnWrapper(psycopg.connect(url), is_pg=True)
+        return _ConnWrapper(psycopg.connect(url, **PG_CONNECT_ARGS), is_pg=True)
     return _ConnWrapper(sqlite3.connect(DB_PATH), is_pg=False)
 
 
@@ -182,7 +197,7 @@ def get_engine():
         sa_url = url.replace('postgres://', 'postgresql+psycopg://')
         sa_url = sa_url.replace('postgresql://', 'postgresql+psycopg://') \
             if not sa_url.startswith('postgresql+psycopg://') else sa_url
-        _ENGINE = create_engine(sa_url, pool_pre_ping=True)
+        _ENGINE = create_engine(sa_url, pool_pre_ping=True, connect_args=dict(PG_CONNECT_ARGS))
     else:
         _ENGINE = create_engine(f'sqlite:///{DB_PATH}')
     return _ENGINE

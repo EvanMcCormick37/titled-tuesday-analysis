@@ -17,6 +17,7 @@ TITLED_TUESDAY = MarketSpec(
     bid_expiry_minute=0,
     pipeline_steps=('scrape_tt', 'update_broadcasts', 'run_raw'),
     event_url_example='https://www.chess.com/tournament/live/titled-tuesday-blitz-…',
+    event_slug_pattern=r'(?:early-|late-)?titled-tuesday-blitz-[a-z]+-\d{2}-\d{4}-\d+',
     model=ModelConfig(
         standings_table='titled_tuesday_standings',
         data_cutoff=config.DATA_CUTOFF,

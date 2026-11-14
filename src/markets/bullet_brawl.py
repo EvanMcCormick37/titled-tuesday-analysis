@@ -22,6 +22,7 @@ BULLET_BRAWL = MarketSpec(
     bid_expiry_minute=0,
     pipeline_steps=('scrape_bb', 'update_broadcasts', 'run_raw'),
     event_url_example='https://www.chess.com/tournament/live/arena/bullet-brawl-…',
+    event_slug_pattern=r'bullet-brawl-[a-z]+-\d{2}-\d{4}-\d{5,}',
     model=ModelConfig(
         standings_table='bullet_brawl_standings',
         data_cutoff=config.DATA_CUTOFF,

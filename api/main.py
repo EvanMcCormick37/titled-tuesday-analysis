@@ -365,8 +365,12 @@ def recompute(slug: str) -> dict:
 
 @api.post('/markets/{slug}/pipeline/run')
 def run_pipeline(slug: str, body: OpsBody) -> dict:
-    _market(slug)
-    params = {'slug_url': body.slug_url.strip()} if body.slug_url and body.slug_url.strip() else {}
+    market = _market(slug)
+    url = (body.slug_url or '').strip()
+    if url and not market.spec.is_event_url(url):
+        raise HTTPException(status_code=422,
+                            detail=f'Not a {market.label} tournament URL (expected e.g. {market.spec.event_url_example})')
+    params = {'slug_url': url} if url else {}
     return {'id': strat.submit_ops(slug, 'run_pipeline', params, created_by='dashboard')}
 
 

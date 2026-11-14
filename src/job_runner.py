@@ -23,8 +23,10 @@ log = logging.getLogger('trade_worker')
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MAX_CONSECUTIVE_ERRORS = 3
 KILL_LANE_IDLE_TIMEOUT_S = 30.0
-OPS_TIMEOUT_S = 45 * 60
 OPS_LOG_TAIL_BYTES = 16_000
+OPS_STREAM_EVERY_S = 5.0     # how often new subprocess output is copied to the job log
+OPS_STREAM_MAX_LINES = 300   # per job; the full tail is still saved when it ends
+OPS_LINE_MAX_CHARS = 300
 _EPSILON = 0.005  # floating-point tolerance on dollar comparisons
 
 
@@ -47,6 +49,49 @@ def _outcome_status(result: ExecutionResult) -> str:
     if result.failed == 0:
         return 'succeeded'
     return 'partial' if result.succeeded_any else 'failed'
+
+
+def _stop(proc: subprocess.Popen) -> None:
+    """Terminate a subprocess, killing it if it ignores the request."""
+    proc.terminate()
+    try:
+        proc.wait(timeout=15)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=15)
+
+
+class _OutputStream:
+    """Copies new complete lines of a running subprocess's output to the job log."""
+
+    def __init__(self, reader: Any, emit: Emit):
+        self._reader = reader
+        self._emit = emit
+        self._partial = b''
+        self._sent = 0
+
+    def flush(self) -> None:
+        if self._sent >= OPS_STREAM_MAX_LINES:
+            return
+        data = self._partial + self._reader.read()
+        *lines, self._partial = data.split(b'\n')
+        for raw in lines:
+            # Keep only the last frame of a progress bar redrawn with \r.
+            line = raw.rstrip(b'\r').decode('utf-8', errors='replace').rsplit('\r', 1)[-1].strip()
+            if not line:
+                continue
+            self._safe_emit(line[:OPS_LINE_MAX_CHARS])
+            self._sent += 1
+            if self._sent >= OPS_STREAM_MAX_LINES:
+                self._safe_emit('Output continues; the full tail is saved when the job ends.')
+                return
+
+    def _safe_emit(self, message: str) -> None:
+        # Losing a progress line is fine; crashing the wait loop is not.
+        try:
+            self._emit('output', message)
+        except Exception:  # noqa: BLE001
+            log.warning('could not record subprocess output', exc_info=True)
 
 
 class JobRunner:
@@ -210,33 +255,42 @@ class JobRunner:
         emit = _make_emit(job)
         emit('phase', f'{op.label} started')
 
-        with tempfile.TemporaryFile() as output:
-            proc = subprocess.Popen(
-                op.command(job['tourn_date'], job['params']),
-                cwd=PROJECT_ROOT, stdout=output, stderr=subprocess.STDOUT,
-                env={**os.environ, 'PYTHONUNBUFFERED': '1'},
-            )
-            deadline = time.monotonic() + OPS_TIMEOUT_S
-            outcome = None
-            while proc.poll() is None:
-                if self._shutting_down():
-                    outcome = 'interrupted'
-                elif q.is_cancel_requested(job_id):
-                    outcome = 'cancelled'
-                elif time.monotonic() > deadline:
-                    outcome = 'failed'
-                if outcome:
-                    proc.terminate()
-                    proc.wait(timeout=15)
-                    break
-                time.sleep(self._ops_poll)
+        # The child writes to one handle and we read through a second, so reading
+        # while it runs never moves the child's write position.
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = Path(tmp) / 'output.log'
+            with open(out_path, 'ab') as child_out, open(out_path, 'rb') as reader:
+                proc = subprocess.Popen(
+                    op.command(job['tourn_date'], job['params']),
+                    cwd=PROJECT_ROOT, stdout=child_out, stderr=subprocess.STDOUT,
+                    env={**os.environ, 'PYTHONUNBUFFERED': '1'},
+                )
+                stream = _OutputStream(reader, emit)
+                deadline = time.monotonic() + op.timeout_s
+                next_stream = time.monotonic() + OPS_STREAM_EVERY_S
+                outcome = None
+                while proc.poll() is None:
+                    if self._shutting_down():
+                        outcome = 'interrupted'
+                    elif self._cancel_requested(job_id):
+                        outcome = 'cancelled'
+                    elif time.monotonic() > deadline:
+                        outcome = 'failed'
+                    if outcome:
+                        _stop(proc)
+                        break
+                    if time.monotonic() >= next_stream:
+                        stream.flush()
+                        next_stream = time.monotonic() + OPS_STREAM_EVERY_S
+                    time.sleep(self._ops_poll)
 
-            output.seek(max(0, os.fstat(output.fileno()).st_size - OPS_LOG_TAIL_BYTES))
-            tail = output.read().decode('utf-8', errors='replace')
+                reader.seek(max(0, os.fstat(reader.fileno()).st_size - OPS_LOG_TAIL_BYTES))
+                tail = reader.read().decode('utf-8', errors='replace')
 
         emit('log', 'Process output', data={'tail': tail})
         if outcome == 'failed':
-            q.finish(job_id, 'failed', error='Timed out', iterations_delta=1)
+            minutes = op.timeout_s / 60
+            q.finish(job_id, 'failed', error=f'Timed out after {minutes:g} min', iterations_delta=1)
         elif outcome:
             q.finish(job_id, outcome, iterations_delta=1)
         elif proc.returncode != 0:
@@ -283,6 +337,16 @@ class JobRunner:
         q.finish(job_id, _outcome_status(total), summary=total.to_dict(), iterations_delta=1)
 
     # ── Helpers ──────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _cancel_requested(job_id: int) -> bool:
+        """Cancel check for the ops wait loop. A failed check counts as no cancel
+        rather than ending the job and leaving the subprocess running unwatched."""
+        try:
+            return q.is_cancel_requested(job_id)
+        except Exception:  # noqa: BLE001
+            log.warning('cancel check for job %s failed; will retry', job_id, exc_info=True)
+            return False
 
     def _should_stop(self, job_id: int) -> Callable[[], bool]:
         return lambda: self._shutting_down() or q.is_cancel_requested(job_id)

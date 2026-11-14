@@ -43,6 +43,12 @@ class MarketSpec:
     # the dashboard's Pipeline page both read this.
     pipeline_steps: tuple[str, ...] = ('scrape', 'update_broadcasts', 'run_raw')
     event_url_example: str = 'https://www.chess.com/tournament/live/…'
+    # Regex for this market's chess.com event slug, found anywhere in a pasted URL
+    # or bare slug. The API rejects a pasted URL for the wrong market with it.
+    event_slug_pattern: str = r'[a-z0-9-]+-\d{5,}'
+
+    def is_event_url(self, url_or_slug: str) -> bool:
+        return re.search(self.event_slug_pattern, url_or_slug.strip().lower()) is not None
 
     @property
     def traded_ns(self) -> tuple[int, ...]:

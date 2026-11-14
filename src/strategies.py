@@ -69,6 +69,7 @@ class OpsJob:
     label: str
     command: Callable[[str, dict], list[str]]
     verify: Callable[[], str | None] = lambda: None   # returns an error if the run failed
+    timeout_s: float = 45 * 60                        # killed and marked failed after this
 
 
 @dataclass(frozen=True)
@@ -190,7 +191,9 @@ def _market_for(spec: MarketSpec) -> Market:
         previous_event_date=_previous,
         pipeline_ready=partial(_pipeline_ready, spec),
         ops={
-            'recompute': OpsJob('recompute', 'Recompute predictions', partial(_recompute_command, spec)),
+            # A recompute normally takes about 40 s; the full pipeline scrapes and can take much longer.
+            'recompute': OpsJob('recompute', 'Recompute predictions', partial(_recompute_command, spec),
+                                timeout_s=5 * 60),
             'run_pipeline': OpsJob('run_pipeline', 'Run pipeline', partial(_pipeline_command, spec),
                                    partial(_pipeline_error, spec)),
         },

@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 
 from api import auth
 from api import main as api_main
-from src import db, job_queue as q, strategies
+from src import db, job_queue as q, job_runner, strategies
 from src.job_runner import JobRunner, Worker
 from src.markets import TITLED_TUESDAY
 from tests.test_trade_jobs import DATE, MARKET, PREV, FakeClient, backend, juicy, model  # noqa: F401
@@ -149,8 +149,9 @@ def test_status_uses_prior_week_guard_and_reports_worker(authed):
 
 # ── Ops jobs ─────────────────────────────────────────────────────────────────
 
-def _register_op(monkeypatch, code: str, verify=lambda: None):
-    op = strategies.OpsJob('recompute', 'Recompute', lambda d, p: [sys.executable, '-c', code], verify)
+def _register_op(monkeypatch, code: str, verify=lambda: None, timeout_s: float = 60):
+    op = strategies.OpsJob('recompute', 'Recompute', lambda d, p: [sys.executable, '-c', code], verify,
+                           timeout_s=timeout_s)
     monkeypatch.setitem(strategies.MARKETS[MARKET].ops, 'recompute', op)
 
 
@@ -191,6 +192,43 @@ def test_ops_verify_catches_recorded_failure(date_patched, monkeypatch):
     assert job['status'] == 'failed' and job['error'] == 'scrape failed'
 
 
+def test_ops_streams_output_while_running(date_patched, monkeypatch):
+    monkeypatch.setattr(job_runner, 'OPS_STREAM_EVERY_S', 0)
+    _register_op(monkeypatch, 'import time; print("step one"); time.sleep(0.5); print("step two")')
+    strategies.submit_ops(MARKET, 'recompute')
+    job = _run_op()
+    assert job['status'] == 'succeeded'
+    streamed = [e['message'] for e in q.list_events(job['id']) if e['kind'] == 'output']
+    assert 'step one' in streamed
+    log = [e for e in q.list_events(job['id']) if e['kind'] == 'log'][0]
+    assert 'step two' in log['data']['tail']
+
+
+def test_ops_uses_its_own_timeout(date_patched, monkeypatch):
+    _register_op(monkeypatch, 'import time; print("hung"); time.sleep(60)', timeout_s=0.5)
+    strategies.submit_ops(MARKET, 'recompute')
+    job = _run_op()
+    assert job['status'] == 'failed' and job['error'].startswith('Timed out')
+    log = [e for e in q.list_events(job['id']) if e['kind'] == 'log'][0]
+    assert 'hung' in log['data']['tail']
+
+
+def test_ops_survives_failed_cancel_check(date_patched, monkeypatch):
+    def broken(job_id):
+        raise OSError('connection dropped')
+    monkeypatch.setattr(q, 'is_cancel_requested', broken)
+    _register_op(monkeypatch, 'import time; time.sleep(0.2); print("done")')
+    strategies.submit_ops(MARKET, 'recompute')
+    job = _run_op()
+    assert job['status'] == 'succeeded'
+
+
+def test_recompute_has_short_timeout():
+    for market in strategies.MARKETS.values():
+        assert market.ops['recompute'].timeout_s <= 10 * 60
+        assert market.ops['run_pipeline'].timeout_s >= 30 * 60
+
+
 def test_duplicate_ops_refused(date_patched):
     strategies.submit_ops(MARKET, 'recompute')
     with pytest.raises(strategies.SubmissionError, match='already'):
@@ -210,6 +248,17 @@ def test_kill_leaves_ops_alone(date_patched):
     q.enqueue_kill(MARKET, DATE)
     job = q.get_job(ops_id)
     assert job['status'] == 'running' and job['cancel_requested'] is False
+
+
+def test_pipeline_run_rejects_another_markets_url(authed):
+    bb = 'https://www.chess.com/tournament/live/arena/bullet-brawl-november-07-2026-31401539'
+    tt = 'https://www.chess.com/tournament/live/titled-tuesday-blitz-november-10-2026-6123456'
+    r = authed.post('/api/markets/titled_tuesday/pipeline/run', json={'slug_url': bb})
+    assert r.status_code == 422 and 'Titled Tuesday' in r.json()['detail']
+    r = authed.post('/api/markets/bullet_brawl/pipeline/run', json={'slug_url': tt})
+    assert r.status_code == 422
+    assert strategies.MARKETS['bullet_brawl'].spec.is_event_url(bb)
+    assert strategies.MARKETS['titled_tuesday'].spec.is_event_url(tt)
 
 
 def test_ops_command_cannot_inject_flags():

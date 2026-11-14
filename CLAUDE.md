@@ -25,11 +25,13 @@ Services + one Postgres plugin, all sharing the single `Dockerfile` at the repo 
 | `tt-api` | `/bin/sh -c "exec python -m uvicorn api.main:app --host 0.0.0.0 --port $PORT"` | FastAPI + built React dashboard (`web/`). Replaces `tt-app` at cutover |
 | `tt-worker` | `python scripts/trade_worker.py` | Runs the trade queue, recomputes, pipeline retries, and live Kalshi snapshots. Run exactly one replica; restart policy ON_FAILURE |
 
-**Important Railway gotcha:** Cron expressions are evaluated in UTC regardless of the `TZ` env var. Use numeric day-of-week (`2` = Tuesday, `6` = Saturday), not the `TUE` alias. `TZ=America/New_York` only affects the container's clock inside Python (which matters for `_most_recent_tuesday()`).
+**Important Railway gotcha:** Cron expressions are evaluated in UTC regardless of the `TZ` env var. Use numeric day-of-week (`2` = Tuesday, `6` = Saturday), not the `TUE` alias. `TZ=America/New_York` only affects the container's clock inside Python (which matters for `MarketSpec.most_recent_event()`, the date each pipeline run is for).
 
 Env vars (set in Railway UI, per service unless noted):
-- **Shared:** `DATABASE_URL` (from Postgres plugin), `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_B64` (base64 of `~/.kalshi/trading-key.txt`), `KALSHI_ENV=prod`, `TZ=America/New_York`, `GH_TOKEN` (PAT for installing private `kalshi-core`)
+- **Shared:** `DATABASE_URL` (always the reference `${{Postgres.DATABASE_URL}}`, never a pasted URL: a copied public URL goes stale when the password changes, which crashed tt-worker and tt-cron in 2026-11), `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_B64` (base64 of `~/.kalshi/trading-key.txt`), `KALSHI_ENV=prod`, `TZ=America/New_York`, `GH_TOKEN` (PAT for installing private `kalshi-core`)
 - **tt-app only:** `DASHBOARD_PASSWORD`
+
+**Schema changes are not applied on deploy.** Before deploying code that needs new columns or tables, run the migration against Railway, e.g. `railway ssh` into tt-worker and run `python scripts/migrate_multi_market.py` (it uses the internal `DATABASE_URL`), or from your machine with `DATABASE_URL='<public URL>' python scripts/...` set for that one command. Only the queue tables (`job_queue.init_schema()`) are created automatically, by tt-api and tt-worker at startup.
 
 The `Dockerfile` installs `kalshi-core` at build time from a private GitHub repo using `GH_TOKEN`. Local dev can bind-mount `/opt/kalshi-core` instead — `docker-entrypoint.sh` handles both paths.
 
@@ -119,7 +121,7 @@ Lichess   ─┤→ scrapers → Postgres (Railway) or SQLite (local)
 - **`scripts/weekly_pipeline.py`** — orchestrates a market's three pre-trade steps (`MarketSpec.pipeline_steps`: `scrape_tt` or `scrape_bb` → `update_broadcasts → run_raw`) as a resumable state machine. Writes to `pipeline_runs` + `job_runs`. On any failure, halts with `state='failed'`, `error_kind` classified for the dashboard to show an appropriate retry UI.
 - **`scripts/trigger_adjusted.py`** — `run_adjusted` entry point. Reads `manual_adjustments` for the upcoming tourn_date, re-simulates, writes `latest_model_predictions`, flips the matching `pipeline_runs` row to `completed`.
 - **`api/main.py`** + **`web/`** — FastAPI + React dashboard for every registered market (market picker in the top bar). Pages: Trade / Edges / Portfolio / Odds / Attendance / Pipeline / Logs. Gated by `DASHBOARD_PASSWORD`.
-- **`app/dashboard.py`** — legacy Streamlit entry, Titled Tuesday only. Six tabs: Odds / Attendance / Pipeline / Portfolio / Trade / Jobs.
+- **`app/dashboard.py`** — legacy Streamlit entry, Titled Tuesday only. Seven tabs: Odds / Attendance / Pipeline / Portfolio / Trade / Edges / Jobs.
 
 ### Trade queue
 
@@ -137,7 +139,7 @@ Tests: `python -m pytest tests` (fake Kalshi client; set `TEST_PG_URL` to a disp
 
 ### Local analysis
 
-Notebooks and backtests run against a local SQLite copy of Railway, in the `tt` conda env (`requirements-dev.txt` plus `kalshi-core`, Jupyter kernel "Python (tt)").
+Notebooks and backtests run against a local SQLite copy of Railway, in the `tt` conda env (`requirements-dev.txt` plus `kalshi-core`, Jupyter kernel "Python (tt)"). Run every script from `tt`: conda `base` has a psycopg without libpq, so anything touching Postgres fails there with "no pq wrapper available".
 
 - `python scripts/pull_snapshot.py` refreshes `data/chess_tournament_data.db` over a read-only connection. Never put the Railway URL in `.env.local`.
 - `python scripts/run_backtest.py --notes "..."` records a run in `data/backtests.db` with its settings and git commit. Pulling a snapshot doesn't affect that file.
@@ -160,7 +162,7 @@ Notebooks and backtests run against a local SQLite copy of Railway, in the `tt` 
 
 ### Key modules
 
-**`src/config.py`** — Single source of truth for MC hyperparameters (`N_SIMS=100_000`, `SKILL_DECAY=0.96`, `PARTICIPATION_DECAY=0.75`), DB path (local), attendance model cutoffs. **No `TOURN_DATE` constant** — resolve dynamically via `src.pipeline.next_tourn_date()` which queries `MAX(titled_tuesday_standings.date) + 1 week`.
+**`src/config.py`** — Single source of truth for MC hyperparameters (`N_SIMS=100_000`, `SKILL_DECAY=0.96`, `PARTICIPATION_DECAY=0.75`), DB path (local), attendance model cutoffs. **No `TOURN_DATE` constant** — resolve dynamically via `src.pipeline.next_tourn_date(spec)`, which is one week after the latest date in the market's standings table.
 
 **`src/db.py`** — Dual-backend connection layer. `get_conn()` returns a wrapped DB-API connection (auto-translates `?` → `%s` on Postgres); `get_engine()` returns a cached SQLAlchemy engine for pandas-style access. Backend chosen at import time from `$DATABASE_URL`: `postgres(ql)://` → psycopg3, else SQLite at `config.DB_PATH`. Helpers: `upsert_many()`, `replace_market_rows()`, `read_market_rows()`, `table_columns()`.
 
@@ -177,7 +179,7 @@ The score and perf pools feed `run_simulation_ranked` (also exported as `run_sim
 - `run_raw(tourn_date)` — load → build pool → baseline simulation → optionally save to `latest_model_predictions_raw`.
 - `run_adjusted(tourn_date, cut_players=, keep_players=, p_participate_overrides=, p_nudges=, global_nudge=)` — merges adjustments into the raw pool, re-simulates, optionally saves to `latest_model_predictions`. Adjustment priority: `p_nudges` → `cut_players` → `p_participate_overrides` → `keep_players`.
 - `load_adjustments(tourn_date) -> dict` — reads `manual_adjustments` and shapes the rows into the kwargs `run_adjusted` expects. "Last-write-wins" per (player, type).
-- `next_tourn_date() -> str` — the one Tuesday after `MAX(titled_tuesday_standings.date)`.
+- `next_tourn_date(spec=TITLED_TUESDAY) -> str` — one week after the latest event in the market's standings table.
 
 **`src/kalshi_markets.py`** — Kalshi helpers for any market spec; `src/kalshi_tt.py` wraps them as `get_tt_markets()`, `get_tt_asks()`, `get_tt_positions_df()`. The positions reader joins Kalshi's live position data against the local kalshi-core `fills` table so transaction fees are reflected in `cost_incl_fees` and `avg_price_incl_fees`. Import `KalshiClient` from `kalshi_core`, not from here.
 
@@ -195,9 +197,10 @@ Bid math (`bid_cents`, `best_ask`, `apply_pullback`, `kalshi_order_price`) impor
 
 ```
 app/
-    dashboard.py        ← Streamlit entry (auth → banner → 6 tabs)
+    dashboard.py        ← Streamlit entry (auth → banner → 7 tabs)
     auth.py             ← DASHBOARD_PASSWORD gate via session_state
     banner.py           ← Persistent status strip reading pipeline_runs
+    trade_loop.py       ← Background take-trades loop thread for the Trade tab
     state.py            ← Cached DB loaders (st.cache_data) — current_status,
                            load_predictions, username_to_player_map, ...
                            Also defines the PipelineStatus NamedTuple.
@@ -207,6 +210,7 @@ app/
         pipeline.py     ← Timeline of current + recent pipeline_runs rows; retry controls
         portfolio.py    ← get_tt_positions_df + fee-inclusive metrics; Sync fills button
         trade.py        ← Place / Fade / Take / Cancel sub-sections, each two-tap confirm
+        edges.py        ← Current edge trades (compute_edges)
         jobs.py         ← Paginated job_runs log viewer
 ```
 
@@ -267,6 +271,8 @@ See `../kalshi-core/CLAUDE.md` for the kalshi-core API.
          state = completed  (trading unlocks)
 ```
 
+Each run is for `spec.most_recent_event()` and is keyed (market, tourn_date). If the cron never started (no row for the latest event once its day has passed), `/status` reports `pipeline_missing` and the dashboard shows a banner and a **Run pipeline for <date>** button. Runs go through the trade queue, so tt-worker must be up.
+
 Spending jobs refuse to fire when the prior event's `pipeline_runs.state != 'completed'` (stale-data guard), unless submitted with the override.
 
 ### Username / player-name mapping
@@ -300,4 +306,4 @@ Kalshi credentials live in `~/.kalshi/` (not in this repo):
 
 Database:
 - **Local:** nothing to configure — `DB_PATH = data/chess_tournament_data.db` (SQLite, auto-created).
-- **Railway-like local test:** put `DATABASE_URL=postgres://...` in `.env.local` (gitignored); `src/db.py` auto-loads it.
+- **Postgres local test:** put a local or disposable Postgres `DATABASE_URL=postgres://...` in `.env.local` (gitignored); `src/db.py` auto-loads it without overriding a variable already set. Never Railway's URL.

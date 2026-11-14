@@ -101,6 +101,8 @@ def run_pipeline(defn: PipelineDef, resume_from: str | None = None,
             print(f'[pipeline:{market}] already {run["state"]}; nothing to do.')
             return run
 
+        if slug_override and resume_from is None:
+            resume_from = defn.steps[0]     # a pasted URL feeds the scrape step, so start there
         steps = _steps_to_run(defn.steps, resume_from, run['state'], run['failed_step'], run['current_step'])
         print(f'[pipeline:{market}] steps to run: {steps}')
 
