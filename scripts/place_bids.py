@@ -61,6 +61,10 @@ def main() -> None:
         "--side", choices=["yes", "no"], default=None,
         help="Restrict bids to only 'yes' or 'no' side. Omit for both.",
     )
+    parser.add_argument(
+        "--match-on-best-available", action="store_true",
+        help="If the best competing bid is below the computed bid, rest 1 cent above it instead.",
+    )
     args = parser.parse_args()
 
     tourn_date = next_tourn_date()
@@ -75,6 +79,7 @@ def main() -> None:
         max_discount=args.max_discount,
         side_filter=args.side,
         dry_run=not args.live,
+        match_on_best_available=args.match_on_best_available,
     )
 
     if result["unmatched"]:

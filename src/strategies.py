@@ -29,6 +29,9 @@ class PlaceBidsParams(_Params):
     max_discount: float = Field(15, ge=0, le=50, title='Max discount (¢)',
                                 description='Hard cap on cents below fair')
     side_filter: Literal['yes', 'no'] | None = Field(None, title='Side')
+    match_on_best_available: bool = Field(
+        False, title='Match on best available',
+        description='If the best competing bid is lower, rest 1¢ above it instead')
 
 
 class FadeNoBidsParams(_Params):

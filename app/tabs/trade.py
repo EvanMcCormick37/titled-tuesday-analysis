@@ -169,12 +169,16 @@ def _render_place(gate_ok: bool, tourn_date: str) -> None:
                                        help='Hard cap on cents-off vs fair.')
     with cols[3]:
         side = st.selectbox('side', ('both', 'yes', 'no'), key='place_side')
+    match_best = st.toggle('match on best available', value=False, key='place_match_best',
+                           help='If the best competing bid is below the computed bid, '
+                                'rest 1¢ above it instead.')
 
     params = {
         'count': int(count),
         'markup': float(markup),
         'max_discount': float(max_discount),
         'side_filter': None if side == 'both' else side,
+        'match_on_best_available': bool(match_best),
     }
     from src.trading import place_bids
     _preview_execute_block('place', gate_ok, tourn_date, place_bids, params,

@@ -67,6 +67,28 @@ def _order_cents(order: dict) -> int | None:
         return None
 
 
+def _best_competing_bid(ob: dict, side: str, own_orders: list[dict]) -> int | None:
+    """Highest bid in cents on `side` that isn't one of our own resting orders.
+
+    Our own buy orders are subtracted level by level, so re-running place_bids
+    never matches (and then walks up from) its own previous bid.
+    """
+    own_qty: dict[int, float] = {}
+    for o in own_orders:
+        if o.get("action", "buy") != "buy":
+            continue
+        c = _order_cents(o)
+        if c is not None:
+            qty = float(o.get("remaining_count", o.get("count")) or 0)
+            own_qty[c] = own_qty.get(c, 0.0) + qty
+    best = None
+    for price, qty in ob.get(f"{side}_dollars") or []:
+        c = round(float(price) * 100)
+        if float(qty) - own_qty.get(c, 0.0) > 0 and (best is None or c > best):
+            best = c
+    return best
+
+
 def _cancel_intent(order: dict) -> CancelIntent:
     return CancelIntent(
         order_id=order["order_id"],
@@ -102,12 +124,16 @@ def plan_place_bids(
     sleep_read: float = 0.05,
     emit: Emit = noop_emit,
     spec: MarketSpec = TITLED_TUESDAY,
+    match_on_best_available: bool = False,
 ) -> Plan:
     """Plan resting bids for all of the market's contracts on tourn_date.
 
     markup: divisor applied to fair price (bid = fair / markup).
     max_discount: maximum cents-off cap so bid >= fair - max_discount.
     side_filter: if "yes" or "no", only place bids on that side.
+    match_on_best_available: if the best competing bid (excluding our own
+        resting orders) is below the computed bid, rest one cent above it
+        instead. With no competing bid, the computed bid is used.
 
     Always reads open orders, so a preview shows the real cancel-and-replace set.
     """
@@ -160,9 +186,16 @@ def plan_place_bids(
                     "reason": f"{side.upper()} fair={fair:.4f} maps to invalid bid",
                 })
                 continue
+            existing = open_by_key.get((ticker, side), [])
+            meta = {"n": n, "fair": round(fair, 4)}
+            if match_on_best_available:
+                competing = _best_competing_bid(ob, side, existing)
+                if competing is not None and competing + 1 < bid_c:
+                    meta["computed_bid"] = int(bid_c)
+                    meta["best_competing_bid"] = competing
+                    bid_c = competing + 1
             bid_c = apply_pullback(bid_c, best_ask(ob, side))
 
-            existing = open_by_key.get((ticker, side), [])
             to_cancel: list[dict] = []
             if existing:
                 price_field = "yes_price_dollars" if side == "yes" else "no_price_dollars"
@@ -177,7 +210,7 @@ def plan_place_bids(
             plan.orders.append(OrderIntent(
                 kind="place", ticker=ticker, side=side, count=count, price_c=bid_c,
                 expiration_ts=expiry, label=subtitle,
-                meta={"n": n, "fair": round(fair, 4), "replaces": len(to_cancel)},
+                meta={**meta, "replaces": len(to_cancel)},
             ))
     return plan
 
@@ -418,10 +451,12 @@ def place_bids(
     sleep_read: float = 0.05,
     sleep_write: float = 0.10,
     dry_run: bool = True,
+    match_on_best_available: bool = False,
 ) -> dict:
     """Plan and (unless dry_run) place resting bids. Returns {placed, cancelled, skipped, unmatched}."""
     plan = plan_place_bids(client, tourn_date, count, markup, max_discount, side_filter,
-                           sleep_read, emit=print_emit)
+                           sleep_read, emit=print_emit,
+                           match_on_best_available=match_on_best_available)
     print(format_plan(plan, dry_run))
     if dry_run:
         return {"placed": 0, "cancelled": 0, "skipped": len(plan.skipped), "unmatched": plan.unmatched}

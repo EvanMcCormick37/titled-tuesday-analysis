@@ -26,10 +26,11 @@ MARKET = 'titled_tuesday'
 class FakeClient:
     """Two players on the winner market; books are configurable per test."""
 
-    def __init__(self, asks_no_side=None, open_orders=None, fail_tickers=()):
+    def __init__(self, asks_no_side=None, open_orders=None, fail_tickers=(), bids_yes_side=None):
         self.tickers = [f'KXTITLEDTUESDAY-{KDATE}-AAA', f'KXTITLEDTUESDAY-{KDATE}-BBB']
         self.names = {self.tickers[0]: 'Player A', self.tickers[1]: 'Player B'}
         self.no_dollars = asks_no_side or {}
+        self.yes_dollars = bids_yes_side or {}
         self.open_orders = open_orders or []
         self.fail_tickers = set(fail_tickers)
         self.placed, self.taken, self.cancelled = [], [], []
@@ -41,7 +42,8 @@ class FakeClient:
         return [{'ticker': t, 'title': 'Winner', 'yes_sub_title': self.names[t]} for t in self.tickers]
 
     def get_orderbooks(self, tickers):
-        return {t: {'yes_dollars': [], 'no_dollars': self.no_dollars.get(t, [])} for t in tickers}
+        return {t: {'yes_dollars': self.yes_dollars.get(t, []),
+                    'no_dollars': self.no_dollars.get(t, [])} for t in tickers}
 
     def get_orderbook(self, ticker):
         return self.get_orderbooks([ticker])[ticker]
@@ -147,6 +149,41 @@ def test_plan_includes_cancels_and_sends_nothing(backend):
                                    sleep_read=0)
     assert [c.order_id for c in plan.cancels] == ['old']
     assert plan.orders and not client.placed and not client.cancelled
+
+
+def _yes_bid(plan, ticker):
+    return next(o.price_c for o in plan.orders if o.ticker == ticker and o.side == 'yes')
+
+
+def test_match_on_best_available_undercuts_to_one_above_best_bid(backend):
+    # Player A fair YES = 0.40; markup 1.15 / max_discount 5 -> computed bid 35c.
+    ticker = f'KXTITLEDTUESDAY-{KDATE}-AAA'
+    client = FakeClient(bids_yes_side={ticker: [['0.20', '10'], ['0.29', '5']]})
+    kw = dict(count=1, markup=1.15, max_discount=5, side_filter='yes', sleep_read=0)
+    assert _yes_bid(trading.plan_place_bids(client, DATE, **kw), ticker) == 35
+    plan = trading.plan_place_bids(client, DATE, match_on_best_available=True, **kw)
+    assert _yes_bid(plan, ticker) == 30
+
+
+def test_match_on_best_available_never_raises_bid_or_chases_own_order(backend):
+    ticker = f'KXTITLEDTUESDAY-{KDATE}-AAA'
+    kw = dict(count=1, markup=1.15, max_discount=5, side_filter='yes', sleep_read=0,
+              match_on_best_available=True)
+    # A competing bid above the computed price leaves the bid alone.
+    client = FakeClient(bids_yes_side={ticker: [['0.38', '10']]})
+    assert _yes_bid(trading.plan_place_bids(client, DATE, **kw), ticker) == 35
+    # Our own resting 30c order is ignored; the best other bid is 20c.
+    client = FakeClient(
+        bids_yes_side={ticker: [['0.20', '10'], ['0.30', '100']]},
+        open_orders=[{'order_id': 'mine', 'ticker': ticker, 'outcome_side': 'yes',
+                      'action': 'buy', 'yes_price_dollars': '0.30', 'remaining_count': 100}],
+    )
+    plan = trading.plan_place_bids(client, DATE, **kw)
+    assert _yes_bid(plan, ticker) == 21
+    assert [c.order_id for c in plan.cancels] == ['mine']
+    # No competing bids at all keeps the computed bid.
+    client = FakeClient()
+    assert _yes_bid(trading.plan_place_bids(client, DATE, **kw), ticker) == 35
 
 
 def test_legacy_wrappers_keep_return_shape_and_dry_run(backend, capsys):
