@@ -67,3 +67,12 @@ dockerfilePath = "Dockerfile"
 #   Env: shared vars + RAILWAY_DEPLOYMENT_DRAINING_SECONDS=30.
 #   Not a web service. Exactly one replica. Restart policy ON_FAILURE.
 #   Serves every registered market (Titled Tuesday, Bullet Brawl).
+#   Also runs the market-maker watchdog (cutoff layer 4 + dead-man's switch).
+#
+# tt-mm (reactive two-tier market maker, src/mm/):
+#   Start command: python scripts/market_maker.py
+#   Env: shared vars + MM_LIVE (unset/0 = shadow: computes quotes, sends nothing;
+#        1 = live), optional MM_SCOUTS=0 (anchors only), MM_MARKETS=titled_tuesday,
+#        MM_JOURNAL_DIR (mount a volume there to keep journals across deploys).
+#   Not a web service. Exactly one replica. Restart policy ON_FAILURE.
+#   Needs kalshi-core with KalshiWS (push kalshi-core main before deploying).

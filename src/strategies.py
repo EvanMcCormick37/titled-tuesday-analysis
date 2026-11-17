@@ -126,8 +126,8 @@ def _standard_strategies(spec: MarketSpec) -> dict[str, Strategy]:
     return {s.name: s for s in (
         Strategy(
             'place_bids', 'Place bids',
-            'Resting bids on every market at max(fair / markup, fair − max discount), '
-            f'expiring {_clock_label(spec.bid_expiry_hour)}.',
+            'Legacy, superseded by the market maker anchors. Resting bids on every market at '
+            f'max(fair / markup, fair − max discount), expiring {_clock_label(spec.bid_expiry_hour)}.',
             PlaceBidsParams,
             lambda client, d, p, emit: trading.plan_place_bids(client, d, emit=emit, spec=spec, **p),
         ),
@@ -279,6 +279,12 @@ def submit(
     m, s = get_strategy(market, strategy)
     validated = s.params_model(**params).model_dump()
     now = job_queue.utcnow()
+
+    if strategy == 'place_bids' and not dry_run:
+        from .mm.store import is_quoting_live
+        if is_quoting_live(market):
+            raise SubmissionError('The market maker is live on this market and already quotes '
+                                  'anchors; pause it first to place bids by hand')
 
     if run_at is not None and run_at.tzinfo is None:
         raise SubmissionError('run_at must include a timezone')

@@ -81,6 +81,8 @@ def backend(request, tmp_path, monkeypatch):
             conn.execute('DROP TABLE IF EXISTS trade_jobs')
             conn.execute('DROP TABLE IF EXISTS pipeline_runs')
             conn.execute('DROP TABLE IF EXISTS market_snapshots')
+            for t in ('mm_control', 'mm_player_overrides', 'mm_alerts', 'mm_status', 'mm_fills'):
+                conn.execute(f'DROP TABLE IF EXISTS {t}')
     else:
         monkeypatch.delenv('DATABASE_URL', raising=False)
         monkeypatch.setattr(db, 'DB_PATH', tmp_path / 'test.db')

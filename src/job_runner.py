@@ -316,6 +316,10 @@ class JobRunner:
         emit = _make_emit(job)
         client = self._client_factory()
         had_running = q.has_running_trade_job(market.slug)
+        if not self._wait_for_mm(market.slug):
+            emit('phase', 'Market maker has not confirmed the pause; sweeping anyway and again after.',
+                 level='warning')
+            had_running = True              # forces the second sweep below
 
         plan = strategy.plan(client, job['tourn_date'], job['params'], emit)
         q.set_plan(job_id, plan.to_dict(), plan.action_count)
@@ -337,6 +341,14 @@ class JobRunner:
         q.finish(job_id, _outcome_status(total), summary=total.to_dict(), iterations_delta=1)
 
     # ── Helpers ──────────────────────────────────────────────────────────────
+
+    def _wait_for_mm(self, market: str) -> bool:
+        from .mm.watchdog import wait_for_pause_ack
+        try:
+            return wait_for_pause_ack(market, timeout=self._kill_idle_timeout)
+        except Exception:  # noqa: BLE001
+            log.warning('could not check market-maker pause', exc_info=True)
+            return False
 
     @staticmethod
     def _cancel_requested(job_id: int) -> bool:
@@ -397,6 +409,7 @@ class Worker:
         heartbeat_seconds: float = 10.0,
         stale_after_seconds: float = 60.0,
         max_threads: int = 8,
+        watchdog_seconds: float = 10.0,
         **runner_kwargs: Any,
     ):
         self.worker_id = f'worker-{uuid.uuid4().hex[:8]}'
@@ -410,6 +423,9 @@ class Worker:
         self._refreshing: dict[tuple[str, str], concurrent.futures.Future] = {}
         self._last_heartbeat = 0.0
         self._client_factory = client_factory
+        self._watchdog_every = watchdog_seconds
+        self._last_watchdog = 0.0
+        self._watchdog_future: concurrent.futures.Future | None = None
 
     def stop(self) -> None:
         self._stop.set()
@@ -430,6 +446,22 @@ class Worker:
                 if key not in self._refreshing and q.snapshot_is_due(market.slug, kind, snap.ttl_seconds):
                     self._refreshing[key] = self._pool.submit(self._refresh_snapshot, market, kind)
 
+    def _run_watchdog(self) -> None:
+        from .mm import watchdog
+        try:
+            report = watchdog.check(self._client_factory(), MARKETS)
+            if any(v['cutoff'] or v['scouts'] for v in report.values()):
+                log.warning('market-maker watchdog acted: %s', report)
+        except Exception:  # noqa: BLE001 — retried next pass
+            log.exception('market-maker watchdog failed')
+
+    def _maybe_watchdog(self) -> None:
+        now = time.monotonic()
+        busy = self._watchdog_future is not None and not self._watchdog_future.done()
+        if self._watchdog_every and not busy and now - self._last_watchdog >= self._watchdog_every:
+            self._last_watchdog = now
+            self._watchdog_future = self._pool.submit(self._run_watchdog)
+
     def tick(self) -> int:
         """One poll cycle. Returns how many jobs were started."""
         self._active = {i: f for i, f in self._active.items() if not f.done()}
@@ -448,6 +480,7 @@ class Worker:
                 self._active[job['id']] = self._pool.submit(self._runner.run, job)
                 started += 1
         self._refresh_due_snapshots()
+        self._maybe_watchdog()
         return started
 
     def drain(self, timeout: float = 25.0) -> None:

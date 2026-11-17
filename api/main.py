@@ -26,6 +26,8 @@ from api import auth
 from src import job_queue as q
 from src import strategies as strat
 from src.db import get_conn, read_market_rows
+from src.mm import store as mm_store
+from src.mm.config import MMParams
 from src.pipeline import load_adjustments
 
 WEB_DIST = Path(__file__).resolve().parent.parent / 'web' / 'dist'
@@ -254,6 +256,81 @@ def snapshot(slug: str, kind: str, force: bool = False) -> dict:
         raise HTTPException(status_code=404, detail='Unknown snapshot')
     snap = q.request_snapshot(slug, kind, force)
     return {'payload': snap['payload'], 'error': snap['error'], 'fetched_at': snap['fetched_at']}
+
+
+# ── Market maker ─────────────────────────────────────────────────────────────
+# tt-mm writes its status every few seconds and reads control/overrides back,
+# so these handlers only touch the mm_* tables.
+
+MM_OFFLINE_AFTER_SECONDS = 20
+
+
+@api.get('/markets/{slug}/mm')
+def mm_overview(slug: str) -> dict:
+    market = _market(slug)
+    status = mm_store.get_status(slug)
+    age = mm_store.heartbeat_age(slug)
+    state = (status or {}).get('state') or {}
+    event_date = state.get('event_date') or market.next_event_date()
+    return {
+        'online': age is not None and age <= MM_OFFLINE_AFTER_SECONDS,
+        'heartbeat_age': age,
+        'mode': (status or {}).get('mode'),
+        'control': mm_store.get_control(slug),
+        'params': mm_store.params_for(slug).model_dump(),
+        'param_schema': MMParams.model_json_schema(),
+        'state': state,
+        'overrides': list(mm_store.get_overrides(slug, event_date).values()),
+        'alerts': mm_store.list_alerts(slug, 100),
+        'fills': mm_store.list_fills(slug, event_date, 100),
+    }
+
+
+class MMPauseBody(BaseModel):
+    paused: bool
+
+
+@api.post('/markets/{slug}/mm/pause')
+def mm_pause(slug: str, body: MMPauseBody) -> dict:
+    _market(slug)
+    mm_store.set_paused(slug, body.paused, 'dashboard' if body.paused else None, by='dashboard')
+    return {'paused': body.paused}
+
+
+@api.put('/markets/{slug}/mm/params')
+def mm_params(slug: str, body: dict) -> dict:
+    _market(slug)
+    return mm_store.set_params(slug, body, by='dashboard').model_dump()
+
+
+class MMRepostBody(BaseModel):
+    markup: float | None = Field(None, ge=1.0, le=10.0)
+
+
+def _mm_event_date(market: strat.Market) -> str:
+    status = mm_store.get_status(market.slug)
+    return ((status or {}).get('state') or {}).get('event_date') or market.next_event_date()
+
+
+@api.post('/markets/{slug}/mm/players/{username}/repost')
+def mm_repost(slug: str, username: str, body: MMRepostBody) -> dict:
+    market = _market(slug)
+    mm_store.repost_player(slug, _mm_event_date(market), username, body.markup)
+    return {'ok': True}
+
+
+@api.post('/markets/{slug}/mm/players/{username}/pull')
+def mm_pull(slug: str, username: str) -> dict:
+    market = _market(slug)
+    mm_store.pull_player(slug, _mm_event_date(market), username)
+    return {'ok': True}
+
+
+@api.post('/mm/alerts/{alert_id}/ack')
+def mm_ack(alert_id: int) -> dict:
+    if not mm_store.ack_alert(alert_id):
+        raise HTTPException(status_code=404, detail='Alert not found')
+    return {'ok': True}
 
 
 # ── Predictions ──────────────────────────────────────────────────────────────

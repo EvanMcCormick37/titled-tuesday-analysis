@@ -23,13 +23,15 @@ Services + one Postgres plugin, all sharing the single `Dockerfile` at the repo 
 | `bb-cron` | `python scripts/weekly_pipeline.py --market bullet_brawl` | The same pipeline for Bullet Brawl. Cron: `0 20 * * 6` (UTC — Saturday 16:00 EDT / 15:00 EST) |
 | `tt-app` | `python -m streamlit run app/dashboard.py --server.port=$PORT --server.address=0.0.0.0` | Mobile-friendly Streamlit dashboard — primary user interface |
 | `tt-api` | `/bin/sh -c "exec python -m uvicorn api.main:app --host 0.0.0.0 --port $PORT"` | FastAPI + built React dashboard (`web/`). Replaces `tt-app` at cutover |
-| `tt-worker` | `python scripts/trade_worker.py` | Runs the trade queue, recomputes, pipeline retries, and live Kalshi snapshots. Run exactly one replica; restart policy ON_FAILURE |
+| `tt-worker` | `python scripts/trade_worker.py` | Runs the trade queue, recomputes, pipeline retries, live Kalshi snapshots, and the market-maker watchdog. Run exactly one replica; restart policy ON_FAILURE |
+| `tt-mm` | `python scripts/market_maker.py` | Reactive two-tier market maker for every registered market (see "Market maker" below). Shadow unless `MM_LIVE=1`. Run exactly one replica; restart policy ON_FAILURE |
 
 **Important Railway gotcha:** Cron expressions are evaluated in UTC regardless of the `TZ` env var. Use numeric day-of-week (`2` = Tuesday, `6` = Saturday), not the `TUE` alias. `TZ=America/New_York` only affects the container's clock inside Python (which matters for `MarketSpec.most_recent_event()`, the date each pipeline run is for).
 
 Env vars (set in Railway UI, per service unless noted):
 - **Shared:** `DATABASE_URL` (always the reference `${{Postgres.DATABASE_URL}}`, never a pasted URL: a copied public URL goes stale when the password changes, which crashed tt-worker and tt-cron in 2026-11), `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_B64` (base64 of `~/.kalshi/trading-key.txt`), `KALSHI_ENV=prod`, `TZ=America/New_York`, `GH_TOKEN` (PAT for installing private `kalshi-core`)
 - **tt-app only:** `DASHBOARD_PASSWORD`
+- **tt-mm only:** `MM_LIVE=1` to send orders (otherwise shadow), optional `MM_SCOUTS=0` (anchors only), `MM_MARKETS` (comma-separated slugs), `MM_JOURNAL_DIR`
 
 **Schema changes are not applied on deploy.** Before deploying code that needs new columns or tables, run the migration against Railway, e.g. `railway ssh` into tt-worker and run `python scripts/migrate_multi_market.py` (it uses the internal `DATABASE_URL`), or from your machine with `DATABASE_URL='<public URL>' python scripts/...` set for that one command. Only the queue tables (`job_queue.init_schema()`) are created automatically, by tt-api and tt-worker at startup.
 
@@ -81,6 +83,10 @@ python scripts/cancel_bids.py
 
 python -m uvicorn api.main:app --reload     # React dashboard API (all markets)
 python -m streamlit run app/dashboard.py    # legacy Streamlit app (Titled Tuesday only)
+
+# ── Market maker ────────────────────────────────────────────────────────────
+python scripts/market_maker.py              # shadow: live books, computes quotes, sends nothing
+MM_LIVE=1 python scripts/market_maker.py    # live
 ```
 
 The trading CLI scripts above cover Titled Tuesday only; trade Bullet Brawl from the React dashboard.
@@ -136,6 +142,21 @@ All dashboard trading goes through one Postgres-backed queue. `tt-api` only adds
 Rules: jobs **re-plan when they fire**, and a plan above the approved `max_exposure` halts as `needs_review`. Spending strategies also halt if the prior week's `pipeline_runs` row isn't `completed`. One normal-lane job runs per market (enforced by a partial unique index), and recomputes share that lane because they briefly empty the predictions table. The kill switch (`enqueue_kill`) uses the priority lane. Live jobs are never auto-retried: a job whose worker dies becomes `interrupted`. Unless given `not_after`, a one-shot expires 15 minutes after its intended start and a loop ends at event start. For a loop, `max_exposure` is the total budget.
 
 Tests: `python -m pytest tests` (fake Kalshi client; set `TEST_PG_URL` to a disposable Postgres to also run against Postgres — tables are dropped). Frontend: `cd web && npm run dev` with the API on port 8000. `DASHBOARD_PASSWORD` is required (login fails closed); set `TT_INSECURE_COOKIE=1` for plain-http local testing.
+
+### Market maker (`src/mm/`, service `tt-mm`)
+
+Replaces resting `place_bids` with an event-driven quoter (design: `Kalshi Market-Making Architecture — Titled Tuesday.md`). One asyncio process quotes every registered market over one Kalshi WebSocket and one shared token bucket (the account is on the Basic tier: 100 write tokens/s; creates and amends cost 10, cancels 2).
+
+- Two tiers per contract and side (YES bid, NO bid), all prices integer cents in that side's frame. **Anchor** = the old place_bids price, `max(fair/markup, fair − max_discount)`. **Scout** = one cent above the best *competing* bid, capped at `fair − buffer_c` (default 1¢) and below the cross. Scout size tapers linearly from AV at the anchor to 0 at fair; anchor size = AV − scout. Pure function: `quoting.quote_side`.
+- The ex-own book subtracts **all** of the account's resting orders (MM, place_bids, fade, manual), so the scout never outbids us.
+- Fair value: `latest_model_predictions` (`p_participate × P_top{N}_given_play`), used only when the prior event's `pipeline_runs` row is `completed` and no recompute is running; validated as a unit (`fair_value.validate`). A new version reprices everything and clears fallback factors.
+- Anchor wipe (an anchor fully filled, at least `wipe_min_qty`): the player's fair value on that side is multiplied by `1 − wipe_ratio` across **all** their markets (`mm_player_overrides`). `max_wipes` wipes pull the player until **Repost** on the Market maker page (optionally with a per-player markup). New model runs clear factors, not pulls.
+- Orders: `post_only`, `client_order_id` prefixed `mma-`/`mms-` (the MM, its startup cancel and the watchdog only touch those), expiration = cutoff (`cutoff_minutes_before_start`, default 120), one order group per market. Price changes amend only if never filled, else cancel + recreate (amend count semantics after fills are ambiguous). Amending price loses queue position; decreasing keeps it.
+- Cutoff in four layers: order expiry, strategy clock, tt-mm cancel-all + verify, tt-worker watchdog (+1 min). Watchdog also cancels scouts if tt-mm's heartbeat is >20 s old.
+- Control: Market maker page (pause/resume, parameters stored as JSON overrides in `mm_control.params` and hot-reloaded, player repost/pull, alerts, fills, live quote sheet). The kill switch also pauses the MM. `place_bids` is legacy and refused while the MM is live and unpaused on that market.
+- Tables (`mm_control`, `mm_player_overrides`, `mm_alerts`, `mm_status`, `mm_fills`) are created by `job_queue.init_schema()`, so no migration is needed.
+- Journal: JSONL of every WS message and action in `MM_JOURNAL_DIR`.
+- kalshi-core gained `KalshiWS`, `order_body`/`create_order`, `amend_order`, `decrease_order`, `batch_create_orders`, `batch_cancel_orders`, `create_order_group`, `get_account_limits`.
 
 ### Local analysis
 

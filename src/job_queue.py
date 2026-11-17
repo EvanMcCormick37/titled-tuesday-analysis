@@ -161,6 +161,8 @@ def init_schema() -> None:
     with get_conn() as conn:
         for stmt in _ddl():
             conn.execute(stmt)
+    from .mm import store as mm_store      # market-maker tables live alongside the queue's
+    mm_store.init_schema()
 
 
 # ── Writes: submission ───────────────────────────────────────────────────────
@@ -204,10 +206,14 @@ def enqueue_kill(market: str, tourn_date: str, created_by: str | None = None) ->
     """Kill switch: drop queued work, stop running work, then cancel resting orders.
 
     Atomic, so no queued job can start between clearing the queue and inserting
-    the priority job.
+    the priority job. Also pauses the market maker for this market, so it cancels
+    its own quotes and doesn't re-post behind the sweep; resume it from the
+    Market maker page.
     """
+    from .mm import store as mm_store
     now = iso(utcnow())
     with get_conn() as conn:
+        mm_store.set_paused(market, True, 'kill switch', by=created_by or 'kill', conn=conn)
         conn.execute(
             "UPDATE trade_jobs SET status='cancelled', ended_at=?, error='Cancelled by kill switch' "
             f"WHERE market=? AND lane='normal' AND strategy NOT IN ({_OPS_SQL}) "

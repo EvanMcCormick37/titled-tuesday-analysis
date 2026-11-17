@@ -16,5 +16,6 @@ plotly>=5.22
 fastapi>=0.115
 uvicorn[standard]>=0.30
 pydantic>=2.7
+websockets>=12
 # kalshi-core (local package) — install separately: pip install -e /path/to/kalshi-core
 # On Railway: baked in at Docker build time via pip install git+https://${GH_TOKEN}@github.com/EvanMcCormick37/kalshi-core.git@main

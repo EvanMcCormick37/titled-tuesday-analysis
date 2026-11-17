@@ -6,6 +6,7 @@ import { JobDrawer } from './JobDrawer';
 import Attendance from './pages/Attendance';
 import Edges from './pages/Edges';
 import Logs from './pages/Logs';
+import MarketMaker from './pages/MarketMaker';
 import Odds from './pages/Odds';
 import Pipeline from './pages/Pipeline';
 import Portfolio from './pages/Portfolio';
@@ -22,6 +23,7 @@ export const useApp = () => useContext(AppContext)!;
 
 const PAGES = [
   ['trade', 'Trade', Trade],
+  ['mm', 'Market maker', MarketMaker],
   ['edges', 'Edges', Edges],
   ['portfolio', 'Portfolio', Portfolio],
   ['odds', 'Odds', Odds],
