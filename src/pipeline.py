@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 
 from .config import N_SIMS, SCORE_COMPOSITE_SCALE
-from .db import get_conn, read_market_rows, replace_market_rows
+from .db import get_conn, get_engine, read_market_rows, replace_market_rows
 from .data import load_and_prepare, market_player_to_username, match_player, resolve_player_names
 from .markets import TITLED_TUESDAY, MarketSpec
 from .simulation import build_player_pool_score, run_simulation_score, build_results
@@ -49,14 +49,17 @@ def run_raw(
     save_to_db: bool = False,
     n_sims: int = N_SIMS,
     spec: MarketSpec = TITLED_TUESDAY,
+    as_of: str | None = None,
 ) -> RawRun:
     """Build player pool and run the baseline (unadjusted) simulation.
 
     save_to_db=True writes results to latest_model_predictions_raw.
+    as_of restricts history to events before that date, to rebuild a past
+    week's prediction. Leave it unset in production.
     """
     print(f'Predicting for tournament date: {tourn_date}')
 
-    df, p_raw, app_counts = load_and_prepare(spec=spec)
+    df, p_raw, app_counts = load_and_prepare(spec=spec, as_of=as_of)
     players, p_play_raw, hist_composites, hist_wts = build_player_pool_score(
         df, p_raw, app_counts, min_appearances=5
     )
@@ -89,6 +92,7 @@ def run_adjusted(
     save_official: bool = False,
     n_sims: int = N_SIMS,
     spec: MarketSpec = TITLED_TUESDAY,
+    as_of: str | None = None,
 ) -> AdjustedRun:
     """Apply attendance adjustments and run the adjusted simulation.
 
@@ -100,7 +104,9 @@ def run_adjusted(
       keep_players            → p_participate = 1.0  (highest priority)
 
     Accepts an optional raw_run to reuse an already-built player pool.
-    save_official=True writes adjusted results to latest_model_predictions.
+    save_official=True writes adjusted results to latest_model_predictions and
+    archives them in historical_predictions. as_of is passed to run_raw when
+    no raw_run is given.
     """
     cut_players             = resolve_player_names(cut_players or [])
     keep_players            = resolve_player_names(keep_players or [])
@@ -108,7 +114,7 @@ def run_adjusted(
     p_nudges                = resolve_player_names(p_nudges or {})
 
     if raw_run is None:
-        raw_run = run_raw(tourn_date, save_to_db=False, n_sims=n_sims, spec=spec)
+        raw_run = run_raw(tourn_date, save_to_db=False, n_sims=n_sims, spec=spec, as_of=as_of)
 
     players, p_play_raw, hist_composites, hist_wts, p_raw = (
         raw_run.players, raw_run.p_play, raw_run.hist_composites, raw_run.hist_wts, raw_run.p_raw
@@ -218,6 +224,26 @@ def _save_adjusted_to_db(
 
     n_altered = int(out['attendance_altered'].sum())
     print(f'Saved {len(out):,} rows -> latest_model_predictions ({n_altered} attendance_altered)')
+
+    _archive_predictions(out, tourn_date, spec)
+
+
+def _archive_predictions(out: pd.DataFrame, tourn_date: str, spec: MarketSpec) -> None:
+    """Replace this market's historical_predictions rows for tourn_date with `out`.
+
+    Each recompute overwrites the week, so the archive holds the last official
+    prediction before the event, the one that was traded.
+    """
+    from sqlalchemy import inspect, text
+    with get_engine().begin() as sa_conn:
+        if inspect(sa_conn).has_table('historical_predictions'):
+            sa_conn.execute(
+                text('DELETE FROM historical_predictions WHERE market = :m AND tourn_date = :d'),
+                {'m': spec.slug, 'd': tourn_date},
+            )
+        out.assign(market=spec.slug).to_sql('historical_predictions', sa_conn,
+                                            if_exists='append', index=False)
+    print(f'Archived {len(out):,} rows -> historical_predictions ({tourn_date})')
 
 
 def load_adj_run_from_db(tourn_date: str | None = None,

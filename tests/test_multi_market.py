@@ -11,7 +11,7 @@ from src import db, strategies, trading
 from src.data import _conflict_z_deduction
 from src.markets import BULLET_BRAWL, TITLED_TUESDAY
 from src.multi_market_schema import migrate
-from src.pipeline import load_adjustments
+from src.pipeline import _archive_predictions, load_adjustments
 from src.pipeline_runner import PipelineDef, run_pipeline
 from src.trade_plan import noop_emit
 
@@ -144,6 +144,14 @@ def test_replacing_one_market_keeps_the_other(database):
     assert db.read_market_rows('latest_model_predictions', BB)['p_participate'].tolist() == [pytest.approx(0.8)]
     tt = db.read_market_rows('latest_model_predictions', TT)
     assert tt['username'].tolist() == ['a'] and 'market' not in tt.columns
+
+
+def test_archiving_replaces_only_that_market_and_week(database):
+    week = pd.DataFrame({'username': ['b', 'c'], 'p_participate': [0.2, 0.3], 'tourn_date': ['2026-11-03'] * 2})
+    _archive_predictions(week, '2026-11-03', BULLET_BRAWL)
+    _archive_predictions(week.iloc[:1], '2026-11-03', BULLET_BRAWL)   # a recompute overwrites the week
+    assert _count('historical_predictions', f"market = '{BB}'") == 1
+    assert _count('historical_predictions', f"market = '{TT}' AND username = 'a'") == 1
 
 
 def test_adjustments_are_scoped(database):
