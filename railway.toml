@@ -2,7 +2,7 @@
 #
 # Each service is created via the Railway UI pointing at this repo; this file
 # provides the build + default deploy config they share.
-#
+# \
 # To create the services:
 #   1. Railway → New Service → GitHub Repo → EvanMcCormick37/titled-tuesday-analysis (branch: mobile-production)
 #   2. For each service, override the start command in the UI:
