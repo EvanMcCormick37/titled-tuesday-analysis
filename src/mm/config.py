@@ -23,8 +23,9 @@ class MMParams(BaseModel):
 
     # ── Scout (top-of-book) layer ─────────────────────────────────────────────
     scouts_enabled: bool = Field(True, title='Scouts enabled')
-    buffer_c: int = Field(1, ge=1, le=20, title='Buffer (¢)',
-                          description='Scout never bids above fair − buffer')
+    buffer_c: int = Field(2, ge=1, le=20, title='Buffer (¢)',
+                          description='Scout never bids above fair − buffer. The attendance researcher '
+                                      'also halts trading when a finding moves fair value by at least this much')
     min_scout: int = Field(1, ge=1, le=1_000, title='Min scout size')
     min_dwell_ms: int = Field(200, ge=0, le=5_000, title='Min dwell (ms)',
                               description='A move must persist this long before repricing, unless outbid')

@@ -11,7 +11,7 @@ from src.mm.oms import ANCHOR, OMS, RESTING, SCOUT, UNKNOWN, TokenBucket
 from src.mm.quoting import Quote, quote_side, scout_volume, side_fair
 
 T = 'KXTITLEDTUESDAY-26NOV17-AAA'
-P = MMParams()          # markup 1.5, max_discount 15, AV 200, buffer 1
+P = MMParams()          # markup 1.5, max_discount 15, AV 200, buffer 2
 
 
 def book(yes=(), no=()):
@@ -51,8 +51,21 @@ def test_scout_improves_one_tick_and_sizes_linearly():
 
 
 def test_scout_rests_at_buffer_edge_when_competitor_is_inside():
+    # fair 30¢, buffer 2 → ceiling 28¢; a competitor at 29¢ is inside the buffer.
     sq = quote_side(book(yes=[(29, 50)]), 'yes', 0.30, {}, P)
-    assert sq.scout == Quote(29, 20) and 'inside buffer' in sq.note
+    assert sq.scout == Quote(28, 40) and 'inside buffer' in sq.note    # 200 × (30 − 28) / (30 − 20)
+    sq = quote_side(book(yes=[(29, 50)]), 'yes', 0.30, {}, MMParams(buffer_c=1))
+    assert sq.scout == Quote(29, 20)
+
+
+def test_default_buffer_suppresses_scouts_only_on_the_cheapest_contracts():
+    # Anchor = fair / 1.5 below 45¢ fair, so the ceiling (fair − buffer) only clears
+    # the anchor above 3 × buffer: 6¢ with the default 2¢ buffer.
+    assert P.buffer_c == 2
+    sq = quote_side(book(yes=[(5, 50)]), 'yes', 0.06, {}, P)              # anchor 4¢, ceiling 4¢
+    assert sq.scout is None and sq.anchor == Quote(4, 200)
+    assert quote_side(book(yes=[(9, 50)]), 'yes', 0.12, {}, P).scout == Quote(10, 100)   # anchor 8¢, ceiling 10¢
+    assert quote_side(book(yes=[(9, 50)]), 'yes', 0.12, {}, MMParams(buffer_c=5)).scout is None
 
 
 def test_no_scout_when_anchor_already_best_or_book_empty():
@@ -83,7 +96,7 @@ def test_no_side_is_symmetric():
 
 
 def test_war_mode_rests_at_edge_and_stale_book_drops_scouts():
-    assert quote_side(book(yes=[(22, 5)]), 'yes', 0.30, {}, P, war_mode=True).scout.price == 29
+    assert quote_side(book(yes=[(22, 5)]), 'yes', 0.30, {}, P, war_mode=True).scout.price == 28
     b = book(yes=[(22, 5)])
     b.stale = True
     sq = quote_side(b, 'yes', 0.30, {}, P)

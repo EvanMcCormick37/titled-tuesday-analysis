@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import time
 from contextlib import asynccontextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +29,9 @@ from src.db import get_conn, read_market_rows
 from src.mm import store as mm_store
 from src.mm.config import MMParams
 from src.pipeline import load_adjustments
+from src.research import store as research_store
+from src.research.operator import OperatorEvent
+from src.research.overlap import KINDS as CLASH_KINDS, classify, event_window
 
 WEB_DIST = Path(__file__).resolve().parent.parent / 'web' / 'dist'
 WORKER_OFFLINE_AFTER_SECONDS = 45
@@ -371,6 +374,80 @@ def predictions(slug: str, n: int = 1, adjusted: bool = True, limit: int = 30) -
     } for r in view.rename(columns={given: 'p_given'}).itertuples()]
     date = df['tourn_date'].iloc[0] if 'tourn_date' in df.columns else None
     return {'rows': rows, 'pool_size': len(df), 'tourn_date': _ts(date)}
+
+
+# ── Attendance research ──────────────────────────────────────────────────────
+
+def _event_summary(ev: dict, window, params) -> dict:
+    """An event for the catalog view: its clash with the window, players trimmed to a count."""
+    out = {k: v for k, v in ev.items() if k not in ('players', 'rounds')}
+    out['player_count'] = len(ev['players'])
+    if ev['source'] == 'operator':
+        out['players'] = [p['name'] for p in ev['players']]
+    out['clash'] = classify(ev, window, params)
+    return out
+
+
+@api.get('/markets/{slug}/research')
+def research_overview(slug: str) -> dict:
+    market = _market(slug)
+    event_date = market.next_event_date()
+    params = research_store.params_for(slug)
+    window = event_window(market.spec, event_date)
+    day = date.fromisoformat(event_date)
+    margin = timedelta(days=params.calendar_days)
+    events = research_store.events_overlapping((day - margin).isoformat(), (day + margin).isoformat())
+    summaries = [_event_summary(ev, window, params) for ev in events]
+    summaries.sort(key=lambda e: (CLASH_KINDS.index(e['clash']['kind']) if e['clash'] else len(CLASH_KINDS),
+                                  -(e['tier'] or 0), e['name']))
+    run = research_store.latest_run(slug)
+    if run:
+        run['candidate_count'] = len(run.pop('candidates') or [])
+        run['for_current_event'] = run['tourn_date'] == event_date
+    return {
+        'event_date': event_date,
+        'window': {'start': q.iso(window.start), 'end': q.iso(window.end)},
+        'control': research_store.get_control(slug),
+        'params': params.model_dump(),
+        'run': run,
+        'recent_runs': research_store.recent_runs(slug, 8),
+        'events': summaries,
+    }
+
+
+@api.post('/markets/{slug}/research/run')
+def research_run(slug: str) -> dict:
+    _market(slug)
+    return {'id': strat.submit_ops(slug, 'research', created_by='dashboard')}
+
+
+class PolicyBody(BaseModel):
+    policy: str
+    value: float | None = None
+    note: str | None = Field(None, max_length=1000)
+
+
+@api.put('/research/events/{event_id}/policy')
+def research_policy(event_id: int, body: PolicyBody) -> dict:
+    try:
+        found = research_store.set_policy(event_id, body.policy, body.value, body.note)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e)) from None
+    if not found:
+        raise HTTPException(status_code=404, detail='No such event')
+    return {'ok': True}
+
+
+@api.post('/research/events')
+def research_add_event(body: OperatorEvent) -> dict:
+    return {'id': research_store.add_operator_event(body.to_record())}
+
+
+@api.delete('/research/events/{event_id}')
+def research_delete_event(event_id: int) -> dict:
+    if not research_store.delete_operator_event(event_id):
+        raise HTTPException(status_code=404, detail='No such operator-added event')
+    return {'ok': True}
 
 
 # ── Attendance adjustments ───────────────────────────────────────────────────

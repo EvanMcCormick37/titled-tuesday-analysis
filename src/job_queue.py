@@ -4,6 +4,8 @@ Rules enforced here rather than in callers:
   - At most one `normal`-lane job runs per market. A partial UNIQUE index makes
     this a database guarantee, not just a worker convention.
   - `priority`-lane jobs (the kill switch) ignore that limit.
+  - `background`-lane jobs (attendance research) ignore it too, and never block
+    the market's lane: they read predictions but never change them or orders.
   - A live job is never retried automatically. If a worker dies mid-job the job
     becomes `interrupted` and waits for a human, to avoid double orders.
 
@@ -22,10 +24,12 @@ from .db import get_conn, is_postgres
 ACTIVE_STATUSES = ('queued', 'running', 'needs_review')
 TERMINAL_STATUSES = ('succeeded', 'partial', 'failed', 'cancelled', 'interrupted', 'expired')
 
-# Non-trading jobs. They share the market's lane on purpose: a trade must never
-# plan against predictions that are mid-recompute. The kill switch leaves them
-# alone because they can't place orders.
-OPS_STRATEGIES = ('recompute', 'run_pipeline')
+# Non-trading jobs, run as subprocesses. Recompute and pipeline runs share the
+# market's lane on purpose: a trade must never plan against predictions that are
+# mid-recompute. Research runs in the background lane (it only reads). The kill
+# switch leaves all of them alone because they can't place orders.
+OPS_STRATEGIES = ('recompute', 'run_pipeline', 'research')
+LANES = ('normal', 'priority', 'background')
 _OPS_SQL = ', '.join(f"'{s}'" for s in OPS_STRATEGIES)
 
 _JOB_COLUMNS = (
@@ -86,6 +90,7 @@ def _ddl() -> list[str]:
         else ('INTEGER PRIMARY KEY AUTOINCREMENT', 'TEXT', 'TEXT')
     )
     statuses = ', '.join(f"'{s}'" for s in ACTIVE_STATUSES + TERMINAL_STATUSES)
+    lanes = ', '.join(f"'{s}'" for s in LANES)
     return [
         f"""
         CREATE TABLE IF NOT EXISTS trade_jobs (
@@ -96,7 +101,7 @@ def _ddl() -> list[str]:
             params              {js} NOT NULL,
             dry_run             INTEGER NOT NULL DEFAULT 0,
             lane                TEXT NOT NULL DEFAULT 'normal'
-                                CHECK (lane IN ('normal','priority')),
+                                CHECK (lane IN ({lanes})),
             status              TEXT NOT NULL DEFAULT 'queued'
                                 CHECK (status IN ({statuses})),
             run_at              {ts} NOT NULL,
@@ -163,6 +168,8 @@ def init_schema() -> None:
             conn.execute(stmt)
     from .mm import store as mm_store      # market-maker tables live alongside the queue's
     mm_store.init_schema()
+    from .research import store as research_store
+    research_store.init_schema()
 
 
 # ── Writes: submission ───────────────────────────────────────────────────────
@@ -286,7 +293,7 @@ def claim_next(worker_id: str, lane: str = 'normal') -> dict | None:
         WHERE status='queued' AND id = (
             SELECT j.id FROM trade_jobs j
             WHERE j.status='queued' AND j.lane=? AND j.run_at <= ?
-              AND (j.lane='priority' OR NOT EXISTS (
+              AND (j.lane <> 'normal' OR NOT EXISTS (
                     SELECT 1 FROM trade_jobs r
                     WHERE r.market=j.market AND r.lane='normal' AND r.status='running'))
             ORDER BY j.run_at, j.id

@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react';
 import { req } from '../api';
 import { useApp } from '../App';
 import { ErrorNote } from '../components';
+import ResearchPanel from './Research';
 
 type Adjustments = {
   cut_players: string[];
@@ -98,6 +99,8 @@ export default function Attendance() {
   const set = (patch: Partial<Adjustments>) => setForm({ ...form, ...patch });
 
   return (
+    <div className="stack">
+    <ResearchPanel />
     <section className="card stack">
       <h2>Attendance · {q.data.event_date}</h2>
       <p className="muted">Saving replaces all adjustments for this event. What you see here is the full set.</p>
@@ -118,5 +121,6 @@ export default function Attendance() {
         <button className="btn primary" disabled={save.isPending} onClick={() => save.mutate(true)}>Save and recompute</button>
       </div>
     </section>
+    </div>
   );
 }

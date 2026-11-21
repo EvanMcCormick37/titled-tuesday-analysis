@@ -37,6 +37,9 @@ class MarketSpec:
     bid_expiry_hour: int
     bid_expiry_minute: int
     model: ModelConfig
+    # How long the event runs from its start; the attendance researcher's clash
+    # test treats any other tournament round overlapping this window as a hard clash.
+    event_duration_minutes: int = 150
     prediction_ns: tuple[int, ...] = (1, 3, 5, 8, 10)
     timezone: str = 'America/New_York'
     # Weekly pipeline steps, in order. The runner in scripts/weekly_pipeline.py and

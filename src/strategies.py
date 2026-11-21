@@ -73,6 +73,7 @@ class OpsJob:
     command: Callable[[str, dict], list[str]]
     verify: Callable[[], str | None] = lambda: None   # returns an error if the run failed
     timeout_s: float = 45 * 60                        # killed and marked failed after this
+    lane: str = 'normal'                              # 'background' for jobs that never change predictions
 
 
 @dataclass(frozen=True)
@@ -169,6 +170,19 @@ def _pipeline_command(spec: MarketSpec, event_date: str, params: dict) -> list[s
     return cmd
 
 
+def _research_command(spec: MarketSpec, event_date: str, params: dict) -> list[str]:
+    return [sys.executable, str(_SCRIPTS / 'research_attendance.py'),
+            f'--market={spec.slug}', f'--date={event_date}']
+
+
+def _research_error(spec: MarketSpec) -> str | None:
+    from .research import store as research_store
+    run = research_store.latest_run(spec.slug)
+    if run and run['status'] == 'failed':
+        return run['error'] or 'Research run failed'
+    return None
+
+
 def _pipeline_error(spec: MarketSpec) -> str | None:
     """The pipeline exits 0 after recording a failure, so check what it recorded."""
     from .db import get_conn
@@ -199,6 +213,9 @@ def _market_for(spec: MarketSpec) -> Market:
                                 timeout_s=5 * 60),
             'run_pipeline': OpsJob('run_pipeline', 'Run pipeline', partial(_pipeline_command, spec),
                                    partial(_pipeline_error, spec)),
+            # Reads predictions and public calendars only, so it never holds the trade lane.
+            'research': OpsJob('research', 'Research attendance', partial(_research_command, spec),
+                               partial(_research_error, spec), timeout_s=15 * 60, lane='background'),
         },
         snapshots={
             'edges': Snapshot(lambda client, d: market_views.edges_snapshot(client, d, spec), 15),
@@ -246,7 +263,7 @@ def submit_ops(market: str, name: str, params: dict | None = None,
     if job_queue.has_active_job(market, name):
         raise SubmissionError(f'{m.ops[name].label} is already queued or running')
     return job_queue.enqueue(market=market, strategy=name, tourn_date=m.next_event_date(),
-                             params=params or {}, created_by=created_by)
+                             params=params or {}, lane=m.ops[name].lane, created_by=created_by)
 
 
 DEFAULT_WINDOW_MINUTES = 15

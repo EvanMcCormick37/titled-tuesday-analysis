@@ -263,7 +263,7 @@ class JobRunner:
                 proc = subprocess.Popen(
                     op.command(job['tourn_date'], job['params']),
                     cwd=PROJECT_ROOT, stdout=child_out, stderr=subprocess.STDOUT,
-                    env={**os.environ, 'PYTHONUNBUFFERED': '1'},
+                    env={**os.environ, 'PYTHONUNBUFFERED': '1', 'TT_JOB_ID': str(job_id)},
                 )
                 stream = _OutputStream(reader, emit)
                 deadline = time.monotonic() + op.timeout_s
@@ -474,7 +474,7 @@ class Worker:
             self._last_heartbeat = now
 
         started = 0
-        for lane in ('priority', 'normal'):
+        for lane in q.LANES:                 # priority first, then normal, then background
             while (job := q.claim_next(self.worker_id, lane)) is not None:
                 log.info('starting job %s (%s)', job['id'], job['strategy'])
                 self._active[job['id']] = self._pool.submit(self._runner.run, job)

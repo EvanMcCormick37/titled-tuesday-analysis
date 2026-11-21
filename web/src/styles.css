@@ -95,7 +95,7 @@ details summary { cursor: pointer; color: var(--muted); }
 .grid-two { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 
 /* Controls */
-input, select { font: inherit; color: inherit; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; width: 100%; min-height: 34px; }
+input, select, textarea { font: inherit; color: inherit; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; width: 100%; min-height: 34px; }
 input[type='checkbox'] { width: auto; min-height: 0; }
 .brand select { width: auto; }
 .field { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
@@ -234,7 +234,12 @@ dialog::backdrop { background: rgb(0 0 0 / .45); }
   .brand { flex: 1; }
   .page { padding: 8px; }
   .card { padding: 12px; }
-  input, select { font-size: 16px; }
+  input, select, textarea { font-size: 16px; }
   .chart-row { grid-template-columns: 100px minmax(0, 1fr) 54px; gap: 6px; }
   .chart.two .chart-row { grid-template-columns: 84px minmax(0, 1fr) 46px minmax(0, 1fr) 46px; gap: 4px; }
 }
+
+/* Attendance research */
+.research-events { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
+.research-event { border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; gap: 4px; }
+.research-event select { width: auto; max-width: 100%; }
