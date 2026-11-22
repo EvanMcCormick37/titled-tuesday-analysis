@@ -260,7 +260,8 @@ def test_bullet_brawl_is_registered_with_its_own_spec():
     assert set(market.strategies) == set(strategies.MARKETS[TT].strategies)
     assert BULLET_BRAWL.pipeline_steps[0] == 'scrape_bb'
     assert BULLET_BRAWL.model.score_noise_sigma == 10.0
-    assert TITLED_TUESDAY.model.score_noise_sigma == 0.0
+    # Tiebreak smoothing: 100 composite units, never 0 (deterministic tiebreaks).
+    assert TITLED_TUESDAY.model.score_noise_sigma * 10_000 == pytest.approx(100.0)
 
 
 def test_every_market_has_a_pipeline():

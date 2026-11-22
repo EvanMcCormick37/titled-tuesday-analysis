@@ -474,6 +474,16 @@ def request_snapshot(market: str, kind: str, force: bool = False) -> dict:
     return _row_to_snapshot(row)
 
 
+def get_snapshot(market: str, kind: str) -> dict | None:
+    """The latest copy of a snapshot, without registering a viewer."""
+    with get_conn() as conn:
+        row = conn.execute(
+            f'SELECT {", ".join(_SNAPSHOT_COLS)} FROM market_snapshots WHERE market=? AND kind=?',
+            (market, kind),
+        ).fetchone()
+    return None if row is None else _row_to_snapshot(row)
+
+
 def snapshot_is_due(market: str, kind: str, ttl_seconds: float, viewer_window: float = 120) -> bool:
     now = utcnow()
     with get_conn() as conn:

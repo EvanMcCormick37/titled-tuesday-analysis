@@ -20,7 +20,12 @@ class ModelConfig:
     min_participation_rate: float
     season_shift_date: str | None = None
     season_shift_factor: float = 1.0
-    score_noise_sigma: float = 0.0     # Gaussian noise on each sampled score, in score points
+    # Gaussian noise on each sampled score, in score points (x SCORE_COMPOSITE_SCALE in the MC).
+    # Never 0: the composite is score*10000 + tiebreak, so with no noise every replayed result
+    # keeps its exact historical tiebreak and ties resolve deterministically. 0.01 points = 100
+    # composite units (config.SCORE_GAUSSIAN_KERNEL_SIGMA_NARROW), which shuffles tiebreaks
+    # without moving anyone across a score bucket.
+    score_noise_sigma: float = 0.01
     played_filter: str | None = None   # SQL condition for a standings row that counts as attending
 
 

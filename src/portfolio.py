@@ -124,8 +124,13 @@ def run_portfolio_mc(players, p_play, hist_pcts, hist_wts,
 
 
 def run_portfolio_mc_score(players, p_play, hist_composites, hist_wts,
-                           portfolio, n_sims=N_SIMS, chunk=CHUNK, seed=SEED):
-    """Rank by (score, tiebreak) composite. Returns (pnl_per_sim, p_win) where p_win is per-position win probability."""
+                           portfolio, n_sims=N_SIMS, chunk=CHUNK, seed=SEED,
+                           noise_sigma=0.01, log=print):
+    """Rank by (score, tiebreak) composite. Returns (pnl_per_sim, p_win) where p_win is per-position win probability.
+
+    noise_sigma matches the market's `score_noise_sigma * SCORE_COMPOSITE_SCALE`
+    (as in run_raw / run_adjusted); log=None silences progress lines.
+    """
     rng   = np.random.default_rng(seed)
     n     = len(players)
     max_N = int(portfolio['n_values'].max())
@@ -149,6 +154,8 @@ def run_portfolio_mc_score(players, p_play, hist_composites, hist_wts,
         for i in range(n):
             idx = rng.choice(len(hist_composites[i]), size=c, p=hist_wts[i], replace=True)
             scores[:, i] = hist_composites[i][idx]
+        if noise_sigma > 0.0:
+            scores += rng.normal(0.0, noise_sigma, size=scores.shape)
 
         present = rng.random((c, n)) < p_play
         scores[~present] = -np.inf
@@ -173,7 +180,8 @@ def run_portfolio_mc_score(players, p_play, hist_composites, hist_wts,
         revenue                      = (outcome * port_volumes[None, :]).sum(axis=1)
         pnl_per_sim[start:start + c] = revenue - total_cost
 
-        print(f'  {start + c:>7,} / {n_sims:,}  ({time.time() - t0:.1f}s)')
+        if log:
+            log(f'  {start + c:>7,} / {n_sims:,}  ({time.time() - t0:.1f}s)')
 
     return pnl_per_sim, outcome_sum / n_sims
 
@@ -376,3 +384,97 @@ def run_payoff_matrix(players, p_play, hist_pcts, hist_wts,
 
     return payoff_matrix, cps
 
+
+
+# ── Dashboard P&L simulation ─────────────────────────────────────────────────
+
+PNL_SIMS = 25_000
+PNL_BINS = 60
+
+
+def summarize_pnl(pnl: np.ndarray, total_cost: float, bins: int = PNL_BINS) -> tuple[dict, list[dict]]:
+    """Summary stats and an equal-width histogram of simulated P&L, JSON-ready."""
+    pnl = np.asarray(pnl, dtype=np.float64)
+    q = np.percentile(pnl, [5, 25, 50, 75, 95])
+    ev = float(pnl.mean())
+    summary = {
+        'ev': ev,
+        'cost': float(total_cost),
+        'expected_payout': ev + float(total_cost),
+        'roi': ev / total_cost if total_cost > 0 else None,
+        'std': float(pnl.std()),
+        'p_profit': float((pnl > 0).mean()),
+        'p05': float(q[0]), 'p25': float(q[1]), 'p50': float(q[2]),
+        'p75': float(q[3]), 'p95': float(q[4]),
+        'min': float(pnl.min()), 'max': float(pnl.max()),
+    }
+    lo, hi = summary['min'], summary['max']
+    if hi - lo < 1e-9:
+        return summary, [{'lo': lo, 'hi': hi, 'count': int(len(pnl))}]
+    counts, edges = np.histogram(pnl, bins=bins, range=(lo, hi))
+    hist = [{'lo': float(edges[k]), 'hi': float(edges[k + 1]), 'count': int(counts[k])}
+            for k in range(len(counts))]
+    return summary, hist
+
+
+def simulate_positions_pnl(positions: pd.DataFrame, spec, tourn_date: str,
+                           n_sims: int = PNL_SIMS, log=None) -> dict:
+    """Monte Carlo P&L of the held positions under the official predictions.
+
+    `positions` is `get_positions_df` output. Joint outcomes come from the same
+    score-composite pool as the model, with each player's p_participate taken
+    from latest_model_predictions (so manual adjustments are included). Cost
+    includes fees. A position whose player isn't in the pool counts as a loss
+    in every simulation and is listed under `unmatched`.
+    """
+    from .config import SCORE_COMPOSITE_SCALE
+    from .data import market_player_to_username, match_player
+    from .db import read_market_rows
+    from .pipeline import load_adj_run_from_db
+
+    saved = read_market_rows('latest_model_predictions', spec.slug)
+    if saved.empty:
+        raise RuntimeError('No official predictions for this market yet; recompute first.')
+    predictions_date = str(saved['tourn_date'].iloc[0])[:10]
+    warnings = []
+    if predictions_date != tourn_date:
+        warnings.append(f'Predictions are for {predictions_date}, not {tourn_date}.')
+
+    run = load_adj_run_from_db(spec=spec)
+    name_map = market_player_to_username(run.players, spec)
+    df = positions.copy()
+    df['username'] = [match_player(t, name_map) for t in df['marketTitle']]
+    cost_col = 'cost_incl_fees' if 'cost_incl_fees' in df.columns else 'cost'
+    df['sim_cost'] = df[cost_col].astype(float).abs()
+
+    portfolio = build_portfolio(
+        df.assign(cost=df['sim_cost']), run.players,
+        {t: u for t, u in zip(df['marketTitle'], df['username']) if u},
+    )
+    matched = portfolio['player_idx'] >= 0
+    pnl, p_win = run_portfolio_mc_score(
+        run.players, run.p_play, run.hist_composites, run.hist_wts, portfolio,
+        n_sims=n_sims, noise_sigma=spec.model.score_noise_sigma * SCORE_COMPOSITE_SCALE, log=log,
+    )
+    summary, hist = summarize_pnl(pnl, float(df['sim_cost'].sum()))
+
+    df['p_win'] = p_win
+    df['ev'] = df['p_win'] * df['volume'].astype(float)
+    df['expected_return'] = df['ev'] - df['sim_cost']
+    df['roi'] = np.where(df['sim_cost'] > 0, df['expected_return'] / df['sim_cost'], np.nan)
+    df['matched'] = matched
+    unmatched = sorted(set(df.loc[~df['matched'], 'marketTitle']))
+    if unmatched:
+        warnings.append(f'{len(unmatched)} position(s) not matched to a model player; counted as losses.')
+
+    rows = [{
+        'ticker': r.ticker, 'marketTitle': r.marketTitle, 'n': int(r.n), 'position': r.position,
+        'volume': float(r.volume), 'cost': float(r.sim_cost), 'p_win': float(r.p_win),
+        'ev': float(r.ev), 'expected_return': float(r.expected_return),
+        'roi': None if pd.isna(r.roi) else float(r.roi), 'matched': bool(r.matched),
+    } for r in df.itertuples()]
+    return {
+        'tourn_date': tourn_date, 'predictions_date': predictions_date, 'n_sims': int(n_sims),
+        'summary': summary, 'histogram': hist, 'positions': rows,
+        'unmatched': unmatched, 'warnings': warnings,
+    }

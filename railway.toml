@@ -62,14 +62,14 @@ dockerfilePath = "Dockerfile"
 #   Healthcheck path: /api/me
 #   Env: shared vars + DASHBOARD_PASSWORD. Restart policy ON_FAILURE.
 #
-# tt-worker (trade queue, recomputes, live Kalshi snapshots):
+# tt-trade-worker (trade queue, recomputes, live Kalshi snapshots):
 #   Start command: python scripts/trade_worker.py
 #   Env: shared vars + RAILWAY_DEPLOYMENT_DRAINING_SECONDS=30.
 #   Not a web service. Exactly one replica. Restart policy ON_FAILURE.
 #   Serves every registered market (Titled Tuesday, Bullet Brawl).
 #   Also runs the market-maker watchdog (cutoff layer 4 + dead-man's switch).
 #
-# tt-mm (reactive two-tier market maker, src/mm/):
+# tt-market-maker (reactive two-tier market maker, src/mm/):
 #   Start command: python scripts/market_maker.py
 #   Env: shared vars + MM_LIVE (unset/0 = shadow: computes quotes, sends nothing;
 #        1 = live), optional MM_SCOUTS=0 (anchors only), MM_MARKETS=titled_tuesday,

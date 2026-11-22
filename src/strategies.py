@@ -220,6 +220,8 @@ def _market_for(spec: MarketSpec) -> Market:
         snapshots={
             'edges': Snapshot(lambda client, d: market_views.edges_snapshot(client, d, spec), 15),
             'positions': Snapshot(lambda client, d: market_views.positions_snapshot(client, d, spec), 30),
+            # Re-simulates (~40 s, in a subprocess) only when positions or predictions change.
+            'pnl': Snapshot(lambda client, d: market_views.pnl_snapshot(client, d, spec), 60),
         },
     )
 

@@ -211,7 +211,7 @@ Notebooks and backtests run against a local SQLite copy of Railway, in the `tt` 
 - Each market keeps its raw results in its own tables (`titled_tuesday_standings`, `bullet_brawl_standings`).
 - `scripts/migrate_multi_market.py` applies this schema to an existing database. It is idempotent.
 - The Streamlit app and the trading CLI scripts cover Titled Tuesday only; the React dashboard covers every registered market.
-- `ModelConfig.score_noise_sigma` (score points) sets a market's Gaussian smoothing in `run_raw` and `run_adjusted`. Titled Tuesday's is 0; Bullet Brawl's is 10, the winner of its sigma backtest. `ModelConfig.played_filter` is the SQL condition for a row that counts as attending; Bullet Brawl uses `games > 0`.
+- `ModelConfig.score_noise_sigma` (score points) sets a market's Gaussian smoothing in `run_raw` and `run_adjusted`. Titled Tuesday's is 0.01 (100 composite units, `SCORE_GAUSSIAN_KERNEL_SIGMA_NARROW`), which randomizes tiebreaks without moving anyone across a score bucket; Bullet Brawl's is 10, the winner of its sigma backtest. Never set it to 0: replayed results would keep their exact historical tiebreaks, so ties resolve deterministically. The `ModelConfig` default is 0.01 for that reason. `ModelConfig.played_filter` is the SQL condition for a row that counts as attending; Bullet Brawl uses `games > 0`.
 - `python scripts/run_backtest.py --market bullet_brawl` runs the sigma comparison (its results notebook, `bullet-brawl-backtest.ipynb`, is now in `notebooks/archive/`). Add a market's backtest to `PROFILES` in that script.
 - Adding a market: a `MarketSpec` (with `pipeline_steps` and `event_url_example`), a scrape function and `PIPELINES` entry in `scripts/weekly_pipeline.py`, registration in `MARKETS`, and a Railway cron service.
 - Bullet Brawl is registered and runs the same weekly workflow as Titled Tuesday. Chess.com has no Bullet Brawl listing page, so `scripts/scraping/update_bullet_brawl.py` finds each new event in the monthly game archives of the most frequent recent players, confirms it against the tournament API, and then enriches new accounts with at least `MIN_APPEARANCES` games into `player_information`. If no archive has the event yet, the step fails with `listing_missing_slug` and the Pipeline page takes the URL.
@@ -249,7 +249,7 @@ The score and perf pools feed `run_simulation_ranked` (also exported as `run_sim
 
 Bid math (`bid_cents`, `best_ask`, `apply_pullback`, `kalshi_order_price`) imported from `kalshi_core`.
 
-**`src/portfolio.py`** — Portfolio-level MC for P&L simulation and Kelly sizing. `pnl_summary`, `portfolio_kelly`, `kalshi_order_price` re-exported from `kalshi_core` for back-compat.
+**`src/portfolio.py`** — Portfolio-level MC for P&L simulation and Kelly sizing. `simulate_positions_pnl` backs the React Portfolio page's `pnl` snapshot: tt-worker reads positions, then runs `scripts/portfolio_pnl.py` as a subprocess (about 40 s, 25k sims, official predictions, costs including fees). It re-simulates only when positions or predictions change (`market_views._pnl_input_key`). `pnl_summary`, `portfolio_kelly`, `kalshi_order_price` re-exported from `kalshi_core` for back-compat.
 
 ### Dashboard package (`app/`)
 

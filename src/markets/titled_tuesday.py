@@ -26,5 +26,7 @@ TITLED_TUESDAY = MarketSpec(
         min_participation_rate=config.MIN_PARTICIPATION_RATE,
         season_shift_date=config.SEASON_SHIFT_DATE,
         season_shift_factor=config.SEASON_SHIFT_FACTOR,
+        # 100 composite units: randomizes tiebreaks, keeps score ranks intact.
+        score_noise_sigma=config.SCORE_GAUSSIAN_KERNEL_SIGMA_NARROW / config.SCORE_COMPOSITE_SCALE,
     ),
 )

@@ -17,12 +17,15 @@
   --info: #1d5fb8;
   --info-bg: #e3eefb;
   --neutral-bg: #e9ebef;
-  /* If-plays advantage ramp: one blue hue, light (low) to dark (high). */
-  --adv-0: #86b6ef;
-  --adv-1: #5598e7;
-  --adv-2: #2a78d6;
-  --adv-3: #1c5cab;
-  --adv-4: #104281;
+  /* If-plays advantage ramp: blue (low) to gold (high), OKLCH steps with rising lightness. */
+  --adv-0: #1e55a4;
+  --adv-1: #526c9a;
+  --adv-2: #8b7e69;
+  --adv-3: #b18c45;
+  --adv-4: #cf9b0f;
+  /* P&L histogram: diverging poles (validated against --surface in both modes). */
+  --gain: #2a78d6;
+  --loss: #e34948;
   --radius: 8px;
   font-family: Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
   font-size: 14px;
@@ -48,12 +51,14 @@
     --info: #86b6f5;
     --info-bg: #17304f;
     --neutral-bg: #2a3039;
-    /* On a dark surface the ramp runs the other way: high advantage is brightest. */
-    --adv-0: #184f95;
-    --adv-1: #256abf;
-    --adv-2: #3987e5;
-    --adv-3: #6da7ec;
-    --adv-4: #9ec5f4;
+    /* Same blue-to-gold ramp, lifted so the blue end stays visible on the dark surface. */
+    --adv-0: #3970c2;
+    --adv-1: #6d89bd;
+    --adv-2: #aea086;
+    --adv-3: #dbb563;
+    --adv-4: #fdce3e;
+    --gain: #3987e5;
+    --loss: #e66767;
   }
 }
 
@@ -243,3 +248,27 @@ dialog::backdrop { background: rgb(0 0 0 / .45); }
 .research-events { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; }
 .research-event { border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; gap: 4px; }
 .research-event select { width: auto; max-width: 100%; }
+
+/* P&L histogram */
+.pnl-chart { position: relative; width: 100%; min-width: 0; }
+.pnl-chart svg { display: block; overflow: visible; }
+.pnl-chart .grid { stroke: var(--border); stroke-width: 1; opacity: .6; }
+.pnl-chart .baseline { stroke: var(--muted); stroke-width: 1; }
+.pnl-chart .axis { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.pnl-chart .bar { transition: opacity .1s; }
+.pnl-chart .bar.gain { fill: var(--gain); }
+.pnl-chart .bar.loss { fill: var(--loss); }
+.pnl-chart .bar.dim { opacity: .45; }
+.pnl-chart .ref { stroke-width: 2; }
+.pnl-chart .ref.zero { stroke: var(--muted); stroke-dasharray: 4 3; stroke-width: 1.5; }
+.pnl-chart .ref.ev { stroke: var(--text); }
+.pnl-chart .ev-label { fill: var(--text); font-size: 12px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.chart-tip { position: absolute; transform: translateX(-50%); pointer-events: none; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; font-size: 12px; display: flex; flex-direction: column; white-space: nowrap; box-shadow: 0 2px 8px rgba(0,0,0,.12); font-variant-numeric: tabular-nums; }
+.chart-tip span { color: var(--muted); }
+.chart-legend { gap: 14px; font-size: 12px; color: var(--muted); margin-top: 4px; }
+.chart-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.swatch { display: inline-block; width: 12px; height: 10px; border-radius: 2px; }
+.swatch.gain { background: var(--gain); }
+.swatch.loss { background: var(--loss); }
+.swatch.line { width: 2px; height: 12px; background: var(--text); border-radius: 0; }
+.swatch.dash { width: 0; height: 12px; border-left: 1.5px dashed var(--muted); border-radius: 0; }
