@@ -114,7 +114,8 @@ def model(monkeypatch):
 
 def submit_take(backend=None, **kw):
     args = dict(market=MARKET, strategy='take_trades', tourn_date=DATE,
-                params={'min_roi': 1.2, 'min_qty': 1, 'max_qty': 10}, max_exposure=100.0)
+                params={'min_roi': 1.2, 'min_qty': 1, 'max_qty': 10, 'min_expected_return': 0},
+                max_exposure=100.0)
     args.update(kw)
     return strategies.submit(**args)
 
@@ -212,6 +213,27 @@ def test_killed_fok_counts_as_failure(backend):
     plan = trading.plan_take_trades(client, DATE, min_roi=1.2, min_qty=1, sleep_read=0)
     result = execute_plan(client, plan, sleep_write=0)
     assert result.failed == 1 and result.filled_exposure == 0
+
+
+def test_min_expected_return_filters_small_edges(backend):
+    client = FakeClient(asks_no_side=juicy())
+    plan = trading.plan_take_trades(client, DATE, min_roi=1.2, min_qty=1, max_qty=10, sleep_read=0)
+    assert len(plan.orders) == 1
+    er = plan.orders[0].meta['expected_return']
+    assert er > 0
+    # The order's expected profit is just under the floor: skipped, and counted.
+    plan = trading.plan_take_trades(client, DATE, min_roi=1.2, min_qty=1, max_qty=10, sleep_read=0,
+                                    min_expected_return=er + 0.01)
+    assert plan.orders == [] and plan.stats['small_return_skipped'] == 1
+    # The floor applies at the order size: a larger max_qty clears it.
+    plan = trading.plan_take_trades(client, DATE, min_roi=1.2, min_qty=1, max_qty=50, sleep_read=0,
+                                    min_expected_return=er + 0.01)
+    assert len(plan.orders) == 1
+
+
+def test_take_trades_form_defaults():
+    p = strategies.TakeTradesParams()
+    assert p.min_roi == 1.1 and p.min_expected_return == 10.0
 
 
 # ── Queue mechanics ──────────────────────────────────────────────────────────

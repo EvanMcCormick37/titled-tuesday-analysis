@@ -54,7 +54,7 @@ class MarketSpec:
     timezone: str = 'America/New_York'
     # Weekly pipeline steps, in order. The runner in scripts/weekly_pipeline.py and
     # the dashboard's Pipeline page both read this.
-    pipeline_steps: tuple[str, ...] = ('scrape', 'update_broadcasts', 'run_raw')
+    pipeline_steps: tuple[str, ...] = ('scrape', 'update_broadcasts', 'run_raw', 'research')
     event_url_example: str = 'https://www.chess.com/tournament/live/…'
     # Regex for this market's chess.com event slug, found anywhere in a pasted URL
     # or bare slug. The API rejects a pasted URL for the wrong market with it.

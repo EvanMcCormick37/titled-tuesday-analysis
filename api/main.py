@@ -329,6 +329,12 @@ def mm_pull(slug: str, username: str) -> dict:
     return {'ok': True}
 
 
+@api.post('/markets/{slug}/mm/alerts/ack-all')
+def mm_ack_all(slug: str) -> dict:
+    _market(slug)
+    return {'acknowledged': mm_store.ack_all_alerts(slug)}
+
+
 @api.post('/mm/alerts/{alert_id}/ack')
 def mm_ack(alert_id: int) -> dict:
     if not mm_store.ack_alert(alert_id):

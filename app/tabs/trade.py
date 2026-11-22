@@ -194,7 +194,7 @@ def _render_take(gate_ok: bool, tourn_date: str) -> None:
     )
     cols = st.columns(4)
     with cols[0]:
-        min_roi = st.number_input('min_roi', 1.0, 5.0, 1.5, 0.05, key='take_min_roi')
+        min_roi = st.number_input('min_roi', 1.0, 5.0, 1.1, 0.05, key='take_min_roi')
     with cols[1]:
         min_qty = st.number_input('min_qty', 1, 1_000, 25, 5, key='take_min_qty')
     with cols[2]:

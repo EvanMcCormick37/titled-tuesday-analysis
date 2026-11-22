@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type KeyboardEvent } from 'react';
 import { req } from '../api';
 import { useApp } from '../App';
 import { ErrorNote } from '../components';
@@ -45,20 +45,29 @@ function ValueList({ title, hint, values, step, min, max, onChange }: {
   onChange: (v: Record<string, number>) => void;
 }) {
   const [name, setName] = useState('');
+  // Value for newly added players; kept between adds so a batch can share one value.
+  const [draft, setDraft] = useState(String(min === undefined ? 0 : 0.5));
+  const parsed = Number(draft);
+  const draftOk = draft.trim() !== '' && Number.isFinite(parsed)
+    && (min === undefined || parsed >= min) && (max === undefined || parsed <= max);
   const add = () => {
     const n = name.trim();
-    if (n && !(n in values)) onChange({ ...values, [n]: min === undefined ? 0 : 0.5 });
+    if (!draftOk) return;
+    if (n && !(n in values)) onChange({ ...values, [n]: parsed });
     setName('');
   };
+  const onEnter = (e: KeyboardEvent) => { if (e.key === 'Enter') { e.preventDefault(); add(); } };
   return (
     <fieldset className="stack">
       <legend>{title}</legend>
       <small className="muted">{hint}</small>
       <div className="row">
         <input list="players" placeholder="Player name" aria-label={`Add to ${title}`} value={name}
-               onChange={(e) => setName(e.target.value)}
-               onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); add(); } }} />
-        <button type="button" className="btn" onClick={add}>Add</button>
+               onChange={(e) => setName(e.target.value)} onKeyDown={onEnter} />
+        <input type="number" className="value-draft" aria-label={`${title}: value for new players`}
+               title="Value given to each player you add" step={step} min={min} max={max} value={draft}
+               aria-invalid={!draftOk} onChange={(e) => setDraft(e.target.value)} onKeyDown={onEnter} />
+        <button type="button" className="btn" disabled={!draftOk} onClick={add}>Add</button>
       </div>
       {Object.entries(values).map(([k, v]) => (
         <div key={k} className="row value-row">

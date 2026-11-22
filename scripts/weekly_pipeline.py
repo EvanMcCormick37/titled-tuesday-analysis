@@ -4,9 +4,12 @@
 Each market runs its pre-trade steps as one resumable state machine
 (see src/pipeline_runner.py). The step names come from the MarketSpec:
 
-    Titled Tuesday:  scrape_tt → update_broadcasts → run_raw → ADJUSTMENTS_PENDING
-    Bullet Brawl:    scrape_bb → update_broadcasts → run_raw → ADJUSTMENTS_PENDING
-    Freestyle Friday: scrape_ff → update_broadcasts → run_raw → ADJUSTMENTS_PENDING
+    Titled Tuesday:  scrape_tt → update_broadcasts → run_raw → research → ADJUSTMENTS_PENDING
+    Bullet Brawl:    scrape_bb → update_broadcasts → run_raw → research → ADJUSTMENTS_PENDING
+    Freestyle Friday: scrape_ff → update_broadcasts → run_raw → research → ADJUSTMENTS_PENDING
+
+The research step is advisory: it never fails the pipeline (a failed run is
+recorded in research_runs and shown on the Attendance page).
 
 Usage:
     python scripts/weekly_pipeline.py
@@ -104,6 +107,23 @@ def step_run_raw(spec: MarketSpec = TITLED_TUESDAY) -> dict:
     }
 
 
+def step_research(spec: MarketSpec = TITLED_TUESDAY) -> dict:
+    """Attendance research for the event run_raw just predicted. Candidates come
+    from latest_model_predictions_raw. Never raises: research only informs the
+    operator's adjustments, so its failure must not block the pipeline."""
+    from src.research import store as research_store
+    from src.research.run import run as run_research
+    target = next_tourn_date(spec)
+    try:
+        research_store.init_schema()
+        result = run_research(spec, target, log=lambda m: print(f'  research: {m}', flush=True))
+    except Exception as exc:  # noqa: BLE001 — advisory step
+        print(f'  research: FAILED ({type(exc).__name__}: {exc}); continuing')
+        return {'event_date': target, 'status': 'failed', 'error': f'{type(exc).__name__}: {exc}'[:500]}
+    return {'event_date': target, 'run_id': result['run_id'], 'status': result['status'],
+            'leads': len(result['leads'])}
+
+
 def _step_runner(spec: MarketSpec, scrape):
     """(step, slug_override) -> summary, for a market whose first step is `scrape`."""
     first = spec.pipeline_steps[0]
@@ -115,6 +135,8 @@ def _step_runner(spec: MarketSpec, scrape):
             return step_update_broadcasts(spec)
         if step == 'run_raw':
             return step_run_raw(spec)
+        if step == 'research':
+            return step_research(spec)
         raise ValueError(f'{spec.slug} has no step {step!r}')
     return run_step
 

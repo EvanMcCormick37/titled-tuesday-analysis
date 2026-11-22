@@ -82,7 +82,8 @@ def test_cookie_flags(client):
 # ── Trading flow ─────────────────────────────────────────────────────────────
 
 def test_preview_submit_run_detail(authed):
-    body = {'strategy': 'take_trades', 'params': {'min_roi': 1.2, 'min_qty': 1, 'max_qty': 10}}
+    body = {'strategy': 'take_trades', 'params': {'min_roi': 1.2, 'min_qty': 1, 'max_qty': 10,
+                                                  'min_expected_return': 0}}
     plan = authed.post(f'/api/markets/{MARKET}/preview', json=body).json()
     assert plan['exposure'] == pytest.approx(2.0) and not authed.fake.taken
 
@@ -133,7 +134,8 @@ def test_naive_run_at_rejected(authed):
 
 def test_review_approve_over_http(authed):
     job_id = authed.post(f'/api/markets/{MARKET}/jobs', json={
-        'strategy': 'take_trades', 'params': {'min_roi': 1.2, 'min_qty': 1, 'max_qty': 10},
+        'strategy': 'take_trades',
+        'params': {'min_roi': 1.2, 'min_qty': 1, 'max_qty': 10, 'min_expected_return': 0},
         'max_exposure': 1.0}).json()['id']
     JobRunner(lambda: authed.fake, sleep_write=0).run(q.claim_next('t'))
     assert authed.get(f'/api/jobs/{job_id}').json()['job']['status'] == 'needs_review'

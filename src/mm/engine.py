@@ -454,12 +454,8 @@ class Engine:
             while hist and now - hist[0] > 60:
                 hist.popleft()
             if len(hist) > p.war_max_reprices and self._war_until.get((ticker, side), 0) <= now:
+                # Price war: rest at the buffer edge for the cool-off (no alert; too noisy).
                 self._war_until[(ticker, side)] = now + p.war_cooloff_s
-                ms = self._market_of(ticker)
-                if ms is not None:
-                    self._alert(ms, 'price_war', f'{self.contracts[ticker].subtitle} {side.upper()}: '
-                                f'{len(hist)} scout reprices in 60 s; resting at the buffer edge for '
-                                f'{p.war_cooloff_s} s', ticker=ticker)
         self.oms.set_target(slot, q)
 
     def quote_tick(self) -> None:

@@ -42,7 +42,10 @@ class FadeNoBidsParams(_Params):
 
 
 class TakeTradesParams(_Params):
-    min_roi: float = Field(1.5, ge=1.0, le=5.0, title='Min ROI')
+    min_roi: float = Field(1.1, ge=1.0, le=5.0, title='Min ROI')
+    min_expected_return: float = Field(
+        10.0, ge=0, le=10_000, title='Min expected return ($)',
+        description='Skip levels whose expected profit (after fees, at the order size) is below this')
     min_qty: int = Field(25, ge=1, le=1_000, title='Min quantity',
                          description='Thinner levels are skipped as likely decoys')
     max_qty: int = Field(200, ge=1, le=10_000, title='Max contracts per level')
@@ -140,7 +143,7 @@ def _standard_strategies(spec: MarketSpec) -> dict[str, Strategy]:
         ),
         Strategy(
             'take_trades', 'Take trades',
-            'Fill-or-kill orders on live asks whose ROI clears the threshold.',
+            'Fill-or-kill orders on live asks whose ROI and expected return clear the thresholds.',
             TakeTradesParams,
             lambda client, d, p, emit: trading.plan_take_trades(client, d, emit=emit, spec=spec, **p),
             can_loop=True,

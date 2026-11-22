@@ -11,7 +11,7 @@ export function PlanTable({ plan }: { plan: Plan }) {
       {plan.orders.length > 0 && (
         <div className="table-wrap">
           <table>
-            <thead><tr><th>Player</th><th>Top</th><th>Side</th><th className="num">Price</th><th className="num">Qty</th><th className="num">Cost</th><th className="num">ROI</th></tr></thead>
+            <thead><tr><th>Player</th><th>Top</th><th>Side</th><th className="num">Price</th><th className="num">Qty</th><th className="num">Cost</th><th className="num">ROI</th><th className="num">Exp. return</th></tr></thead>
             <tbody>
               {plan.orders.map((o, i) => (
                 <tr key={i} title={o.ticker}>
@@ -22,6 +22,7 @@ export function PlanTable({ plan }: { plan: Plan }) {
                   <td className="num">{o.count}</td>
                   <td className="num">{usd(o.cost)}</td>
                   <td className="num">{o.meta?.roi?.toFixed(2) ?? '—'}</td>
+                  <td className="num">{o.meta?.expected_return !== undefined ? usd(o.meta.expected_return) : '—'}</td>
                 </tr>
               ))}
             </tbody>

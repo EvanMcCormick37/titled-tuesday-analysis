@@ -307,33 +307,41 @@ def plan_fade_no_bids(
 def plan_take_trades(
     client: KalshiClient,
     tourn_date: str,
-    min_roi: float = 1.5,
+    min_roi: float = 1.1,
     min_qty: int = 10,
     max_qty: int = 200,
     best_per_event: bool = True,
     sleep_read: float = 0.05,
     emit: Emit = noop_emit,
     spec: MarketSpec = TITLED_TUESDAY,
+    min_expected_return: float = 0.0,
 ) -> Plan:
-    """Plan fill-or-kill taker orders on levels whose ROI clears `min_roi`.
+    """Plan fill-or-kill taker orders on levels whose ROI clears `min_roi` and
+    whose expected return clears `min_expected_return`.
 
     best_per_event: if True, only the single highest-ROI trade per N-category.
         If False, every qualifying level per (ticker, side).
     min_qty: levels with fewer available contracts are skipped as iceberg decoys.
     max_qty: cap on contracts purchased per level.
+    min_expected_return: minimum expected profit in dollars for the order, i.e.
+        (EV − fee-inclusive price) × the contracts it would buy (capped at max_qty).
     """
     emit("phase", "Fetching live asks")
     df, unmatched = compute_edges(client, tourn_date, sleep_read=sleep_read, spec=spec)
     plan = Plan(strategy="take_trades", tourn_date=tourn_date, unmatched=unmatched,
-                stats={"levels_scanned": len(df), "edge_count": 0, "thin_skipped": 0})
+                stats={"levels_scanned": len(df), "edge_count": 0, "thin_skipped": 0,
+                       "small_return_skipped": 0})
     if df.empty:
         return plan
 
+    order_qty  = df["Quantity Available"].clip(upper=max_qty).astype(int)
     has_volume = df["Quantity Available"] >= min_qty
     has_edge   = df["ROI"] > min_roi
+    has_return = (df["EV"] - df["Order Price"]) * order_qty >= min_expected_return
     plan.stats["thin_skipped"] = int((has_edge & ~has_volume).sum())
+    plan.stats["small_return_skipped"] = int((has_edge & has_volume & ~has_return).sum())
 
-    qualifying = df[has_edge & has_volume]
+    qualifying = df[has_edge & has_volume & has_return]
     if best_per_event:
         edge = qualifying.sort_values("ROI", ascending=False).drop_duplicates(subset=["n"]).copy()
     else:
@@ -351,6 +359,8 @@ def plan_take_trades(
             label=row["Player Name"],
             meta={"n": int(row["n"]), "roi": round(float(row["ROI"]), 3),
                   "ev": round(float(row["EV"]), 3),
+                  "expected_return": round((float(row["EV"]) - float(row["Order Price"]))
+                                           * int(row["order_qty"]), 2),
                   "available": int(row["Quantity Available"])},
         ))
     return plan
@@ -513,13 +523,14 @@ def place_fade_no_bids(
 def take_trades(
     client: KalshiClient,
     tourn_date: str,
-    min_roi: float = 1.5,
+    min_roi: float = 1.1,
     min_qty: int = 10,
     max_qty: int = 200,
     sleep_read: float = 0.05,
     best_per_event: bool = True,
     dry_run: bool = True,
     budget_remaining: float | None = None,
+    min_expected_return: float = 0.0,
 ) -> dict:
     """Plan and (unless dry_run) fire taker orders.
 
@@ -529,7 +540,7 @@ def take_trades(
     On a live run `exposure` counts only orders that actually filled.
     """
     plan = plan_take_trades(client, tourn_date, min_roi, min_qty, max_qty, best_per_event,
-                            sleep_read, emit=print_emit)
+                            sleep_read, emit=print_emit, min_expected_return=min_expected_return)
     print(format_plan(plan, dry_run))
     base = {"unmatched": plan.unmatched, "edge_count": plan.stats["edge_count"],
             "skipped": plan.stats["levels_scanned"] - plan.stats["edge_count"]}

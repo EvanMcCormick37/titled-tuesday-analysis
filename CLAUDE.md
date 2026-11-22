@@ -20,14 +20,14 @@ Services + one Postgres plugin, all sharing the single `Dockerfile` at the repo 
 | Service | Start command | Purpose |
 |---|---|---|
 | `tt-cron` | `python scripts/weekly_pipeline.py` | Titled Tuesday weekly scrape → broadcasts refresh → raw MC. Cron: `0 19 * * 2` (UTC — 15:00 EDT / 14:00 EST) |
-| `bb-cron` | `python scripts/weekly_pipeline.py --market bullet_brawl` | The same pipeline for Bullet Brawl. Cron: `0 20 * * 6` (UTC — Saturday 16:00 EDT / 15:00 EST) |
-| `ff-cron` | `python scripts/weekly_pipeline.py --market freestyle_friday` | The same pipeline for Freestyle Friday. Cron: `0 19 * * 5` (UTC — Friday 15:00 EDT / 14:00 EST) |
+| `bb-cron` | `python scripts/weekly_pipeline.py --market bullet_brawl` | The same pipeline for Bullet Brawl. Cron: `0 12 * * 0` (UTC — Sunday 08:00 EDT / 07:00 EST). It runs the morning after because chess.com's public tournament API caches status: an hour after Saturday's event it can still report the arena unfinished, and the scrape fails |
+| `ff-cron` | `python scripts/weekly_pipeline.py --market freestyle_friday` | The same pipeline for Freestyle Friday. Cron: `0 12 * * 6` (UTC — Saturday 08:00 EDT / 07:00 EST), the morning after, for the same API-caching reason as bb-cron |
 | `tt-api` | `/bin/sh -c "exec python -m uvicorn api.main:app --host 0.0.0.0 --port $PORT"` | Primary dashboard: FastAPI + built React app (`web/`), every registered market. Healthcheck `/api/me` |
 | `tt-app` | `python -m streamlit run app/dashboard.py --server.port=$PORT --server.address=0.0.0.0` | Legacy Streamlit dashboard, Titled Tuesday only |
 | `tt-worker` | `python scripts/trade_worker.py` | Runs the trade queue, recomputes, pipeline retries, attendance research, live Kalshi snapshots, and the market-maker watchdog. Run exactly one replica; restart policy ON_FAILURE |
 | `tt-market-maker` | `python scripts/market_maker.py` | Reactive two-tier market maker for every registered market (see "Market maker" below). Shadow unless `MM_LIVE=1`. Run exactly one replica; restart policy ON_FAILURE. The code calls it `tt-mm`; tt-worker finds it by its DB heartbeat, so the service name doesn't matter |
 
-**Important Railway gotcha:** Cron expressions are evaluated in UTC regardless of the `TZ` env var. Use numeric day-of-week (`2` = Tuesday, `6` = Saturday), not the `TUE` alias. `TZ=America/New_York` only affects the container's clock inside Python (which matters for `MarketSpec.most_recent_event()`, the date each pipeline run is for).
+**Important Railway gotcha:** Cron expressions are evaluated in UTC regardless of the `TZ` env var. Use numeric day-of-week (`0` = Sunday, `2` = Tuesday, `6` = Saturday), not the `TUE` alias. `TZ=America/New_York` only affects the container's clock inside Python (which matters for `MarketSpec.most_recent_event()`, the date each pipeline run is for).
 
 Env vars (set in Railway UI, per service unless noted):
 - **Shared:** `DATABASE_URL` (always the reference `${{Postgres.DATABASE_URL}}`, never a pasted URL: a copied public URL goes stale when the password changes, which crashed tt-worker and tt-cron in 2026-11), `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_B64` (base64 of `~/.kalshi/trading-key.txt`), `KALSHI_ENV=prod`, `TZ=America/New_York`, `GH_TOKEN` (PAT for installing private `kalshi-core`)
@@ -71,7 +71,7 @@ MM_LIVE=1 python scripts/market_maker.py    # live
 
 ### Entry points (where to start reading)
 
-- **`scripts/weekly_pipeline.py`** — orchestrates a market's three pre-trade steps (`MarketSpec.pipeline_steps`: `scrape_tt`, `scrape_bb` or `scrape_ff` → `update_broadcasts → run_raw`) as a resumable state machine. Writes to `pipeline_runs` + `job_runs`. On any failure, halts with `state='failed'`, `error_kind` classified for the dashboard to show an appropriate retry UI.
+- **`scripts/weekly_pipeline.py`** — orchestrates a market's three pre-trade steps (`MarketSpec.pipeline_steps`: `scrape_tt`, `scrape_bb` or `scrape_ff` → `update_broadcasts → run_raw → research`) as a resumable state machine. `research` is advisory and never fails the run. Writes to `pipeline_runs` + `job_runs`. On any failure, halts with `state='failed'`, `error_kind` classified for the dashboard to show an appropriate retry UI.
 - **`scripts/trigger_adjusted.py`** — `run_adjusted` entry point. Reads `manual_adjustments` for the upcoming tourn_date, re-simulates, writes `latest_model_predictions`, flips the matching `pipeline_runs` row to `completed`.
 - **`api/main.py`** + **`web/`** — FastAPI + React dashboard for every registered market (market picker in the top bar). Pages: Trade / Market maker / Edges / Portfolio / Odds / Attendance / Pipeline / Logs. Gated by `DASHBOARD_PASSWORD`.
 - **`scripts/market_maker.py`** — tt-market-maker entry point; runs `src/mm/engine.py`.
@@ -107,14 +107,14 @@ Replaces resting `place_bids` with an event-driven quoter (design: `Kalshi Marke
 - Journal: JSONL of every WS message and action, one file per UTC day in `MM_JOURNAL_DIR`.
 - Quoting is active only when the market is unpaused, not held (a model run that fails hard validation holds the market and raises a `model_invalid` alert), fair values are loaded, and the time is before the cutoff (minus 5 s).
 - Modules: `config` (`MMParams`, order-id prefixes), `book` (WS books + ex-own view), `quoting` (pure pricing/sizing), `fair_value`, `risk` (position/player/event limits), `oms` (target diffing, token bucket, order states), `gateway` (`LiveGateway` / `ShadowGateway`), `engine` (the asyncio process), `watchdog` (run by tt-worker), `store` (`mm_*` tables), `journal`.
-- API: `GET /api/markets/{slug}/mm` (status, quotes, alerts, fills), `POST …/mm/pause`, `PUT …/mm/params`, `POST …/mm/players/{username}/repost|pull`, `POST /api/mm/alerts/{id}/ack`.
+- API: `GET /api/markets/{slug}/mm` (status, quotes, alerts, fills), `POST …/mm/pause`, `PUT …/mm/params`, `POST …/mm/players/{username}/repost|pull`, `POST …/mm/alerts/ack-all`, `POST /api/mm/alerts/{id}/ack`. The price-war governor rests at the buffer edge silently (no alert).
 - Tests: `tests/test_mm_core.py` (quoting, book, risk, OMS) and `tests/test_mm_engine.py` (engine with a fake gateway).
 
 ### Attendance researcher (`src/research/`)
 
 Finds other tournaments that may keep high-value players away from the next event. It is deterministic so far, with no LLM; the planned LLM phases are in `Attendance Researcher Architecture — Proposal.md` at the repo root.
 
-- Runs as the `research` ops job in the **`background` lane**: a subprocess on tt-worker (`scripts/research_attendance.py --market --date`) that never holds the market's trade lane, because it doesn't change predictions or orders. Started from **Run now** on the Attendance page (no schedule yet). The kill switch leaves it alone.
+- Runs automatically as the last step of the weekly pipeline (`research`, right after `run_raw`, for the event `run_raw` predicted). A research failure is recorded in `research_runs` and the step summary but never fails the pipeline. It can also be re-run as the `research` ops job in the **`background` lane**: a subprocess on tt-worker (`scripts/research_attendance.py --market --date`) that never holds the market's trade lane, started from **Run now** on the Attendance page. The kill switch leaves it alone.
 - **Candidates:** players whose raw-model fair value `p_participate × P_top8_given_play` is above 5% (`candidate_min_fv`, `candidate_n`), one row per player.
 - **Calendar:** the Lichess broadcast API (`/api/broadcast/top` + `/api/broadcast`, every tier, then rounds and `/broadcast/{id}/players` for events within a day of the event), plus events you add on the Attendance page. chess.com/events can't be read automatically (Cloudflare challenges headless browsers); add its events by hand. Don't add stealth or challenge-solving.
 - **Clash test** (`overlap.py`): window = start to start + `MarketSpec.event_duration_minutes` (TT 150, BB 120). A round overlapping the window is `hard`, within `adjacent_hours` is `adjacent`, within `mid_event_hours` is `multi_day`. Round length depends on time control (classical 300 min). Season-long leagues count only through their actual rounds.
@@ -206,6 +206,8 @@ Postgres on Railway (schema defined in `scripts/init_postgres_schema.py`); SQLit
          run_raw                 │
          │                       │
          │   computation_error   → state=failed
+         ↓                       │
+         research  (advisory; never fails the run)
          ↓                       │
          state = adjustments_pending  (user opens the Attendance page)
                  ↓

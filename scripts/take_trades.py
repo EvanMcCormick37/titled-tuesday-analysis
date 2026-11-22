@@ -53,6 +53,7 @@ def _run_once(client: KalshiClient, args: argparse.Namespace, budget_remaining: 
         client,
         tourn_date=args.date,
         min_roi=args.min_roi,
+        min_expected_return=args.min_expected_return,
         min_qty=args.min_qty,
         max_qty=args.max_qty,
         best_per_event=True,
@@ -84,8 +85,12 @@ def main() -> None:
              "A batch that would exceed the remaining budget is cancelled and the loop halts.",
     )
     parser.add_argument(
-        "--min-roi", type=float, default=1.5,
-        help="Minimum ROI threshold to qualify a trade (default: 1.5)",
+        "--min-roi", type=float, default=1.1,
+        help="Minimum ROI threshold to qualify a trade (default: 1.1)",
+    )
+    parser.add_argument(
+        "--min-expected-return", type=float, default=10.0,
+        help="Minimum expected profit in dollars per order, after fees (default: 10)",
     )
     parser.add_argument(
         "--min-qty", type=int, default=25,

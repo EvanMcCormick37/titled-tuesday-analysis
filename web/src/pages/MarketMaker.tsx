@@ -121,6 +121,7 @@ export default function MarketMaker() {
     onSuccess: () => { toast('Player pulled'); refresh(); },
   });
   const ack = useMutation({ mutationFn: (id: number) => req(`/mm/alerts/${id}/ack`, 'POST'), onSuccess: refresh });
+  const ackAll = useMutation({ mutationFn: () => req(`/markets/${market.slug}/mm/alerts/ack-all`, 'POST'), onSuccess: refresh });
 
   const ov = q.data;
   const st = ov?.state ?? {};
@@ -166,7 +167,12 @@ export default function MarketMaker() {
       </section>
 
       <section className="card stack">
-        <h3>Alerts {unacked.length > 0 && <span className="badge warn">{unacked.length} new</span>}</h3>
+        <div className="row between wrap">
+          <h3>Alerts {unacked.length > 0 && <span className="badge warn">{unacked.length} new</span>}</h3>
+          {unacked.length > 0 && (
+            <button className="btn small ghost" disabled={ackAll.isPending} onClick={() => ackAll.mutate()}>Dismiss all</button>
+          )}
+        </div>
         {ov && ov.alerts.length === 0 && <Empty>No alerts yet.</Empty>}
         <ul className="stack" style={{ listStyle: 'none', padding: 0, margin: 0 }}>
           {ov?.alerts.slice(0, 30).map((a) => (

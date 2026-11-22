@@ -13,7 +13,7 @@ import streamlit as st
 from app.state import current_status, invalidate_caches
 from src.db import get_conn
 
-_STEPS = ('scrape_tt', 'update_broadcasts', 'run_raw')
+_STEPS = ('scrape_tt', 'update_broadcasts', 'run_raw', 'research')
 
 
 def _step_jobs(pipeline_run_id: int) -> dict[str, dict]:

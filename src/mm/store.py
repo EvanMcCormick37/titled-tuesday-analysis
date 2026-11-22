@@ -246,6 +246,13 @@ def ack_alert(alert_id: int) -> bool:
                              (alert_id,)).rowcount or 0) > 0
 
 
+def ack_all_alerts(market: str) -> int:
+    """Acknowledge every open alert for a market. Returns how many were open."""
+    with get_conn() as conn:
+        return conn.execute('UPDATE mm_alerts SET acknowledged = 1 WHERE market = ? AND acknowledged = 0',
+                            (market,)).rowcount or 0
+
+
 # ── Status ───────────────────────────────────────────────────────────────────
 
 def write_status(market: str, mode: str, paused_ack: bool, state: dict) -> None:

@@ -137,6 +137,8 @@ legend { font-weight: 600; padding: 0 4px; }
 .chip button { background: none; border: 0; color: var(--muted); cursor: pointer; font-size: 15px; line-height: 1; padding: 0 4px; }
 .value-row > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .value-row input { width: 90px; flex: none; }
+.value-draft { width: 90px; flex: none; }
+.value-draft[aria-invalid="true"] { border-color: var(--bad); }
 
 /* Status */
 .badge { display: inline-flex; align-items: center; gap: 4px; font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 10px; white-space: nowrap; }

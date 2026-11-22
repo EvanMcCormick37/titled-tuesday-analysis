@@ -9,8 +9,7 @@ type Position = {
   ticker: string; marketTitle: string; n: number; position: string; volume: number;
   cost: number; fees: number; cost_incl_fees: number; avg_price: number; avg_price_incl_fees: number;
 };
-type Order = { ticker: string; side: string; price_c: number | null; qty: number | string | null; expires: string | null };
-type Payload = { rows: Position[]; orders: Order[] };
+type Payload = { rows: Position[] };
 type SimPosition = { ticker: string; p_win: number; ev: number; expected_return: number; roi: number | null; matched: boolean };
 type PnlSummary = {
   ev: number; cost: number; expected_payout: number; roi: number | null; std: number; p_profit: number;
@@ -76,7 +75,6 @@ export default function Portfolio() {
   const pnlRefresh = useMutation({ mutationFn: () => req<Snapshot<PnlPayload>>(`${pnlPath}?force=true`) });
   const sim = new Map((pnl.data?.payload?.positions ?? []).map((r) => [r.ticker, r]));
   const rows = q.data?.payload?.rows ?? [];
-  const orders = q.data?.payload?.orders ?? [];
   const cost = rows.reduce((s, r) => s + Math.abs(r.cost), 0);
   const fees = rows.reduce((s, r) => s + r.fees, 0);
 
@@ -91,7 +89,6 @@ export default function Portfolio() {
         <Metric label="Exposure" value={usd(cost)} />
         <Metric label="Fees paid" value={usd(fees)} />
         <Metric label="Out of pocket" value={usd(cost + fees)} />
-        <Metric label="Resting orders" value={orders.length} />
       </div>
       <PnlSimulation snap={pnl.data} onRefresh={() => pnlRefresh.mutate()} busy={pnlRefresh.isPending} positionsHeld={rows.length > 0} />
       <h3>Positions</h3>
@@ -111,20 +108,6 @@ export default function Portfolio() {
                   <td className="num">{m ? signedUsd(m.expected_return) : '—'}</td>
                 </tr>
               ); })}
-            </tbody>
-          </table>
-        </div>
-      )}
-      <h3>Resting orders</h3>
-      {q.data?.payload && orders.length === 0 && <Empty>No resting orders for this event.</Empty>}
-      {orders.length > 0 && (
-        <div className="table-wrap">
-          <table>
-            <thead><tr><th>Market</th><th>Side</th><th className="num">Price</th><th className="num">Qty</th><th>Expires</th></tr></thead>
-            <tbody>
-              {orders.map((o, i) => (
-                <tr key={i}><td>{o.ticker}</td><td>{o.side?.toUpperCase()}</td><td className="num">{o.price_c ?? '—'}¢</td><td className="num">{o.qty ?? '—'}</td><td>{o.expires ? new Date(o.expires).toLocaleString() : '—'}</td></tr>
-              ))}
             </tbody>
           </table>
         </div>
