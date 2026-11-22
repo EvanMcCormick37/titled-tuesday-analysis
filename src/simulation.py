@@ -143,6 +143,29 @@ def run_simulation(players, p_play, hist_pcts, hist_wts,
     return plays_ct, topn_ct
 
 
+NOISE_CUTOFF_SIGMAS = 16.0
+
+
+def add_cutoff_noise(scores, k, noise_sigma, rng):
+    """Add N(0, noise_sigma) to every score that could still finish in the top k.
+
+    Noise only matters near the top-k cutoff, so drawing it for the whole
+    (sims x players) matrix wastes most of the run. A score more than
+    NOISE_CUTOFF_SIGMAS sigma below its row's k-th best can only reach the top k
+    if the two noise draws differ by over 16 sigma (probability ~1e-15), so
+    leaving those scores un-noised gives the same distribution in practice.
+    Absent players (-inf) stay -inf. Modifies `scores` in place.
+    """
+    n = scores.shape[1]
+    k = min(k, n)
+    kth = np.partition(scores, n - k, axis=1)[:, n - k]
+    near = scores >= (kth - NOISE_CUTOFF_SIGMAS * noise_sigma)[:, None]
+    near &= scores > -np.inf
+    rows, cols = np.nonzero(near)
+    scores[rows, cols] += rng.normal(0.0, noise_sigma, size=rows.size)
+    return scores
+
+
 def run_simulation_ranked(players, p_play, hist_signals, hist_wts,
                           n_sims=N_SIMS, n_values=N_VALUES, chunk=CHUNK, seed=SEED,
                           noise_sigma=0.0):
@@ -167,12 +190,11 @@ def run_simulation_ranked(players, p_play, hist_signals, hist_wts,
             idx = rng.choice(len(hist_signals[i]), size=c, p=hist_wts[i], replace=True)
             scores[:, i] = hist_signals[i][idx]
 
-        if noise_sigma > 0.0:
-            scores += rng.normal(0.0, noise_sigma, size=scores.shape)
-
         present = rng.random((c, n)) < p_play
         plays_ct += present.sum(axis=0)
         scores[~present] = -np.inf
+        if noise_sigma > 0.0:
+            add_cutoff_noise(scores, max_N, noise_sigma, rng)
 
         part  = np.argpartition(-scores, min(max_N, n - 1), axis=1)[:, :max_N]
         row   = np.arange(c)[:, None]

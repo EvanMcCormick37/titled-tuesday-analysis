@@ -23,6 +23,7 @@ import pandas as pd
 
 from kalshi_core import pnl_summary, portfolio_kelly, kalshi_order_price  # noqa: F401 — re-exported for callers
 from .config import N_SIMS, CHUNK, SEED
+from .simulation import add_cutoff_noise
 
 
 # ── Portfolio parsing ─────────────────────────────────────────────────────────
@@ -154,11 +155,10 @@ def run_portfolio_mc_score(players, p_play, hist_composites, hist_wts,
         for i in range(n):
             idx = rng.choice(len(hist_composites[i]), size=c, p=hist_wts[i], replace=True)
             scores[:, i] = hist_composites[i][idx]
-        if noise_sigma > 0.0:
-            scores += rng.normal(0.0, noise_sigma, size=scores.shape)
-
         present = rng.random((c, n)) < p_play
         scores[~present] = -np.inf
+        if noise_sigma > 0.0:
+            add_cutoff_noise(scores, max_N, noise_sigma, rng)
 
         k     = min(max_N, n - 1)
         part  = np.argpartition(-scores, k, axis=1)[:, :max_N]

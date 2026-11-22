@@ -11,7 +11,7 @@ Production Python trading system for betting on chess.com's weekly **Titled Tues
 2. Predicts each player's probability of attending and finishing in the top N (Monte Carlo)
 3. Places and executes orders on Kalshi using those fair-value estimates
 
-As of 2026-10, the system is deployed on **Railway** across several services sharing one Docker image + one Postgres instance. Local development against SQLite still works unchanged via the dual-backend DB layer.
+Production runs on **Railway**: several services sharing one Docker image and one Postgres instance. Local development runs against SQLite through the dual-backend DB layer.
 
 ## Deployment (Railway)
 
@@ -21,16 +21,16 @@ Services + one Postgres plugin, all sharing the single `Dockerfile` at the repo 
 |---|---|---|
 | `tt-cron` | `python scripts/weekly_pipeline.py` | Titled Tuesday weekly scrape → broadcasts refresh → raw MC. Cron: `0 19 * * 2` (UTC — 15:00 EDT / 14:00 EST) |
 | `bb-cron` | `python scripts/weekly_pipeline.py --market bullet_brawl` | The same pipeline for Bullet Brawl. Cron: `0 20 * * 6` (UTC — Saturday 16:00 EDT / 15:00 EST) |
-| `tt-app` | `python -m streamlit run app/dashboard.py --server.port=$PORT --server.address=0.0.0.0` | Mobile-friendly Streamlit dashboard — primary user interface |
-| `tt-api` | `/bin/sh -c "exec python -m uvicorn api.main:app --host 0.0.0.0 --port $PORT"` | FastAPI + built React dashboard (`web/`). Replaces `tt-app` at cutover |
+| `tt-api` | `/bin/sh -c "exec python -m uvicorn api.main:app --host 0.0.0.0 --port $PORT"` | Primary dashboard: FastAPI + built React app (`web/`), every registered market. Healthcheck `/api/me` |
+| `tt-app` | `python -m streamlit run app/dashboard.py --server.port=$PORT --server.address=0.0.0.0` | Legacy Streamlit dashboard, Titled Tuesday only |
 | `tt-worker` | `python scripts/trade_worker.py` | Runs the trade queue, recomputes, pipeline retries, attendance research, live Kalshi snapshots, and the market-maker watchdog. Run exactly one replica; restart policy ON_FAILURE |
-| `tt-market-maker` | `python scripts/market_maker.py` | Reactive two-tier market maker for every registered market (see "Market maker" below). Shadow unless `MM_LIVE=1`. Run exactly one replica; restart policy ON_FAILURE. Called `tt-mm` in `railway.toml` and the code; tt-worker finds it by its DB heartbeat, so the service name doesn't matter |
+| `tt-market-maker` | `python scripts/market_maker.py` | Reactive two-tier market maker for every registered market (see "Market maker" below). Shadow unless `MM_LIVE=1`. Run exactly one replica; restart policy ON_FAILURE. The code calls it `tt-mm`; tt-worker finds it by its DB heartbeat, so the service name doesn't matter |
 
 **Important Railway gotcha:** Cron expressions are evaluated in UTC regardless of the `TZ` env var. Use numeric day-of-week (`2` = Tuesday, `6` = Saturday), not the `TUE` alias. `TZ=America/New_York` only affects the container's clock inside Python (which matters for `MarketSpec.most_recent_event()`, the date each pipeline run is for).
 
 Env vars (set in Railway UI, per service unless noted):
 - **Shared:** `DATABASE_URL` (always the reference `${{Postgres.DATABASE_URL}}`, never a pasted URL: a copied public URL goes stale when the password changes, which crashed tt-worker and tt-cron in 2026-11), `KALSHI_API_KEY_ID`, `KALSHI_PRIVATE_KEY_B64` (base64 of `~/.kalshi/trading-key.txt`), `KALSHI_ENV=prod`, `TZ=America/New_York`, `GH_TOKEN` (PAT for installing private `kalshi-core`)
-- **tt-app only:** `DASHBOARD_PASSWORD`
+- **tt-api and tt-app:** `DASHBOARD_PASSWORD`
 - **tt-worker only:** `RAILWAY_DEPLOYMENT_DRAINING_SECONDS=30`
 - **tt-market-maker only:** `MM_LIVE=1` to send orders (otherwise shadow), optional `MM_SCOUTS=0` (anchors only), `MM_MARKETS` (comma-separated slugs), `MM_JOURNAL_DIR` (default `data/mm_journal`; mount a volume there to keep journals across deploys). Needs a kalshi-core build that includes `KalshiWS`, so push kalshi-core `main` before deploying
 
@@ -41,87 +41,32 @@ The `Dockerfile` installs `kalshi-core` at build time from a private GitHub repo
 ## Common Commands
 
 ```bash
-# Install dependencies
 pip install -r requirements.txt
 
-# ── Local one-off tasks ─────────────────────────────────────────────────────
-
 # Full weekly pipeline (scrape → broadcasts → raw MC → adjustments_pending)
-python scripts/weekly_pipeline.py
-python scripts/weekly_pipeline.py --market bullet_brawl
-
-# Just scrape new TT standings
-python scripts/scraping/update_titled_tuesday.py
-
-# Just scrape new Bullet Brawl standings (or pass an event URL; --enrich-only fills in player names)
-python scripts/scraping/update_bullet_brawl.py
-
-# Weekly broadcast refresh (Lichess PGN dumps + attendance_conflicts rebuild)
-python scripts/scraping/update_broadcasts.py
+python scripts/weekly_pipeline.py [--market bullet_brawl]
 
 # Re-run `run_adjusted` against the current manual_adjustments table
-python scripts/trigger_adjusted.py
-python scripts/trigger_adjusted.py --market bullet_brawl
+python scripts/trigger_adjusted.py [--market bullet_brawl]
 
-# Walk-forward joint backtest of score vs perf-rating MC (writes to `backtest` table)
-python scripts/run_backtest.py
+# Walk-forward backtest (records the run in data/backtests.db)
+python scripts/run_backtest.py [--market bullet_brawl] --notes "..."
 
-# ── Trading (CLI — all auto-resolve tourn_date via next_tourn_date()) ────────
-
-# Place resting bids on Kalshi (dry run by default; pass --live to go live)
-python scripts/place_bids.py
-
-# Place fade NO bids expiring N minutes after 11:00 ET tournament start
+# Trading CLI — Titled Tuesday only, dry run unless --live; trade Bullet Brawl from the React dashboard
+python scripts/place_bids.py        # legacy; refused while the MM is live
 python scripts/place_fade_bids.py
-
-# Fire taker orders on high-ROI opportunities (optional --loop)
-python scripts/take_trades.py
-
-# Cancel all resting TT orders
+python scripts/take_trades.py       # optional --loop
 python scripts/cancel_bids.py
 
-# ── Dashboard (local dev) ───────────────────────────────────────────────────
-
+# Dashboard (local dev)
 python -m uvicorn api.main:app --reload     # React dashboard API (all markets)
-python -m streamlit run app/dashboard.py    # legacy Streamlit app (Titled Tuesday only)
 
-# ── Market maker ────────────────────────────────────────────────────────────
+# Market maker
 python scripts/market_maker.py              # shadow: live books, computes quotes, sends nothing
 MM_LIVE=1 python scripts/market_maker.py    # live
 ```
 
-The trading CLI scripts above cover Titled Tuesday only; trade Bullet Brawl from the React dashboard.
-
-The `notebooks/command-center.ipynb` remains the richest interactive control surface for exploratory analysis, though for day-to-day production use the Streamlit dashboard has superseded it.
-
 ## Architecture Overview
-
-### Data Flow
-
-```
-Chess.com ─┐
-Lichess   ─┤→ scrapers → Postgres (Railway) or SQLite (local)
-           │                 ↓
-           │        src/data.py (load_and_prepare)
-           │                 ↓
-           │        src/simulation.py (100k Monte Carlo)
-           │                 ↓
-           │        latest_model_predictions_raw ──┐
-           │                                        │  src/pipeline.run_adjusted
-           │        manual_adjustments ────────────┤      (merges adjustments
-           │                                        │       into raw sim)
-           │                                        ↓
-           │                                latest_model_predictions
-           │                                        ↓
-           │              ┌─────────────────────────┴──────────────────────────┐
-           │              ↓                                                    ↓
-           │       api/main.py + web/                                   src/trading.py
-           │       (React dashboard)                                    (place / take / cancel / fade)
-           │              │                                                    ↓
-           └─ pipeline_runs                                              kalshi_core.KalshiClient
-              (state machine for                                               ↓
-              the whole weekly cycle)                                      Kalshi API
-```
 
 ### Entry points (where to start reading)
 
@@ -129,7 +74,7 @@ Lichess   ─┤→ scrapers → Postgres (Railway) or SQLite (local)
 - **`scripts/trigger_adjusted.py`** — `run_adjusted` entry point. Reads `manual_adjustments` for the upcoming tourn_date, re-simulates, writes `latest_model_predictions`, flips the matching `pipeline_runs` row to `completed`.
 - **`api/main.py`** + **`web/`** — FastAPI + React dashboard for every registered market (market picker in the top bar). Pages: Trade / Market maker / Edges / Portfolio / Odds / Attendance / Pipeline / Logs. Gated by `DASHBOARD_PASSWORD`.
 - **`scripts/market_maker.py`** — tt-market-maker entry point; runs `src/mm/engine.py`.
-- **`app/dashboard.py`** — legacy Streamlit entry, Titled Tuesday only. Seven tabs: Odds / Attendance / Pipeline / Portfolio / Trade / Edges / Jobs.
+- **`app/dashboard.py`** — legacy Streamlit dashboard, Titled Tuesday only.
 
 ### Trade queue
 
@@ -156,6 +101,7 @@ Replaces resting `place_bids` with an event-driven quoter (design: `Kalshi Marke
 - Orders: `post_only`, `client_order_id` prefixed `mma-`/`mms-` (the MM, its startup cancel and the watchdog only touch those), expiration = cutoff (`cutoff_minutes_before_start`, default 120), one order group per market. Price changes amend only if never filled, else cancel + recreate (amend count semantics after fills are ambiguous). Amending price loses queue position; decreasing keeps it.
 - Cutoff in four layers: order expiry, strategy clock, tt-mm cancel-all + verify, tt-worker watchdog (+1 min). Watchdog also cancels scouts if tt-mm's heartbeat is >20 s old.
 - Control: Market maker page (pause/resume, parameters stored as JSON overrides in `mm_control.params` and hot-reloaded, player repost/pull, alerts, fills, live quote sheet). The kill switch also pauses the MM. `place_bids` is legacy and refused while the MM is live and unpaused on that market.
+- Parameters and their defaults: `MMParams` in `src/mm/config.py` (per-market overrides validated by pydantic, `extra='forbid'`).
 - Tables (`mm_control`, `mm_player_overrides`, `mm_alerts`, `mm_status`, `mm_fills`) are created by `job_queue.init_schema()`, so no migration is needed.
 - Journal: JSONL of every WS message and action, one file per UTC day in `MM_JOURNAL_DIR`.
 - Quoting is active only when the market is unpaused, not held (a model run that fails hard validation holds the market and raises a `model_invalid` alert), fair values are loaded, and the time is before the cutoff (minus 5 s).
@@ -163,45 +109,28 @@ Replaces resting `place_bids` with an event-driven quoter (design: `Kalshi Marke
 - API: `GET /api/markets/{slug}/mm` (status, quotes, alerts, fills), `POST …/mm/pause`, `PUT …/mm/params`, `POST …/mm/players/{username}/repost|pull`, `POST /api/mm/alerts/{id}/ack`.
 - Tests: `tests/test_mm_core.py` (quoting, book, risk, OMS) and `tests/test_mm_engine.py` (engine with a fake gateway).
 
-**Parameters** (`MMParams` in `src/mm/config.py`; per-market overrides from the Market maker page, validated by pydantic, `extra='forbid'`). Defaults:
-
-| Group | Param | Default |
-|---|---|---|
-| Anchor | `anchor_volume` (contracts per side), `markup`, `max_discount` (¢) | 200, 1.5, 15 |
-| Scout | `scouts_enabled`, `buffer_c`, `min_scout`, `min_dwell_ms` | true, 2, 1, 200 |
-| Price war | `war_max_reprices` (per min), `war_cooloff_s` (rests at the buffer edge meanwhile) | 8, 120 |
-| Wipes | `wipe_ratio`, `wipe_min_qty`, `max_wipes`, `wipe_mirror` | 0.33, 10, 2, true |
-| Risk | `max_position` (per market), `max_player_notional` ($ resting per player per side), `max_event_notional` ($), `min_price_c`, `max_price_c`, `order_group_limit` (contracts / 15 s) | 400, 400, 5000, 2, 97, 2000 |
-| Timing | `cutoff_minutes_before_start` | 120 |
-
-**Going live:** run in shadow first and check the Market maker page (mode `shadow`, fresh heartbeat, WS connected, no `fv_errors`, sensible quote sheet). Lower the size and risk limits for the first live event, optionally with scouts off. Then set `MM_LIVE=1` on the service (it redeploys). On startup it cancels its own `mma-`/`mms-` orders and begins quoting. tt-worker must be running for the watchdog. To stop, use **Pause** or the kill switch; to return to shadow, unset `MM_LIVE`.
-- kalshi-core gained `KalshiWS`, `order_body`/`create_order`, `amend_order`, `decrease_order`, `batch_create_orders`, `batch_cancel_orders`, `create_order_group`, `get_account_limits`.
-
 ### Attendance researcher (`src/research/`)
 
-Finds other tournaments that may keep high-value players away from the next event. Design and roadmap: `Attendance Researcher Architecture — Proposal.md` at the repo root. **Phase 1 (built) is deterministic, with no LLM.** Phases 2–4 add the LLM investigation (minirouter.sh, `zai/glm-5.3-flash`), proposals with accept/edit/reject, scheduling, and the emergency halt.
+Finds other tournaments that may keep high-value players away from the next event. It is deterministic so far, with no LLM; the planned LLM phases are in `Attendance Researcher Architecture — Proposal.md` at the repo root.
 
 - Runs as the `research` ops job in the **`background` lane**: a subprocess on tt-worker (`scripts/research_attendance.py --market --date`) that never holds the market's trade lane, because it doesn't change predictions or orders. Started from **Run now** on the Attendance page (no schedule yet). The kill switch leaves it alone.
 - **Candidates:** players whose raw-model fair value `p_participate × P_top8_given_play` is above 5% (`candidate_min_fv`, `candidate_n`), one row per player.
-- **Calendar:** the Lichess broadcast API (`/api/broadcast/top` + `/api/broadcast`, every tier, then rounds and `/broadcast/{id}/players` for events within a day of the event), plus events you add on the Attendance page. chess.com/events can't be read automatically (Cloudflare challenges headless browsers, tested 2026-11-20); add its events by hand. Don't add stealth or challenge-solving.
+- **Calendar:** the Lichess broadcast API (`/api/broadcast/top` + `/api/broadcast`, every tier, then rounds and `/broadcast/{id}/players` for events within a day of the event), plus events you add on the Attendance page. chess.com/events can't be read automatically (Cloudflare challenges headless browsers); add its events by hand. Don't add stealth or challenge-solving.
 - **Clash test** (`overlap.py`): window = start to start + `MarketSpec.event_duration_minutes` (TT 150, BB 120). A round overlapping the window is `hard`, within `adjacent_hours` is `adjacent`, within `mid_event_hours` is `multi_day`. Round length depends on time control (classical 300 min). Season-long leagues count only through their actual rounds.
 - **Name matching** (`names.py`): exact / strong / partial (surname + first initial, never a shared given name) / hint (the free-text players line).
 - **Tables** (created by `job_queue.init_schema()`): `research_control` (params JSON), `research_runs` (candidates, leads, stats, collector errors), `research_events` (catalog, upserted by (source, source_id), with the operator's per-event `policy`, which re-collection never overwrites).
 - **Migration:** the `background` lane needs `python scripts/migrate_research.py` once per database (it rebuilds the `trade_jobs.lane` CHECK; idempotent). Until then, queueing a research job fails.
-- **API:** `GET /api/markets/{slug}/research`, `POST …/research/run`, `POST /api/research/events` (add), `DELETE /api/research/events/{id}` (your events only), `PUT /api/research/events/{id}/policy`.
-- **Tests:** `tests/test_research.py`. `scripts/research_smoke_test.py` checks minirouter models (billed); `scripts/chesscom_events_probe.py` is the record of the chess.com test.
+- **Tests:** `tests/test_research.py`.
 
 ### Local analysis
 
 Notebooks and backtests run against a local SQLite copy of Railway, in the `tt` conda env (`requirements-dev.txt` plus `kalshi-core`, Jupyter kernel "Python (tt)"). Run every script from `tt`: conda `base` has a psycopg without libpq, so anything touching Postgres fails there with "no pq wrapper available".
 
 - `python scripts/pull_snapshot.py` refreshes `data/chess_tournament_data.db` over a read-only connection. Never put the Railway URL in `.env.local`.
-- `python scripts/run_backtest.py --notes "..."` records a run in `data/backtests.db` with its settings and git commit. Pulling a snapshot doesn't affect that file.
-- `src/backtest_runs.py` holds the scoring. The run-comparison notebook (`backtest-explorer.ipynb`) is now in `notebooks/archive/`.
+- `python scripts/run_backtest.py --notes "..."` records a run in `data/backtests.db` with its settings and git commit. Pulling a snapshot doesn't affect that file. `src/backtest_runs.py` holds the scoring.
 - `run_raw` and `run_adjusted` take `as_of` to rebuild a past week's prediction from only earlier history (`load_and_prepare(as_of=)`). Leave it unset in production.
 - `notebooks/model-performance-audit.ipynb` audits Titled Tuesday's live predictions since 2026-07-07: calibration, blind spots, manual-override accuracy, Brier scores against backtest models, and betting results.
 - `notebooks/bullet-brawl-score-model.ipynb` tests a Bullet Brawl model that splits score into games played × points per game, instead of replaying raw scores.
-- `notebooks/archive/` (gitignored, local only) holds retired notebooks.
 
 ### Multiple markets
 
@@ -212,65 +141,21 @@ Notebooks and backtests run against a local SQLite copy of Railway, in the `tt` 
 - `scripts/migrate_multi_market.py` applies this schema to an existing database. It is idempotent.
 - The Streamlit app and the trading CLI scripts cover Titled Tuesday only; the React dashboard covers every registered market.
 - `ModelConfig.score_noise_sigma` (score points) sets a market's Gaussian smoothing in `run_raw` and `run_adjusted`. Titled Tuesday's is 0.01 (100 composite units, `SCORE_GAUSSIAN_KERNEL_SIGMA_NARROW`), which randomizes tiebreaks without moving anyone across a score bucket; Bullet Brawl's is 10, the winner of its sigma backtest. Never set it to 0: replayed results would keep their exact historical tiebreaks, so ties resolve deterministically. The `ModelConfig` default is 0.01 for that reason. `ModelConfig.played_filter` is the SQL condition for a row that counts as attending; Bullet Brawl uses `games > 0`.
-- `python scripts/run_backtest.py --market bullet_brawl` runs the sigma comparison (its results notebook, `bullet-brawl-backtest.ipynb`, is now in `notebooks/archive/`). Add a market's backtest to `PROFILES` in that script.
+- `python scripts/run_backtest.py --market bullet_brawl` runs the sigma comparison. Add a market's backtest to `PROFILES` in that script.
 - Adding a market: a `MarketSpec` (with `pipeline_steps` and `event_url_example`), a scrape function and `PIPELINES` entry in `scripts/weekly_pipeline.py`, registration in `MARKETS`, and a Railway cron service.
-- Bullet Brawl is registered and runs the same weekly workflow as Titled Tuesday. Chess.com has no Bullet Brawl listing page, so `scripts/scraping/update_bullet_brawl.py` finds each new event in the monthly game archives of the most frequent recent players, confirms it against the tournament API, and then enriches new accounts with at least `MIN_APPEARANCES` games into `player_information`. If no archive has the event yet, the step fails with `listing_missing_slug` and the Pipeline page takes the URL.
-- Usernames keep chess.com's capitalization in every table, one spelling per account. The tournament API lists Bullet Brawl players in lowercase, so ingestion takes the case from the player's games and then adopts the spelling already on record (`bullet_brawl_ingest.known_usernames`: Titled Tuesday first, then `player_information`). Never lowercase usernames; compare case-insensitively when checking whether an account exists. `scripts/fix_bullet_brawl_username_case.py` repaired the first backfill, which had lowercased them.
-- `scripts/scraping/backfill_bullet_brawl.py` loads history into local SQLite and writes `data/bullet_brawl_backfill_report.csv`. `scripts/push_bullet_brawl_history.py` copies that history and the enriched player names to Railway (run once). `pull_snapshot.py` keeps the local rows until Railway has its own.
+- Chess.com has no Bullet Brawl listing page, so `scripts/scraping/update_bullet_brawl.py` finds each new event in the monthly game archives of the most frequent recent players, confirms it against the tournament API, and then enriches new accounts with at least `MIN_APPEARANCES` games into `player_information`. If no archive has the event yet, the step fails with `listing_missing_slug` and the Pipeline page takes the URL.
+- Usernames keep chess.com's capitalization in every table, one spelling per account. The tournament API lists Bullet Brawl players in lowercase, so ingestion takes the case from the player's games and then adopts the spelling already on record (`bullet_brawl_ingest.known_usernames`: Titled Tuesday first, then `player_information`). Never lowercase usernames; compare case-insensitively when checking whether an account exists.
 
 ### Key modules
 
-**`src/config.py`** — Single source of truth for MC hyperparameters (`N_SIMS=100_000`, `SKILL_DECAY=0.96`, `PARTICIPATION_DECAY=0.75`), DB path (local), attendance model cutoffs. **No `TOURN_DATE` constant** — resolve dynamically via `src.pipeline.next_tourn_date(spec)`, which is one week after the latest date in the market's standings table.
-
-**`src/db.py`** — Dual-backend connection layer. `get_conn()` returns a wrapped DB-API connection (auto-translates `?` → `%s` on Postgres); `get_engine()` returns a cached SQLAlchemy engine for pandas-style access. Backend chosen at import time from `$DATABASE_URL`: `postgres(ql)://` → psycopg3, else SQLite at `config.DB_PATH`. Helpers: `upsert_many()`, `replace_market_rows()`, `read_market_rows()`, `table_columns()`.
-
-**`src/data.py`** — `load_and_prepare()` reads standings, computes decay-weighted skill history and EWMA participation rates, down-weights events before `SEASON_SHIFT_DATE`, subtracts `attendance_conflicts` weeks from the EWMA denominator.
-
-**`src/simulation.py`** — Monte Carlo kernels + three player-pool builders:
-- `build_player_pool()` + `run_simulation()`: rank-percentile (legacy, float32)
-- `build_player_pool_score()`: composite `score * 10000 + tiebreak` (production default)
-- `build_player_pool_perf()`: `performance_rating` (aroc-based Elo; used by backtest)
-
-The score and perf pools feed `run_simulation_ranked` (also exported as `run_simulation_score`). Runs in NumPy-vectorized chunks (`CHUNK=10_000` sims per batch). Returns `P_top{1,3,5,8,10}_given_play` + `p_participate`.
-
-**`src/pipeline.py`** — Three public functions:
-- `run_raw(tourn_date)` — load → build pool → baseline simulation → optionally save to `latest_model_predictions_raw`.
-- `run_adjusted(tourn_date, cut_players=, keep_players=, p_participate_overrides=, p_nudges=, global_nudge=)` — merges adjustments into the raw pool, re-simulates, optionally (`save_official=True`) saves to `latest_model_predictions` and archives the same rows in `historical_predictions`, replacing that market's rows for the date. The archive therefore holds the last official prediction before each event, the one that was traded. Adjustment priority: `p_nudges` → `cut_players` → `p_participate_overrides` → `keep_players`.
-- `load_adjustments(tourn_date) -> dict` — reads `manual_adjustments` and shapes the rows into the kwargs `run_adjusted` expects. "Last-write-wins" per (player, type).
-- `next_tourn_date(spec=TITLED_TUESDAY) -> str` — one week after the latest event in the market's standings table.
-
-**`src/kalshi_markets.py`** — Kalshi helpers for any market spec; `src/kalshi_tt.py` wraps them as `get_tt_markets()`, `get_tt_asks()`, `get_tt_positions_df()`. The positions reader joins Kalshi's live position data against the local kalshi-core `fills` table so transaction fees are reflected in `cost_incl_fees` and `avg_price_incl_fees`. Import `KalshiClient` from `kalshi_core`, not from here.
-
-**`src/trading.py`** — Four live strategies. All default `tourn_date=None` and lazily resolve via `next_tourn_date()`:
-- `place_bids()` — **legacy, superseded by the market maker's anchors**; live submissions are refused while the MM is live and unpaused on that market. Fair price = `p_participate × P_top{N}_given_play`, bids at `max(fair/markup, fair − max_discount)`, cancels stale orders if new bid is lower, pulls back if market ask is at or below the computed bid. Expiry 9 AM ET on tourn day. With `match_on_best_available=True`, if the best competing bid (excluding our own resting orders) is below the computed bid, it rests 1¢ above that bid instead.
-- `place_fade_no_bids()` — resting NO bids at `(1 − P_top{N}_given_play) × 100 − discount_cents`, expiring N minutes after 11:00 ET tourn start. Thesis: fade retail panic-buying of YES on low-attendance stars. **Only touches NO bids with expiration ≥ tourn start** so it doesn't wipe the 9 AM `place_bids` orders.
-- `take_trades()` — fetches live asks, filters by ROI threshold and min quantity (iceberg-decoy guard), fires fill-or-kill orders via `ThreadPoolExecutor`.
-- `cancel_tt_bids()` — cancels every resting TT order for the date.
-
-Bid math (`bid_cents`, `best_ask`, `apply_pullback`, `kalshi_order_price`) imported from `kalshi_core`.
-
-**`src/portfolio.py`** — Portfolio-level MC for P&L simulation and Kelly sizing. `simulate_positions_pnl` backs the React Portfolio page's `pnl` snapshot: tt-worker reads positions, then runs `scripts/portfolio_pnl.py` as a subprocess (about 40 s, 25k sims, official predictions, costs including fees). It re-simulates only when positions or predictions change (`market_views._pnl_input_key`). `pnl_summary`, `portfolio_kelly`, `kalshi_order_price` re-exported from `kalshi_core` for back-compat.
-
-### Dashboard package (`app/`)
-
-```
-app/
-    dashboard.py        ← Streamlit entry (auth → banner → 7 tabs)
-    auth.py             ← DASHBOARD_PASSWORD gate via session_state
-    banner.py           ← Persistent status strip reading pipeline_runs
-    trade_loop.py       ← Background take-trades loop thread for the Trade tab
-    state.py            ← Cached DB loaders (st.cache_data) — current_status,
-                           load_predictions, username_to_player_map, ...
-                           Also defines the PipelineStatus NamedTuple.
-    tabs/
-        odds.py         ← Three Plotly views (chances / fair prices / table) + N selector
-        adjustments.py  ← Form writes manual_adjustments; "Save & recompute" fires trigger_adjusted
-        pipeline.py     ← Timeline of current + recent pipeline_runs rows; retry controls
-        portfolio.py    ← get_tt_positions_df + fee-inclusive metrics; Sync fills button
-        trade.py        ← Place / Fade / Take / Cancel sub-sections, each two-tap confirm
-        edges.py        ← Current edge trades (compute_edges)
-        jobs.py         ← Paginated job_runs log viewer
-```
+- **`src/config.py`** — MC hyperparameters (`N_SIMS`, `SKILL_DECAY`, `PARTICIPATION_DECAY`), local DB path, attendance cutoffs. **No `TOURN_DATE` constant** — use `src.pipeline.next_tourn_date(spec)` (one week after the latest date in the market's standings table).
+- **`src/db.py`** — dual backend chosen at import from `$DATABASE_URL` (`postgres(ql)://` → psycopg3, else SQLite at `config.DB_PATH`). `get_conn()` translates `?` → `%s` on Postgres; `get_engine()` for pandas.
+- **`src/data.py`** — `load_and_prepare()`: decay-weighted skill history and EWMA participation, with `attendance_conflicts` weeks removed from the denominator.
+- **`src/simulation.py`** — MC kernels. Production uses `build_player_pool_score()` (composite `score * 10000 + tiebreak`) with `run_simulation_ranked`; the perf pool is for backtests.
+- **`src/pipeline.py`** — `run_raw`, `run_adjusted`, `load_adjustments`, `next_tourn_date`. `run_adjusted(save_official=True)` also archives to `historical_predictions`. Adjustment priority: `p_nudges` → `cut_players` → `p_participate_overrides` → `keep_players`; last write wins per (player, type).
+- **`src/kalshi_markets.py`** / **`src/kalshi_tt.py`** — Kalshi helpers per spec; positions join the kalshi-core `fills` table for fee-inclusive cost. Import `KalshiClient` from `kalshi_core`, not from here.
+- **`src/trading.py`** — `place_bids` (legacy), `place_fade_no_bids`, `take_trades`, `cancel_tt_bids`. Fade bids only touch NO orders expiring at or after the event start, so they never cancel the earlier-expiring bids.
+- **`src/portfolio.py`** — portfolio MC and Kelly sizing. tt-worker runs `scripts/portfolio_pnl.py` as a subprocess for the Portfolio page's `pnl` snapshot, only when positions or predictions change.
 
 ### Database schema
 
@@ -286,21 +171,19 @@ Postgres on Railway (schema defined in `scripts/init_postgres_schema.py`); SQLit
 **Predictions:**
 - `latest_model_predictions_raw` — pre-adjustment predictions (overwritten each `run_raw`).
 - `latest_model_predictions` — current adjusted predictions (overwritten each `run_adjusted`).
-- `historical_predictions` — archived past predictions; each `run_adjusted(save_official=True)` overwrites its (market, tourn_date) rows.
+- `historical_predictions` — archived past predictions; each `run_adjusted(save_official=True)` overwrites its (market, tourn_date) rows, so it holds the last official prediction before each event, the one that was traded.
+- `backtest` — joint walk-forward backtest output. Row = (market, tourn_date, model, username) with `model ∈ {score, perf}`, includes `played` + `actual_rank`.
 
 **Market maker** (created by `job_queue.init_schema()`): `mm_control` (pause flag + param overrides per market), `mm_player_overrides` (wipe factors, pulls, per-player markup), `mm_alerts`, `mm_status` (heartbeat, mode, `paused_ack`, state JSON), `mm_fills`.
-- `backtest` — joint walk-forward backtest output. Row = (tourn_date, model, username) with `model ∈ {score, perf}`, includes `played` + `actual_rank`.
 
-**Orchestration (new in the Railway deploy):**
-- `pipeline_runs` — one row per weekly cycle. `(tourn_date UNIQUE, state, current_step, failed_step, error_kind, error_message, started_at, completed_at)`. `state ∈ {running, adjustments_pending, completed, failed}`. `error_kind ∈ {listing_missing_slug, http_error, computation_error, unknown}`.
+**Orchestration:**
+- `pipeline_runs` — one row per weekly cycle per market. `(market, tourn_date) UNIQUE` (rekeyed by `migrate_multi_market.py`), plus `state, current_step, failed_step, error_kind, error_message, started_at, completed_at`. `state ∈ {running, adjustments_pending, completed, failed}`. `error_kind ∈ {listing_missing_slug, http_error, computation_error, unknown}`.
 - `job_runs` — fine-grained log of every step. `(pipeline_run_id FK, job_name, started_at, ended_at, status, summary JSONB, log_tail)`. Many `job_runs` rows roll up to one `pipeline_runs`.
-- `manual_adjustments` — `(tourn_date, player_name, adjustment_type, value, created_at, created_by)`. `adjustment_type ∈ {cut, keep, override, nudge, global_nudge}`. Consumed by `load_adjustments()`. Dashboard writes `created_by='dashboard'`.
+- `manual_adjustments` — `(market, tourn_date, player_name, adjustment_type, value, created_at, created_by)`. `adjustment_type ∈ {cut, keep, override, nudge, global_nudge}`. Consumed by `load_adjustments()`. Dashboard writes `created_by='dashboard'`.
 
 **Kalshi (via kalshi-core shared DB at `~/.kalshi/data/kalshi.db`):**
 - `fills` — account-level trade history including `fee_cost`.
 - `portfolio_snapshots` — periodic position snapshots.
-
-See `../kalshi-core/CLAUDE.md` for the kalshi-core API.
 
 ### Pipeline state machine
 
@@ -348,10 +231,6 @@ Each `MarketSpec` defines a winner series and a top-N series:
 - `KXTITLEDTUESTOP-{date}T{N}-{PLAYER}` / `KXBULLETBRAWLTOP-{date}T{N}-{PLAYER}` — top-N markets (N=3, 5, 8)
 
 `{date}` is in Kalshi's `YYMONDD` format (e.g. `26SEP16`), produced by `_to_kalshi_date()` from `kalshi_core`. `MarketSpec.n_from_ticker` extracts N from these patterns.
-
-### API cache
-
-Chess.com API responses cached in `data/api_cache/` (JSON keyed by username) with thread-safe access + exponential backoff on rate limits.
 
 ## Environment Setup (local dev)
 
