@@ -49,6 +49,10 @@ _PLAYER_ALIASES:dict[str, str] = {
     'Aleksandr Logachiov':'Alexander Logachiov',
     'Brayan Steven Chavez':'Brayan Stiven Chavez Duero',
     'Witold Lechowski':'Witek Lechowski',
+    # Freestyle Friday contract names
+    'Sunilduth Lyna Narayanan':'S.L. Narayanan',
+    'Jose Eduardo Martinez Alcantara':'Jose Martinez Alcantara',
+    'Gukesh Dommaraju':'Gukesh D',
 }
 
 _USERNAME_TO_PLAYER:dict | None = None
@@ -363,13 +367,16 @@ def load_and_prepare(scheduling_conflict=None, cut_players=None, keep_players=No
     # excluded from BOTH numerator (already absent from standings) and
     # denominator (subtracted from Z_part below), so p_participate reflects the
     # rate of attendance on weeks with no scheduling conflict.
-    with get_conn() as _conn:
-        conflict_deduction = _conflict_z_deduction(
-            _conn, ref,
-            use_season_shift=(attendance_start is None),
-            min_date=attendance_start,
-            spec=spec,
-        )
+    if model.conflict_deduction:
+        with get_conn() as _conn:
+            conflict_deduction = _conflict_z_deduction(
+                _conn, ref,
+                use_season_shift=(attendance_start is None),
+                min_date=attendance_start,
+                spec=spec,
+            )
+    else:
+        conflict_deduction = {}
 
     # ── Participation calculation ────────────────────────────────────────────
     if attendance_start is not None:
@@ -405,6 +412,26 @@ def load_and_prepare(scheduling_conflict=None, cut_players=None, keep_players=No
         p_participate = (num / Z_user).clip(lower=model.min_participation_rate, upper=1.0).rename('p_participate')
         n_adj = int((num.index.to_series().map(conflict_deduction).fillna(0.0) > 0).sum())
         print(f'  p_participate: {n_adj:,} players had conflict-week deductions applied to Z_part')
+
+    if model.attendance_model == 'two_part':
+        from .attendance_model import two_part_participation
+        with get_conn() as _conn:
+            try:
+                conflict_pairs = {(str(d)[:10], u) for d, u in _conn.execute(
+                    'SELECT date, username FROM attendance_conflicts WHERE market = ?', (spec.slug,)).fetchall()}
+            except Exception:
+                conflict_pairs = set()
+        two_part = two_part_participation(
+            df, ref, conflict_pairs, deduct_conflicts=model.conflict_deduction,
+            min_date=pd.Timestamp(attendance_start) if attendance_start else None,
+            min_rate=model.min_participation_rate,
+        )
+        if two_part is None:
+            print('  p_participate: too little history for the two-part model; keeping the EWMA')
+        else:
+            p_participate = two_part.reindex(p_participate.index).fillna(p_participate).rename('p_participate')
+    elif model.attendance_model != 'ewma':
+        raise ValueError(f'Unknown attendance_model {model.attendance_model!r}')
 
     # ── Legacy scheduling-param path (backward compat for backtest) ──────────
     from .attendance import apply_schedule_adjustments

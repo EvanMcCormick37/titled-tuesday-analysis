@@ -38,7 +38,8 @@ from src.multi_market_schema import migrate
 _SKIPPED_TABLES = {'trade_jobs', 'trade_job_events', 'market_snapshots'}
 _CHUNK_ROWS = 50_000
 # Backfilled locally and not yet on Railway.
-_LOCAL_ONLY_TABLES = ('bullet_brawl_tournaments', 'bullet_brawl_standings')
+_LOCAL_ONLY_TABLES = ('bullet_brawl_tournaments', 'bullet_brawl_standings',
+                      'freestyle_friday_tournaments', 'freestyle_friday_standings')
 
 
 def _source_engine(url: str):

@@ -353,7 +353,7 @@ def _perf_rating(score: str | float | None, aroc_1: float | None) -> float | Non
     return round(aroc_1 + 800 * (score_f / 11 - 0.5), 1)
 
 
-def fetch_standings(slug: str) -> list[dict]:
+def fetch_standings(slug: str, headers: dict | None = None) -> list[dict]:
     players     = []
     page        = 1
     n_rounds    = None
@@ -361,7 +361,7 @@ def fetch_standings(slug: str) -> list[dict]:
 
     while True:
         url  = TOURN_URL.format(slug=slug, page=page)
-        resp = requests.get(url, headers=HEADERS, timeout=30)
+        resp = requests.get(url, headers=headers or HEADERS, timeout=30)
         resp.raise_for_status()
         soup  = BeautifulSoup(resp.text, 'html.parser')
         table = soup.find('table')

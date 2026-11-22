@@ -23,6 +23,15 @@ class ModelConfig:
     # Gaussian noise on each sampled score, in score points (x SCORE_COMPOSITE_SCALE in the MC)
     score_noise_sigma: float = 0.01
     played_filter: str | None = None   # SQL condition for a standings row that counts as attending
+    # 'ewma' (decayed attendance rate) or 'two_part' (src/attendance_model.py: a
+    # walk-forward logistic model of the choice to play, fitted on conflict-free weeks)
+    attendance_model: str = 'ewma'
+    # Leave past weeks with a known broadcast conflict out of the attendance denominator
+    conflict_deduction: bool = True
+    # Pseudo-events of the field's recent results mixed into each player's skill
+    # history; the pull toward the field is k / (k + the player's effective events).
+    # 0 disables it.
+    skill_prior_events: float = 0.0
 
 
 @dataclass(frozen=True)

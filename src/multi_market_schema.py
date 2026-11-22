@@ -1,4 +1,4 @@
-"""Adds per-market scoping to shared tables and creates the Bullet Brawl tables.
+"""Adds per-market scoping to shared tables and creates the Bullet Brawl and Freestyle Friday tables.
 
 Idempotent, and each backend applies it in one transaction. Existing rows become
 'titled_tuesday'. The column default also keeps the previous release's INSERTs
@@ -59,6 +59,44 @@ BULLET_BRAWL_DDL = (
     """,
     'CREATE INDEX IF NOT EXISTS idx_bbs_user ON bullet_brawl_standings(username)',
     'CREATE INDEX IF NOT EXISTS idx_bbs_date ON bullet_brawl_standings(date)',
+)
+
+
+# Same columns as titled_tuesday_standings, so the score model and the HTML
+# standings parser apply unchanged.
+FREESTYLE_FRIDAY_DDL = (
+    """
+    CREATE TABLE IF NOT EXISTS freestyle_friday_tournaments (
+        tournament_slug TEXT PRIMARY KEY,
+        date            TIMESTAMPTZ,
+        start_ts        BIGINT,
+        finish_ts       BIGINT,
+        num_players     INTEGER,
+        winner          TEXT,
+        url             TEXT,
+        ingested_at     TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS freestyle_friday_standings (
+        date                TIMESTAMPTZ,
+        tournament_slug     TEXT NOT NULL,
+        rank                REAL,
+        username            TEXT NOT NULL,
+        title               TEXT,
+        rating              REAL,
+        score               REAL,
+        tie_break           REAL,
+        aroc_1              REAL,
+        performance_rating  REAL,
+        wins                REAL,
+        draws               REAL,
+        byes                REAL,
+        PRIMARY KEY (tournament_slug, username)
+    )
+    """,
+    'CREATE INDEX IF NOT EXISTS idx_ffs_user ON freestyle_friday_standings(username)',
+    'CREATE INDEX IF NOT EXISTS idx_ffs_date ON freestyle_friday_standings(date)',
 )
 
 
@@ -142,4 +180,7 @@ def migrate(conn: _ConnWrapper) -> list[str]:
     for stmt in BULLET_BRAWL_DDL:
         conn.execute(stmt)
     changed.extend(('bullet_brawl_tournaments', 'bullet_brawl_standings'))
+    for stmt in FREESTYLE_FRIDAY_DDL:
+        conn.execute(stmt)
+    changed.extend(('freestyle_friday_tournaments', 'freestyle_friday_standings'))
     return changed

@@ -61,7 +61,8 @@ def run_raw(
 
     df, p_raw, app_counts = load_and_prepare(spec=spec, as_of=as_of)
     players, p_play_raw, hist_composites, hist_wts = build_player_pool_score(
-        df, p_raw, app_counts, min_appearances=5
+        df, p_raw, app_counts, min_appearances=5,
+        prior_events=spec.model.skill_prior_events,
     )
     print(f'  Pool: {len(players):,} players | simulating {n_sims:,} tournaments (raw)...')
 
@@ -265,7 +266,8 @@ def load_adj_run_from_db(tourn_date: str | None = None,
 
     df, p_raw, app_counts = load_and_prepare(spec=spec)
     players, _, hist_composites, hist_wts = build_player_pool_score(
-        df, p_raw, app_counts, min_appearances=5
+        df, p_raw, app_counts, min_appearances=5,
+        prior_events=spec.model.skill_prior_events,
     )
 
     results = saved.set_index('username')

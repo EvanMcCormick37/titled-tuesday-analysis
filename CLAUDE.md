@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Purpose
 
-Production Python trading system for betting on chess.com's weekly **Titled Tuesday** blitz tournament and **Bullet Brawl** 1+0 arena using Kalshi prediction markets. The system:
+Production Python trading system for betting on chess.com's weekly **Titled Tuesday** blitz tournament, **Bullet Brawl** 1+0 arena and **Freestyle Friday** chess960 Swiss using Kalshi prediction markets. The system:
 1. Scrapes historical standings from chess.com + concurrent-event broadcast data from Lichess
 2. Predicts each player's probability of attending and finishing in the top N (Monte Carlo)
 3. Places and executes orders on Kalshi using those fair-value estimates
@@ -21,6 +21,7 @@ Services + one Postgres plugin, all sharing the single `Dockerfile` at the repo 
 |---|---|---|
 | `tt-cron` | `python scripts/weekly_pipeline.py` | Titled Tuesday weekly scrape → broadcasts refresh → raw MC. Cron: `0 19 * * 2` (UTC — 15:00 EDT / 14:00 EST) |
 | `bb-cron` | `python scripts/weekly_pipeline.py --market bullet_brawl` | The same pipeline for Bullet Brawl. Cron: `0 20 * * 6` (UTC — Saturday 16:00 EDT / 15:00 EST) |
+| `ff-cron` | `python scripts/weekly_pipeline.py --market freestyle_friday` | The same pipeline for Freestyle Friday. Cron: `0 19 * * 5` (UTC — Friday 15:00 EDT / 14:00 EST) |
 | `tt-api` | `/bin/sh -c "exec python -m uvicorn api.main:app --host 0.0.0.0 --port $PORT"` | Primary dashboard: FastAPI + built React app (`web/`), every registered market. Healthcheck `/api/me` |
 | `tt-app` | `python -m streamlit run app/dashboard.py --server.port=$PORT --server.address=0.0.0.0` | Legacy Streamlit dashboard, Titled Tuesday only |
 | `tt-worker` | `python scripts/trade_worker.py` | Runs the trade queue, recomputes, pipeline retries, attendance research, live Kalshi snapshots, and the market-maker watchdog. Run exactly one replica; restart policy ON_FAILURE |
@@ -44,15 +45,15 @@ The `Dockerfile` installs `kalshi-core` at build time from a private GitHub repo
 pip install -r requirements.txt
 
 # Full weekly pipeline (scrape → broadcasts → raw MC → adjustments_pending)
-python scripts/weekly_pipeline.py [--market bullet_brawl]
+python scripts/weekly_pipeline.py [--market bullet_brawl|freestyle_friday]
 
 # Re-run `run_adjusted` against the current manual_adjustments table
-python scripts/trigger_adjusted.py [--market bullet_brawl]
+python scripts/trigger_adjusted.py [--market bullet_brawl|freestyle_friday]
 
 # Walk-forward backtest (records the run in data/backtests.db)
-python scripts/run_backtest.py [--market bullet_brawl] --notes "..."
+python scripts/run_backtest.py [--market bullet_brawl|freestyle_friday] --notes "..."
 
-# Trading CLI — Titled Tuesday only, dry run unless --live; trade Bullet Brawl from the React dashboard
+# Trading CLI — Titled Tuesday only, dry run unless --live; trade the other markets from the React dashboard
 python scripts/place_bids.py        # legacy; refused while the MM is live
 python scripts/place_fade_bids.py
 python scripts/take_trades.py       # optional --loop
@@ -70,7 +71,7 @@ MM_LIVE=1 python scripts/market_maker.py    # live
 
 ### Entry points (where to start reading)
 
-- **`scripts/weekly_pipeline.py`** — orchestrates a market's three pre-trade steps (`MarketSpec.pipeline_steps`: `scrape_tt` or `scrape_bb` → `update_broadcasts → run_raw`) as a resumable state machine. Writes to `pipeline_runs` + `job_runs`. On any failure, halts with `state='failed'`, `error_kind` classified for the dashboard to show an appropriate retry UI.
+- **`scripts/weekly_pipeline.py`** — orchestrates a market's three pre-trade steps (`MarketSpec.pipeline_steps`: `scrape_tt`, `scrape_bb` or `scrape_ff` → `update_broadcasts → run_raw`) as a resumable state machine. Writes to `pipeline_runs` + `job_runs`. On any failure, halts with `state='failed'`, `error_kind` classified for the dashboard to show an appropriate retry UI.
 - **`scripts/trigger_adjusted.py`** — `run_adjusted` entry point. Reads `manual_adjustments` for the upcoming tourn_date, re-simulates, writes `latest_model_predictions`, flips the matching `pipeline_runs` row to `completed`.
 - **`api/main.py`** + **`web/`** — FastAPI + React dashboard for every registered market (market picker in the top bar). Pages: Trade / Market maker / Edges / Portfolio / Odds / Attendance / Pipeline / Logs. Gated by `DASHBOARD_PASSWORD`.
 - **`scripts/market_maker.py`** — tt-market-maker entry point; runs `src/mm/engine.py`.
@@ -128,6 +129,7 @@ Notebooks and backtests run against a local SQLite copy of Railway, in the `tt` 
 
 - `python scripts/pull_snapshot.py` refreshes `data/chess_tournament_data.db` over a read-only connection. Never put the Railway URL in `.env.local`.
 - `python scripts/run_backtest.py --notes "..."` records a run in `data/backtests.db` with its settings and git commit. Pulling a snapshot doesn't affect that file. `src/backtest_runs.py` holds the scoring.
+- Judge models with `python scripts/score_vip.py <run ids>`: the **VIP Brier score**, on the fixed cohort of traded players in `src/vip_players.py`, against each player's own top-N rate over the previous year (`skill` > 0 beats it), with price and attendance calibration and bootstrap ranges over events. `--drop-conflicts` leaves out week-of conflicted pairs, as manual cuts would. Whole-field log loss is dominated by long shots that are never traded; keep the cohort fixed so no model chooses which players count.
 - `run_raw` and `run_adjusted` take `as_of` to rebuild a past week's prediction from only earlier history (`load_and_prepare(as_of=)`). Leave it unset in production.
 - `notebooks/model-performance-audit.ipynb` audits Titled Tuesday's live predictions since 2026-07-07: calibration, blind spots, manual-override accuracy, Brier scores against backtest models, and betting results.
 - `notebooks/bullet-brawl-score-model.ipynb` tests a Bullet Brawl model that splits score into games played × points per game, instead of replaying raw scores.
@@ -137,13 +139,15 @@ Notebooks and backtests run against a local SQLite copy of Railway, in the `tt` 
 `src/markets/` holds one `MarketSpec` per weekly event: Kalshi series, N values, start and bid-expiry times, and a `ModelConfig`. Trading, snapshots, the pipeline runner and the API all take a spec, defaulting to Titled Tuesday. A spec becomes tradable only when it is registered in `MARKETS` in `src/strategies.py`.
 
 - `pipeline_runs`, `manual_adjustments`, `attendance_conflicts`, both latest-predictions tables, `historical_predictions` and `backtest` have a `market` column. Always filter on it, and write predictions with `db.replace_market_rows`.
-- Each market keeps its raw results in its own tables (`titled_tuesday_standings`, `bullet_brawl_standings`).
+- Each market keeps its raw results in its own tables (`titled_tuesday_standings`, `bullet_brawl_standings`, `freestyle_friday_standings`). Freestyle Friday's has Titled Tuesday's columns, so the same score model applies.
 - `scripts/migrate_multi_market.py` applies this schema to an existing database. It is idempotent.
 - The Streamlit app and the trading CLI scripts cover Titled Tuesday only; the React dashboard covers every registered market.
-- `ModelConfig.score_noise_sigma` (score points) sets a market's Gaussian smoothing in `run_raw` and `run_adjusted`. Titled Tuesday's is 0.01 (100 composite units, `SCORE_GAUSSIAN_KERNEL_SIGMA_NARROW`), which randomizes tiebreaks without moving anyone across a score bucket; Bullet Brawl's is 10, the winner of its sigma backtest. Never set it to 0: replayed results would keep their exact historical tiebreaks, so ties resolve deterministically. The `ModelConfig` default is 0.01 for that reason. `ModelConfig.played_filter` is the SQL condition for a row that counts as attending; Bullet Brawl uses `games > 0`.
+- `ModelConfig.score_noise_sigma` (score points) sets a market's Gaussian smoothing in `run_raw` and `run_adjusted`. Titled Tuesday's is 0.01 (100 composite units, `SCORE_GAUSSIAN_KERNEL_SIGMA_NARROW`), which randomizes tiebreaks without moving anyone across a score bucket; Bullet Brawl's is 10, the winner of its sigma backtest; Freestyle Friday uses Titled Tuesday's 0.01. Never set it to 0: replayed results would keep their exact historical tiebreaks, so ties resolve deterministically. The `ModelConfig` default is 0.01 for that reason. `ModelConfig.played_filter` is the SQL condition for a row that counts as attending; Bullet Brawl uses `games > 0`.
+- Optional model settings, all off by default: `ModelConfig.attendance_model='two_part'` (`src/attendance_model.py`: a walk-forward logistic model of the choice to play, fitted on conflict-free weeks from a fast and a slow attendance rate, weeks since last played, appearances and past conflict rate); `conflict_deduction=False` keeps past conflict weeks in the attendance denominator; `skill_prior_events=k` mixes the field's recent results into each player's skill history with weight k / (k + effective events). `run_backtest.py` compares them as `narrow_*` variants (`BacktestProfile.overrides`).
 - `python scripts/run_backtest.py --market bullet_brawl` runs the sigma comparison. Add a market's backtest to `PROFILES` in that script.
 - Adding a market: a `MarketSpec` (with `pipeline_steps` and `event_url_example`), a scrape function and `PIPELINES` entry in `scripts/weekly_pipeline.py`, registration in `MARKETS`, and a Railway cron service.
 - Chess.com has no Bullet Brawl listing page, so `scripts/scraping/update_bullet_brawl.py` finds each new event in the monthly game archives of the most frequent recent players, confirms it against the tournament API, and then enriches new accounts with at least `MIN_APPEARANCES` games into `player_information`. If no archive has the event yet, the step fails with `listing_missing_slug` and the Pipeline page takes the URL.
+- Freestyle Friday (11-round Swiss, chess960 3+2, Fridays 11:00 ET) is a normal chess.com live tournament, `freestyle-friday-{month}-{dd}-{yyyy}-{id}`. `scripts/scraping/update_freestyle_friday.py` discovers events the same way (regulars' archives, confirmed as a finished chess960 Swiss on a Friday) and parses the standings pages with Titled Tuesday's `fetch_standings`. History runs weekly from 2025-01-24 to 2026-06-26, then from 2026-10-02 after a July–September 2026 hiatus (2026-05-08 was cancelled). `--backfill --start <month> --until <month>` walks back through regulars' archives, across empty months; without `--until` it stops after two empty months, so it would stop at the hiatus. Five events (US/EU daylight-saving mismatch weeks) started at 12:00 ET, an hour after the spec's start time. `scripts/push_bullet_brawl_history.py --market freestyle_friday` copies the local history to Railway. The chess.com/events page for it renders client-side and isn't used.
 - Usernames keep chess.com's capitalization in every table, one spelling per account. The tournament API lists Bullet Brawl players in lowercase, so ingestion takes the case from the player's games and then adopts the spelling already on record (`bullet_brawl_ingest.known_usernames`: Titled Tuesday first, then `player_information`). Never lowercase usernames; compare case-insensitively when checking whether an account exists.
 
 ### Key modules
@@ -190,7 +194,7 @@ Postgres on Railway (schema defined in `scripts/init_postgres_schema.py`); SQLit
 ```
          [cron fires on Tuesday (TT) or Saturday (BB)]
                  ↓
-         ┌─ scrape_tt / scrape_bb ┐
+         ┌─ scrape_tt/_bb/_ff ────┐
          │                       │
          │   listing_missing_slug → state=failed  (user pastes the URL on the Pipeline page)
          │   http_error           → state=failed  (user hits Retry pipeline)
@@ -227,8 +231,8 @@ Players sometimes use a different account per event, so trading and `run_adjuste
 ### Kalshi market tickers
 
 Each `MarketSpec` defines a winner series and a top-N series:
-- `KXTITLEDTUESDAY-{date}-{PLAYER}` / `KXBULLETBRAWL-{date}-{PLAYER}` — winner market (N=1)
-- `KXTITLEDTUESTOP-{date}T{N}-{PLAYER}` / `KXBULLETBRAWLTOP-{date}T{N}-{PLAYER}` — top-N markets (N=3, 5, 8)
+- `KXTITLEDTUESDAY-{date}-{PLAYER}` / `KXBULLETBRAWL-{date}-{PLAYER}` / `KXFSFRIDAY-{date}-{PLAYER}` — winner market (N=1)
+- `KXTITLEDTUESTOP-{date}T{N}-{PLAYER}` / `KXBULLETBRAWLTOP-{date}T{N}-{PLAYER}` / `KXFSFRIDAYTOP-{date}T{N}-{PLAYER}` — top-N markets (N=3, 5, 8)
 
 `{date}` is in Kalshi's `YYMONDD` format (e.g. `26SEP16`), produced by `_to_kalshi_date()` from `kalshi_core`. `MarketSpec.n_from_ticker` extracts N from these patterns.
 

@@ -52,27 +52,53 @@ def build_player_pool(df, p_participate, app_counts,
     return players, p_play, hist_pcts, hist_wts
 
 
+FIELD_PRIOR_WEEKS = 52       # recent results that make up the field distribution
+FIELD_PRIOR_QUANTILES = 100
+
+
+def _composite(g) -> np.ndarray:
+    return (g['score'].to_numpy(dtype=np.float64) * SCORE_COMPOSITE_SCALE
+            + g['tie_break'].fillna(0).to_numpy(dtype=np.float64))
+
+
+def _field_quantiles(df) -> np.ndarray:
+    """The field's recent composite results, as evenly spaced quantiles."""
+    recent = df[df['date'] >= df['date'].max() - pd.Timedelta(weeks=FIELD_PRIOR_WEEKS)]
+    qs = (np.arange(FIELD_PRIOR_QUANTILES) + 0.5) / FIELD_PRIOR_QUANTILES
+    return np.quantile(_composite(recent), qs)
+
+
 def build_player_pool_score(df, p_participate, app_counts,
-                            min_appearances=MIN_APPEARANCES, min_p=MIN_P):
-    """Composite (score*scale + tiebreak) player pool — production default."""
+                            min_appearances=MIN_APPEARANCES, min_p=MIN_P, prior_events=0.0):
+    """Composite (score*scale + tiebreak) player pool — production default.
+
+    prior_events > 0 mixes the field's recent results into each player's history
+    with weight k / (k + n_eff), n_eff being the player's effective number of
+    events under the skill weights (Kish). Players with little or old history are
+    pulled harder toward the field.
+    """
     eligible = _eligible_players(p_participate, app_counts, min_appearances, min_p)
     players = list(eligible)
     p_play  = p_participate.loc[players].to_numpy(dtype=np.float64)
+    field = _field_quantiles(df) if prior_events > 0 else None
 
     grp = df.groupby('username')
     hist_signals, hist_wts = [], []
     for u in players:
         g = grp.get_group(u)
-        signal = (
-            g['score'].to_numpy(dtype=np.float64) * SCORE_COMPOSITE_SCALE
-            + g['tie_break'].fillna(0).to_numpy(dtype=np.float64)
-        )
+        signal = _composite(g)
         w = g['skill_w'].to_numpy(dtype=np.float64, copy=True)
+        if field is not None:
+            n_eff = w.sum() ** 2 / (w ** 2).sum()
+            pull = prior_events / (prior_events + n_eff)
+            signal = np.concatenate([signal, field])
+            w = np.concatenate([(1 - pull) * w / w.sum(), np.full(len(field), pull / len(field))])
         w /= w.sum()
         hist_signals.append(signal)
         hist_wts.append(w)
 
-    print(f'  Player pool (score): {len(players):,}')
+    prior = f', field prior {prior_events:g} events' if field is not None else ''
+    print(f'  Player pool (score): {len(players):,}{prior}')
     return players, p_play, hist_signals, hist_wts
 
 

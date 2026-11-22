@@ -6,10 +6,12 @@ Each market runs its pre-trade steps as one resumable state machine
 
     Titled Tuesday:  scrape_tt → update_broadcasts → run_raw → ADJUSTMENTS_PENDING
     Bullet Brawl:    scrape_bb → update_broadcasts → run_raw → ADJUSTMENTS_PENDING
+    Freestyle Friday: scrape_ff → update_broadcasts → run_raw → ADJUSTMENTS_PENDING
 
 Usage:
     python scripts/weekly_pipeline.py
     python scripts/weekly_pipeline.py --market bullet_brawl
+    python scripts/weekly_pipeline.py --market freestyle_friday
     python scripts/weekly_pipeline.py --resume update_broadcasts
     python scripts/weekly_pipeline.py --slug-url https://chess.com/tournament/live/titled-tuesday-blitz-...
 """
@@ -33,7 +35,7 @@ sys.path.insert(0, str(PROJECT_ROOT / 'scripts' / 'scraping'))
 
 import requests  # for RequestException classification
 
-from src.markets import BULLET_BRAWL, TITLED_TUESDAY, MarketSpec
+from src.markets import BULLET_BRAWL, FREESTYLE_FRIDAY, TITLED_TUESDAY, MarketSpec
 from src.pipeline import run_raw, next_tourn_date
 from src.pipeline_runner import PipelineDef
 from src.pipeline_runner import run_pipeline as run_market_pipeline
@@ -46,6 +48,7 @@ from update_titled_tuesday import (
 )
 from update_broadcasts import run as run_update_broadcasts
 import update_bullet_brawl
+import update_freestyle_friday
 
 
 def _classify_error(step: str, exc: BaseException) -> str:
@@ -123,6 +126,7 @@ def _pipeline(spec: MarketSpec, scrape) -> PipelineDef:
 PIPELINES = {
     TITLED_TUESDAY.slug: _pipeline(TITLED_TUESDAY, lambda url: step_scrape_tt(slug_override=url)),
     BULLET_BRAWL.slug:   _pipeline(BULLET_BRAWL, update_bullet_brawl.run),
+    FREESTYLE_FRIDAY.slug: _pipeline(FREESTYLE_FRIDAY, update_freestyle_friday.run),
 }
 
 

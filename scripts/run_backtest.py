@@ -15,6 +15,9 @@ Titled Tuesday models (--models):
 Bullet Brawl models:
   score, score_smooth_3, score_smooth_10   (gaussian sigma of 0, 3 and 10 score-points)
 
+Freestyle Friday models:
+  score, score_smooth_narrow, score_smooth   (as Titled Tuesday's; narrow is production)
+
 Titled Tuesday attendance is computed from the single-session era only (>= 2025-09-02),
 regardless of how far back skill history is allowed to reach.
 
@@ -31,13 +34,14 @@ Usage
     python scripts/run_backtest.py --start 2025-11-04 --sims 100000
     python scripts/run_backtest.py --sample 3         # quick smoke test
     python scripts/run_backtest.py --market bullet_brawl --notes "sigma comparison"
+    python scripts/run_backtest.py --market freestyle_friday --models score_smooth_narrow
 """
 
 import argparse
 import sqlite3
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -53,7 +57,7 @@ from src.config import (
 from src import backtest_runs
 from src.data import load_and_prepare
 from src.db import is_postgres
-from src.markets import BULLET_BRAWL, TITLED_TUESDAY, MarketSpec
+from src.markets import BULLET_BRAWL, FREESTYLE_FRIDAY, TITLED_TUESDAY, MarketSpec
 from src.simulation import (
     build_player_pool_score, build_player_pool_perf,
     run_simulation_ranked, build_results,
@@ -71,6 +75,26 @@ class BacktestProfile:
     attendance_start: str | None
     # Gaussian sigma per model, in composite-signal units (score * SCORE_COMPOSITE_SCALE + tiebreak).
     noise_sigma: dict[str, float]
+    # ModelConfig fields a model variant changes (attendance_model, conflict_deduction,
+    # skill_prior_events, ...). Models not listed use the market's ModelConfig.
+    overrides: dict[str, dict] = field(default_factory=dict)
+
+    def spec_for(self, model: str) -> MarketSpec:
+        changes = self.overrides.get(model)
+        return replace(self.spec, model=replace(self.spec.model, **changes)) if changes else self.spec
+
+
+# Narrow-smoothing variants of the attendance and skill models, scored with scripts/score_vip.py.
+_NARROW_VARIANTS = {
+    'narrow_no_deduct':          {'conflict_deduction': False},
+    'narrow_two_part':           {'attendance_model': 'two_part'},
+    'narrow_two_part_no_deduct': {'attendance_model': 'two_part', 'conflict_deduction': False},
+    'narrow_prior1':             {'skill_prior_events': 1.0},
+    'narrow_prior3':             {'skill_prior_events': 3.0},
+    'narrow_prior8':             {'skill_prior_events': 8.0},
+    'narrow_two_part_prior3':    {'attendance_model': 'two_part', 'skill_prior_events': 3.0},
+}
+_NARROW_SIGMAS = {m: SCORE_GAUSSIAN_KERNEL_SIGMA_NARROW for m in _NARROW_VARIANTS}
 
 
 PROFILES = {
@@ -83,7 +107,9 @@ PROFILES = {
             'perf':                0.0,
             'score_smooth':        SCORE_GAUSSIAN_KERNEL_SIGMA_WIDE,
             'score_smooth_narrow': SCORE_GAUSSIAN_KERNEL_SIGMA_NARROW,
+            **_NARROW_SIGMAS,
         },
+        overrides=_NARROW_VARIANTS,
     ),
     BULLET_BRAWL.slug: BacktestProfile(
         spec=BULLET_BRAWL,
@@ -94,6 +120,18 @@ PROFILES = {
             'score_smooth_3':  3 * SCORE_COMPOSITE_SCALE,
             'score_smooth_10': 10 * SCORE_COMPOSITE_SCALE,
         },
+    ),
+    FREESTYLE_FRIDAY.slug: BacktestProfile(
+        spec=FREESTYLE_FRIDAY,
+        start='2025-07-04',      # leaves the first 23 events (from 2025-01-24) as history
+        attendance_start=None,
+        noise_sigma={
+            'score':               0.0,
+            'score_smooth_narrow': SCORE_GAUSSIAN_KERNEL_SIGMA_NARROW,
+            'score_smooth':        SCORE_GAUSSIAN_KERNEL_SIGMA_WIDE,
+            **_NARROW_SIGMAS,
+        },
+        overrides=_NARROW_VARIANTS,
     ),
 }
 
@@ -120,10 +158,13 @@ def _ensure_table(conn: sqlite3.Connection) -> None:
 
 def _run_one_model(
     kind: str, df, p_participate, app_counts,
-    n_sims: int, seed: int, noise_sigma: float,
+    n_sims: int, seed: int, noise_sigma: float, prior_events: float = 0.0,
 ) -> pd.DataFrame:
-    builder = build_player_pool_perf if kind == 'perf' else build_player_pool_score
-    pool = builder(df, p_participate, app_counts, min_appearances=MIN_APP)
+    if kind == 'perf':
+        pool = build_player_pool_perf(df, p_participate, app_counts, min_appearances=MIN_APP)
+    else:
+        pool = build_player_pool_score(df, p_participate, app_counts, min_appearances=MIN_APP,
+                                       prior_events=prior_events)
 
     players, p_play, hist_signals, hist_wts = pool
     if len(players) < max(N_VALUES):
@@ -205,6 +246,7 @@ def run_backtest(
         'data_cutoff': model_config.data_cutoff,
         'season_shift_applied': attendance_start is None and model_config.season_shift_date is not None,
         'played_filter': model_config.played_filter,
+        'overrides': {m: profile.overrides[m] for m in models if m in profile.overrides},
     }
     store = backtest_runs.connect()
     run_id = backtest_runs.start_run(store, market, models, settings, notes)
@@ -242,9 +284,15 @@ def _run_events(run_id, store, profile, start_date, n_sims, base_seed, sample, a
     for i, t_date in enumerate(dates):
         print(f'[{i+1:>3}/{n_total}] {t_date}')
 
-        df, p_participate, app_counts = load_and_prepare(
-            as_of=t_date, attendance_start=attendance_start, spec=spec,
-        )
+        # One load per distinct attendance setup among the models.
+        loads = {}
+        for model in models:
+            m = profile.spec_for(model).model
+            key = (m.attendance_model, m.conflict_deduction)
+            if key not in loads:
+                loads[key] = load_and_prepare(as_of=t_date, attendance_start=attendance_start,
+                                              spec=profile.spec_for(model))
+        df, p_participate, app_counts = next(iter(loads.values()))
         if df.empty:
             print('  SKIP: no historical data before this date')
             continue
@@ -263,10 +311,13 @@ def _run_events(run_id, store, profile, start_date, n_sims, base_seed, sample, a
                       f'({n_perf_avail:,}/{n_perf_total:,} hist rows)')
 
         for j, model in enumerate(models):
+            m = profile.spec_for(model).model
+            df, p_participate, app_counts = loads[(m.attendance_model, m.conflict_deduction)]
             results = _run_one_model(
                 model, df, p_participate, app_counts,
                 n_sims=n_sims, seed=base_seed + i * 10 + j,
                 noise_sigma=profile.noise_sigma[model],
+                prior_events=m.skill_prior_events,
             )
             if results.empty:
                 print(f'  SKIP {model}: pool too small')
@@ -295,8 +346,11 @@ if __name__ == '__main__':
     parser.add_argument('--sims',             type=int, default=N_SIMS)
     parser.add_argument('--sample',           type=int, default=None)
     parser.add_argument('--models',           nargs='+', help="which model variants to run (default: all for the market)")
+    parser.add_argument('--min-app',          type=int, default=MIN_APP,
+                        help='appearances a player needs to enter the pool (default %(default)s)')
     parser.add_argument('--notes', help='what this run is testing; shown in the run list')
     args = parser.parse_args()
+    MIN_APP = args.min_app      # read by _run_one_model and recorded in the run's settings
 
     run_backtest(
         market           = args.market,

@@ -193,3 +193,115 @@ def calibration(scored: pd.DataFrame, probability: str = 'p_top', outcome: str =
     return (binned.groupby(['run_id', 'model', 'n', 'bin'], observed=True)
             .agg(predicted=(probability, 'mean'), observed=(outcome, 'mean'), count=(outcome, 'size'))
             .reset_index())
+
+
+# ── VIP scoring ──────────────────────────────────────────────────────────────
+# Accuracy on the players actually traded (src.vip_players), not the whole field.
+# The cohort is fixed before scoring, so no model can choose which players count.
+
+VIP_N_VALUES = (1, 3, 5, 8)
+VIP_BASELINE_WEEKS = 52
+_VIP_PRICE_EDGES = (0.02, 0.05, 0.1, 0.2, 0.35, 0.5, 1.0)
+
+
+def vip_frame(predictions: pd.DataFrame, standings: pd.DataFrame, vip_accounts: dict[str, str],
+              n_values: tuple[int, ...] = VIP_N_VALUES) -> pd.DataFrame:
+    """One row per (run, model, event, VIP player): the traded price for each N and the outcome.
+
+    `standings` has columns d (YYYY-MM-DD), username, rank, for every event of the
+    market (earlier ones feed the baseline). A player's accounts are summed (only
+    one plays in an event) and capped at 1; a VIP without a prediction counts as 0.
+    `base{n}` is the baseline: the player's top-N rate over the market's events in
+    the previous VIP_BASELINE_WEEKS weeks, counting an event they skipped as a miss.
+    """
+    players = sorted(set(vip_accounts.values()))
+    st = standings.assign(player=standings['username'].map(vip_accounts)).dropna(subset=['player'])
+    best = st.groupby(['d', 'player'])['rank'].min()
+    all_dates = np.array(sorted(standings['d'].unique()))
+
+    p = predictions.assign(player=predictions['username'].map(vip_accounts)).dropna(subset=['player'])
+    for n in n_values:
+        p[f'price{n}'] = p['p_participate'] * p[f'P_top{n}_given_play']
+    cols = ['p_participate'] + [f'price{n}' for n in n_values]
+    agg = p.groupby(['run_id', 'model', 'tourn_date', 'player'])[cols].sum().clip(upper=1.0)
+
+    keys = predictions[['run_id', 'model', 'tourn_date']].drop_duplicates()
+    grid = keys.merge(pd.DataFrame({'player': players}), how='cross')
+    out = grid.merge(agg.reset_index(), on=['run_id', 'model', 'tourn_date', 'player'], how='left')
+    out[cols] = out[cols].fillna(0.0)
+    out['rank'] = [best.get((d, pl), np.nan) for d, pl in zip(out['tourn_date'], out['player'])]
+    out['played'] = out['rank'].notna().astype(int)
+
+    hits = best.reset_index()
+    window = {d: all_dates[(all_dates < d) & (all_dates >= (pd.Timestamp(d) - pd.Timedelta(weeks=VIP_BASELINE_WEEKS))
+                                              .strftime('%Y-%m-%d'))] for d in out['tourn_date'].unique()}
+    for n in n_values:
+        out[f'hit{n}'] = (out['rank'] <= n).astype(int)
+        by_player = hits[hits['rank'] <= n].groupby('player')['d'].apply(lambda s: set(s)).to_dict()
+        out[f'base{n}'] = [len(by_player.get(pl, set()).intersection(window[d])) / max(1, len(window[d]))
+                           for d, pl in zip(out['tourn_date'], out['player'])]
+    return out
+
+
+def vip_summary(frame: pd.DataFrame, n_values: tuple[int, ...] = VIP_N_VALUES) -> pd.DataFrame:
+    """VIP Brier per run, model and N (plus 'all' N pooled), against the frequency baseline.
+
+    skill = 1 - brier / baseline_brier; above 0 means the model beats the baseline.
+    """
+    rows = []
+    for (run_id, model), g in frame.groupby(['run_id', 'model']):
+        events = g['tourn_date'].nunique()
+        pooled = {'sq': 0.0, 'base_sq': 0.0, 'count': 0}
+        for n in n_values:
+            sq = ((g[f'price{n}'] - g[f'hit{n}']) ** 2)
+            base_sq = ((g[f'base{n}'] - g[f'hit{n}']) ** 2)
+            pooled['sq'] += sq.sum(); pooled['base_sq'] += base_sq.sum(); pooled['count'] += len(g)
+            rows.append({'run_id': run_id, 'model': model, 'n': str(n), 'events': events,
+                         'brier': sq.mean(), 'baseline_brier': base_sq.mean(),
+                         'skill': 1 - sq.mean() / base_sq.mean(),
+                         'predicted_per_event': g[f'price{n}'].sum() / events,
+                         'actual_per_event': g[f'hit{n}'].sum() / events})
+        rows.append({'run_id': run_id, 'model': model, 'n': 'all', 'events': events,
+                     'brier': pooled['sq'] / pooled['count'], 'baseline_brier': pooled['base_sq'] / pooled['count'],
+                     'skill': 1 - pooled['sq'] / pooled['base_sq'],
+                     'predicted_per_event': np.nan, 'actual_per_event': np.nan})
+    return pd.DataFrame(rows).set_index(['run_id', 'model', 'n'])
+
+
+def vip_calibration(frame: pd.DataFrame, n_values: tuple[int, ...] = VIP_N_VALUES) -> pd.DataFrame:
+    """Predicted vs observed VIP hit rate by traded price (all N pooled, prices >= 2%)."""
+    long = pd.concat([frame[['run_id', 'model']].assign(price=frame[f'price{n}'], hit=frame[f'hit{n}'])
+                      for n in n_values], ignore_index=True)
+    long = long[long['price'] >= _VIP_PRICE_EDGES[0]]
+    long['bin'] = pd.cut(long['price'], _VIP_PRICE_EDGES, include_lowest=True)
+    return (long.groupby(['run_id', 'model', 'bin'], observed=True)
+            .agg(predicted=('price', 'mean'), observed=('hit', 'mean'), count=('hit', 'size')).reset_index())
+
+
+def vip_attendance(frame: pd.DataFrame) -> pd.DataFrame:
+    """Predicted vs observed VIP attendance by p_participate."""
+    binned = frame.assign(bin=pd.cut(frame['p_participate'], (0, .25, .5, .75, .9, 1.0), include_lowest=True))
+    return (binned.groupby(['run_id', 'model', 'bin'], observed=True)
+            .agg(predicted=('p_participate', 'mean'), observed=('played', 'mean'), count=('played', 'size'))
+            .reset_index())
+
+
+def vip_bootstrap(frame: pd.DataFrame, model_a: str, model_b: str, run_a: int, run_b: int | None = None,
+                  n_values: tuple[int, ...] = VIP_N_VALUES, draws: int = 5000, seed: int = 0) -> np.ndarray:
+    """2.5/50/97.5 percentiles of (Brier_a / Brier_b - 1), resampling events. Below 0: a is better.
+
+    model_b may be 'baseline' to compare model_a with the frequency baseline.
+    """
+    def per_event(run, model, col):
+        g = frame[(frame['run_id'] == run) & (frame['model'] == (model_a if col == 'base' else model))]
+        sq = sum((g[f'{col}{n}'] - g[f'hit{n}']) ** 2 for n in n_values)
+        return sq.groupby(g['tourn_date']).sum()
+    a = per_event(run_a, model_a, 'price')
+    b = per_event(run_a, model_a, 'base') if model_b == 'baseline' else per_event(run_b or run_a, model_b, 'price')
+    dates = a.index.intersection(b.index).to_numpy()
+    rng = np.random.default_rng(seed)
+    ratios = []
+    for _ in range(draws):
+        s = rng.choice(dates, len(dates))
+        ratios.append(a[s].sum() / b[s].sum() - 1)
+    return np.percentile(ratios, [2.5, 50, 97.5])
