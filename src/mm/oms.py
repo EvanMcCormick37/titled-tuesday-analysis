@@ -23,10 +23,12 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from .config import ANCHOR_PREFIX, SCOUT_PREFIX
+from .config import ANCHOR_PREFIX, EXIT_PREFIX, MM_PREFIXES, SCOUT_PREFIX
 from .quoting import Quote
 
-ANCHOR, SCOUT = 'anchor', 'scout'
+ANCHOR, SCOUT, EXIT = 'anchor', 'scout', 'exit'
+TIERS = (ANCHOR, SCOUT, EXIT)
+_PREFIX = {ANCHOR: ANCHOR_PREFIX, SCOUT: SCOUT_PREFIX, EXIT: EXIT_PREFIX}
 Slot = tuple[str, str, str]          # (ticker, side, tier)
 
 # Order states
@@ -160,7 +162,7 @@ class OMS:
         for t, s, price, rem in list(self.external.values()):
             if t == ticker and s == side and self.real:
                 out[price] = out.get(price, 0.0) + rem
-        for tier in (ANCHOR, SCOUT):
+        for tier in TIERS:
             o = self.orders.get((ticker, side, tier))
             if o is None or not o.real or o.state == PENDING_NEW:
                 continue
@@ -179,8 +181,7 @@ class OMS:
 
     def _new_order(self, slot: Slot, q: Quote) -> Order:
         ticker, side, tier = slot
-        prefix = ANCHOR_PREFIX if tier == ANCHOR else SCOUT_PREFIX
-        o = Order(coid=f'{prefix}{uuid.uuid4().hex[:20]}', ticker=ticker, side=side, tier=tier,
+        o = Order(coid=f'{_PREFIX[tier]}{uuid.uuid4().hex[:20]}', ticker=ticker, side=side, tier=tier,
                   price=q.price, remaining=q.size, real=self.real)
         return o
 
@@ -193,7 +194,7 @@ class OMS:
             if target is None:
                 return None
             o = self._new_order(slot, target)
-            # Anchors first: they are the base quote; scouts follow once anchors are up.
+            # Anchors and exits first: they are the base quotes; scouts follow.
             return Action('create', o, target.price, target.size, priority=5 if slot[2] == SCOUT else 4)
         if target is None:
             return Action('cancel', live, priority=0)
@@ -400,7 +401,7 @@ class OMS:
         account's other resting orders."""
         self.external = {}
         for r in open_orders:
-            if not is_ours(r) and not str(r.get('client_order_id') or '').startswith(('mma-', 'mms-')):
+            if not is_ours(r) and not str(r.get('client_order_id') or '').startswith(MM_PREFIXES):
                 self._track_external({**r, 'status': 'resting'})
         rest_by_coid = {o.get('client_order_id'): o for o in open_orders if is_ours(o)}
         for o in list(self.orders.values()):

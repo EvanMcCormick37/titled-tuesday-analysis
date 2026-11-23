@@ -42,6 +42,27 @@ def side_fair(fair_yes: float, side: str, yes_factor: float = 1.0, no_factor: fl
     return min(max(fy if side == 'yes' else fn, 0.0), 1.0)
 
 
+def exit_quote(book: Book, side: str, fair: float, position: float, p: MMParams) -> Quote | None:
+    """Resting sell of a position at fair value, expressed as a bid on `side`.
+
+    `side` is the closing side: a long YES (position > 0) closes with a NO bid,
+    a long NO with a YES bid. `fair` is that side's fair value. The price is
+    floored in the bid's frame, so the sell is never below fair in the held
+    contract's frame. A crossing price is pulled back to rest one tick inside
+    the cross, which sells above fair; post_only would otherwise reject it.
+    """
+    held = position if side == 'no' else -position
+    size = math.floor(held + 1e-9)
+    if size < 1 or fair <= 0:
+        return None
+    price = math.floor(fair * 100 + 1e-6)
+    cross = book.cross_price(side)
+    if cross is not None and price >= cross:
+        price = cross - 1
+    price = min(price, p.max_price_c)
+    return Quote(price, size) if price >= 1 else None
+
+
 def anchor_price(fair: float, p: MMParams, markup: float | None = None) -> int | None:
     """kalshi_core.bid_cents's rule, computed in cents with a float guard
     (bid_cents(0.70, 1.5, 15) floors 54.999… to 54)."""

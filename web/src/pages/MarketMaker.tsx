@@ -6,7 +6,7 @@ import { ConfirmDialog, Empty, ErrorNote, Metric, Segmented } from '../component
 import { ago, time, usd } from '../format';
 
 type Q = { price: number; size: number } | null;
-type SideRow = { fair: number; note: string; war: boolean; best_ex_own: number | null; anchor: Q; scout: Q };
+type SideRow = { fair: number; note: string; war: boolean; best_ex_own: number | null; anchor: Q; scout: Q; exit?: Q };
 type QuoteRow = {
   player: string; username: string | null; n: number; fair_yes: number | null; status: string;
   stale: boolean; position: number; yes?: SideRow; no?: SideRow;
@@ -16,7 +16,7 @@ type MMState = {
   live: boolean; scouts: boolean; event_date: string | null; t_cut: string | null; window_open: boolean;
   cutoff_done: boolean; paused: boolean; pause_reason: string | null; held: boolean;
   fv_version: string | null; fv_errors: string[]; ws_connected: boolean; stale_books: number;
-  markets: number; unmatched: string[]; orders: { anchor: number; scout: number };
+  markets: number; unmatched: string[]; orders: { anchor: number; scout: number; exit?: number };
   resting_notional: number; tokens: number; oms: Record<string, number>;
   quotes: Record<string, QuoteRow>;
 };
@@ -46,6 +46,7 @@ function SideCell({ s }: { s?: SideRow }) {
     <td title={s.note}>
       <div>{s.scout ? <strong>{cents(s.scout)}</strong> : <span className="muted">no scout</span>}</div>
       <small className="muted">anchor {cents(s.anchor)} · best other {s.best_ex_own ?? '—'}¢{s.war ? ' · war' : ''}</small>
+      {s.exit && <div><small>exit (sell at fair) {cents(s.exit)}</small></div>}
     </td>
   );
 }
@@ -127,7 +128,7 @@ export default function MarketMaker() {
   const st = ov?.state ?? {};
   const quotes = useMemo(() => {
     const rows = Object.entries(st.quotes ?? {});
-    const shown = filter === 'all' ? rows : rows.filter(([, r]) => r.live.length || r.yes?.anchor || r.no?.anchor);
+    const shown = filter === 'all' ? rows : rows.filter(([, r]) => r.live.length || r.yes?.anchor || r.no?.anchor || r.yes?.exit || r.no?.exit);
     return shown.sort(([, a], [, b]) => a.n - b.n || (b.fair_yes ?? 0) - (a.fair_yes ?? 0));
   }, [st.quotes, filter]);
   const unacked = ov?.alerts.filter((a) => !a.acknowledged) ?? [];
@@ -154,7 +155,7 @@ export default function MarketMaker() {
           <div className="metrics">
             <Metric label="Event" value={st.event_date ?? '—'} />
             <Metric label="Cutoff" value={st.cutoff_done ? 'Passed' : time(st.t_cut)} />
-            <Metric label="Orders (scout / anchor)" value={`${st.orders?.scout ?? 0} / ${st.orders?.anchor ?? 0}`} />
+            <Metric label="Orders (scout / anchor / exit)" value={`${st.orders?.scout ?? 0} / ${st.orders?.anchor ?? 0} / ${st.orders?.exit ?? 0}`} />
             <Metric label="Resting" value={usd(st.resting_notional)} />
             <Metric label="Feed" value={st.ws_connected ? `${st.stale_books ?? 0} stale of ${st.markets ?? 0}` : 'Disconnected'} />
             <Metric label="Rate tokens" value={st.tokens ?? '—'} />

@@ -3,6 +3,7 @@
     WS msg → seq check → Book.apply → mark market dirty
     quote tick (every 50 ms, dirty markets only):
         quote_side per (ticker, side) → risk.check → dwell/price-war filter → OMS targets
+        exit_quote per held position (sell at fair; skips risk.check, it only reduces risk)
     exec tick (every 20 ms): OMS.next_actions → gateway (threads) → OMS.on_result
     slow tick (every 1 s): control + params, cutoff, status, model runs, discovery,
         reconciliation, positions
@@ -31,8 +32,8 @@ from . import fair_value, risk, store
 from .book import SIDES, Book
 from .config import MMParams, is_mm_order
 from .journal import Journal
-from .oms import ANCHOR, OMS, SCOUT, Action, FillEvent, Slot, TokenBucket
-from .quoting import Quote, quote_side, side_fair
+from .oms import ANCHOR, EXIT, OMS, SCOUT, Action, FillEvent, Slot, TokenBucket
+from .quoting import Quote, exit_quote, quote_side, side_fair
 
 log = logging.getLogger(__name__)
 
@@ -393,6 +394,7 @@ class Engine:
 
     def _market_targets(self, ms: MarketState) -> dict[Slot, Quote | None]:
         targets: dict[Slot, Quote | None] = {}
+        exits: dict[Slot, Quote | None] = {}
         quotes: dict[str, dict] = {}
         active = (not ms.paused and not ms.held and ms.fv is not None
                   and self._quoting_window_open(ms))
@@ -406,12 +408,14 @@ class Engine:
             row = {'player': c.subtitle, 'username': c.username, 'n': c.n, 'fair_yes': fair_yes,
                    'status': ovr.get('status', 'active'), 'stale': book.stale}
             for side in SIDES:
-                a_slot, s_slot = (ticker, side, ANCHOR), (ticker, side, SCOUT)
-                targets[a_slot] = targets[s_slot] = None
+                a_slot, s_slot, e_slot = (ticker, side, ANCHOR), (ticker, side, SCOUT), (ticker, side, EXIT)
+                targets[a_slot] = targets[s_slot] = exits[e_slot] = None
                 if not active or fair_yes is None or ovr.get('status') == 'pulled':
                     continue
                 fair = side_fair(fair_yes, side, float(ovr.get('yes_factor') or 1.0),
                                  float(ovr.get('no_factor') or 1.0))
+                if p.exits_enabled:
+                    exits[e_slot] = exit_quote(book, side, fair, self.positions.get(ticker, 0.0), p)
                 war = self._war_until.get((ticker, side), 0) > now
                 sq = quote_side(book, side, fair, self.oms.own_levels(ticker, side), p,
                                 markup=ovr.get('markup_override'), war_mode=war, scouts=self.scouts)
@@ -421,16 +425,18 @@ class Engine:
             quotes[ticker] = row
         player_of = {t: self._player_key(self.contracts[t]) for t in ms.tickers}
         checked = risk.check(targets, self.positions, player_of, p)
+        checked.update(exits)          # exits only shrink positions: no limit applies
         for ticker, row in quotes.items():
             for side in SIDES:
                 if side in row:
                     row[side]['anchor'] = _q(checked.get((ticker, side, ANCHOR)))
                     row[side]['scout'] = _q(checked.get((ticker, side, SCOUT)))
+                    row[side]['exit'] = _q(checked.get((ticker, side, EXIT)))
         self.last_quotes.update(quotes)
         return checked
 
     def _apply_target(self, slot: Slot, q: Quote | None, p: MMParams) -> None:
-        """Dwell and price-war filter for scouts; everything else applies at once."""
+        """Dwell and price-war filter for scouts; anchors and exits apply at once."""
         now = self.mono()
         current = self.oms.targets.get(slot)
         if q == current:
@@ -438,7 +444,7 @@ class Engine:
             return
         ticker, side, tier = slot
         live = self.oms.orders.get(slot)
-        immediate = (tier == ANCHOR or q is None or current is None
+        immediate = (tier != SCOUT or q is None or current is None
                      or (live is not None and q.price > live.price))        # outbid: move now
         if not immediate:
             pending = self._dwell.get(slot)
@@ -616,7 +622,8 @@ class Engine:
             'stale_books': sum(1 for t in ms.tickers if self.books[t].stale),
             'markets': len(ms.tickers), 'unmatched': ms.unmatched, 'skipped': ms.skipped[:50],
             'orders': {'anchor': sum(1 for o in orders if o.tier == ANCHOR),
-                       'scout': sum(1 for o in orders if o.tier == SCOUT)},
+                       'scout': sum(1 for o in orders if o.tier == SCOUT),
+                       'exit': sum(1 for o in orders if o.tier == EXIT)},
             'resting_notional': round(sum(o.price * o.remaining / 100 for o in orders), 2),
             'tokens': round(self.oms.bucket.available(), 1), 'oms': dict(self.oms.stats),
             'params': ms.params.model_dump(),

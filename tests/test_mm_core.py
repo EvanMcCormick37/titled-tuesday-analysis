@@ -7,8 +7,8 @@ from src.mm import risk
 from src.mm.book import Book
 from src.mm.config import MMParams, is_mm_order
 from src.mm.gateway import LiveGateway, book_side, yes_price
-from src.mm.oms import ANCHOR, OMS, RESTING, SCOUT, UNKNOWN, TokenBucket
-from src.mm.quoting import Quote, quote_side, scout_volume, side_fair
+from src.mm.oms import ANCHOR, EXIT, OMS, RESTING, SCOUT, UNKNOWN, TokenBucket
+from src.mm.quoting import Quote, exit_quote, quote_side, scout_volume, side_fair
 
 T = 'KXTITLEDTUESDAY-26NOV17-AAA'
 P = MMParams()          # markup 1.5, max_discount 15, AV 200, buffer 2
@@ -112,6 +112,29 @@ def test_side_fair_applies_player_factors():
     assert side_fair(0.30, 'yes', yes_factor=0.67) == pytest.approx(0.201)
     assert side_fair(0.30, 'no', no_factor=0.67) == pytest.approx(0.469)
     assert scout_volume(30.0, 29, 20, P) == 20 and scout_volume(30.0, 21, 20, P) == 180
+
+
+def test_exit_sells_the_position_at_fair():
+    # Long 37.4 YES at fair 0.30 → sell YES at 30¢ = NO bid at 70¢ for 37.
+    assert exit_quote(book(), 'no', 0.70, 37.4, P) == Quote(70, 37)
+    assert exit_quote(book(), 'yes', 0.30, 37.4, P) is None          # nothing to close on YES
+    # Long NO closes with a YES bid at YES fair.
+    assert exit_quote(book(), 'yes', 0.30, -10, P) == Quote(30, 10)
+    assert exit_quote(book(), 'no', 0.70, -10, P) is None
+    assert exit_quote(book(), 'no', 0.70, 0.5, P) is None             # under one contract
+    # Rounds in our favour: fair YES 30.5¢ → NO bid 69¢ = YES sell at 31¢.
+    assert exit_quote(book(), 'no', 0.695, 5, P) == Quote(69, 5)
+    # Someone bids YES 35¢ (above fair): rest one tick inside the cross, selling at 36¢.
+    assert exit_quote(book(yes=[(35, 10)]), 'no', 0.70, 5, P) == Quote(64, 5)
+
+
+def test_exit_counts_as_own_for_the_scout():
+    m = OMS(TokenBucket(1e9, 1e9), real=True)
+    m.set_target((T, 'no', EXIT), Quote(70, 20))
+    (a,) = m.next_actions()
+    assert a.order.coid.startswith('mmx-') and is_mm_order({'client_order_id': a.order.coid})
+    m.on_result(a, True, {'order_id': 'X', 'remaining_count': '20'})
+    assert m.own_levels(T, 'no') == {70: 20}
 
 
 # ── Risk ─────────────────────────────────────────────────────────────────────

@@ -21,7 +21,7 @@ from src.mm import fair_value, store, watchdog
 from src.mm.config import MMParams
 from src.mm.engine import Engine
 from src.mm.gateway import LiveGateway, ShadowGateway
-from src.mm.oms import ANCHOR, SCOUT
+from src.mm.oms import ANCHOR, EXIT, SCOUT
 
 DATE, PREV, KDATE, MARKET = '2026-11-17', '2026-11-10', '26NOV17', 'titled_tuesday'
 WIN_A = f'KXTITLEDTUESDAY-{KDATE}-AAA'
@@ -187,7 +187,7 @@ def test_live_orders_carry_expiry_group_and_prefix(env):
     t_cut = TITLED_TUESDAY.start_ts(DATE) - 120 * 60
     assert client.created and all(b['expiration_time'] == t_cut for b in client.created)
     assert all(b['order_group_id'] == 'og-1' and b['post_only'] for b in client.created)
-    assert all(b['client_order_id'].startswith(('mma-', 'mms-')) for b in client.created)
+    assert all(b['client_order_id'].startswith(('mma-', 'mms-', 'mmx-')) for b in client.created)
 
 
 def test_startup_cancels_only_market_maker_leftovers(env):
@@ -251,6 +251,33 @@ def test_small_fill_is_never_a_wipe(env):
     assert 'a' not in store.get_overrides(MARKET, DATE)
 
 
+def test_exits_rest_held_positions_at_fair_and_track_fills(env):
+    eng, _, _, _ = make_engine()
+    for t in (WIN_A, WIN_B, TOP3_A):
+        eng.handle(snap(t))
+    eng.positions[WIN_A] = 50          # long YES on Player A to win (fair 0.30)
+    eng.positions[TOP3_A] = -20        # long NO on Player A top 3 (fair 0.50)
+    cycle(eng)
+    slots = live_slots(eng)
+    assert slots[(WIN_A, 'no', EXIT)] == (70, 50)          # sell YES at 30¢
+    assert slots[(TOP3_A, 'yes', EXIT)] == (50, 20)        # sell NO at 50¢
+    assert (WIN_A, 'yes', EXIT) not in slots and (WIN_B, 'no', EXIT) not in slots
+    assert slots[(WIN_A, 'no', ANCHOR)][0] == 55            # the NO anchor still quotes
+    # A partial exit fill shrinks the order to the remaining position.
+    o = eng.oms.orders[(WIN_A, 'no', EXIT)]
+    eng.handle({'type': 'fill', 'msg': {'trade_id': 't1', 'order_id': o.order_id,
+                                        'client_order_id': o.coid, 'count_fp': '30.00',
+                                        'yes_price_dollars': '0.3000'}})
+    assert eng.positions[WIN_A] == 20
+    cycle(eng)
+    assert live_slots(eng)[(WIN_A, 'no', EXIT)] == (70, 20)
+    # Switched off from the dashboard, the exits come down.
+    eng.markets[MARKET].params = MMParams(exits_enabled=False)
+    eng.dirty.add(MARKET)
+    cycle(eng)
+    assert not any(s[2] == EXIT for s in live_slots(eng))
+
+
 def test_pause_clears_everything_and_acks(env):
     eng, _, _, _ = make_engine()
     for t in (WIN_A, WIN_B, TOP3_A):
@@ -306,13 +333,14 @@ def test_watchdog_cancels_mm_orders_after_cutoff_only(env, monkeypatch):
 def test_watchdog_pulls_scouts_when_heartbeat_stale(env, monkeypatch):
     client = FakeKalshi()
     client.open_orders = [{'order_id': 's', 'client_order_id': 'mms-1', 'ticker': WIN_A},
+                          {'order_id': 'x', 'client_order_id': 'mmx-1', 'ticker': WIN_A},
                           {'order_id': 'a', 'client_order_id': 'mma-1', 'ticker': WIN_A}]
     m = dataclasses.replace(strategies.MARKETS[MARKET], next_event_date=lambda: DATE)
     store.write_status(MARKET, 'live', False, {})
     with db.get_conn() as conn:
         conn.execute("UPDATE mm_status SET heartbeat_at = '2026-01-01T00:00:00.000+00:00'")
     watchdog.check(client, {MARKET: m}, now=BEFORE_CUTOFF)
-    assert client.cancelled == ['s']
+    assert client.cancelled == ['s', 'x']
 
 
 def test_kill_switch_pauses_market_maker_and_live_mm_blocks_place_bids(env):

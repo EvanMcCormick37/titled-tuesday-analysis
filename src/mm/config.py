@@ -33,6 +33,11 @@ class MMParams(BaseModel):
                                   description='Above this, rest at the buffer edge for the cool-off')
     war_cooloff_s: int = Field(120, ge=10, le=3_600, title='Price-war cool-off (s)')
 
+    # ── Exit layer: resting sells of what we hold, at fair value ─────────────
+    exits_enabled: bool = Field(True, title='Exit orders enabled',
+                                description='Rest a sell of every position at fair value (a long YES '
+                                            'is offered as a NO bid at 100 − fair)')
+
     # ── Fallback on anchor wipes (per player, as a ratio) ─────────────────────
     wipe_ratio: float = Field(0.33, gt=0, lt=1, title='Wipe cut',
                               description="Each wipe multiplies the player's fair value on that side by (1 − cut)")
@@ -61,7 +66,8 @@ DEFAULT_PARAMS = MMParams()
 # so its startup cancel and the watchdog never touch fade or manual orders.
 ANCHOR_PREFIX = 'mma-'
 SCOUT_PREFIX = 'mms-'
-MM_PREFIXES = (ANCHOR_PREFIX, SCOUT_PREFIX)
+EXIT_PREFIX = 'mmx-'
+MM_PREFIXES = (ANCHOR_PREFIX, SCOUT_PREFIX, EXIT_PREFIX)
 
 
 def is_mm_order(order: dict, prefixes: tuple[str, ...] = MM_PREFIXES) -> bool:

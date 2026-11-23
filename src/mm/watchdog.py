@@ -6,7 +6,8 @@ Two jobs, both touching only market-maker orders (client_order_id prefixes):
      order still resting on that event is cancelled and an alert raised. (Layer 1
      is the order expiry itself, 2 the strategy clock, 3 tt-mm's own cancel-all.)
   2. Dead-man's switch. If tt-mm's heartbeat is older than HEARTBEAT_STALE_S,
-     its scouts are cancelled: they are priced off a book nobody is watching.
+     its scouts and exits are cancelled: they are priced off a book (exits, at fair
+     with no discount) that nobody is watching.
      Anchors are priced off fair value alone, so they stay, and expire at the cutoff.
 """
 from __future__ import annotations
@@ -18,7 +19,7 @@ from typing import Any
 from kalshi_core import _to_kalshi_date
 
 from . import store
-from .config import SCOUT_PREFIX, is_mm_order
+from .config import EXIT_PREFIX, SCOUT_PREFIX, is_mm_order
 
 log = logging.getLogger(__name__)
 
@@ -64,14 +65,14 @@ def check(client: Any, markets: dict, now: float | None = None) -> dict:
                                 'after the cutoff', level='error', tourn_date=event_date)
         if stale:
             pattern = market.spec.ticker_pattern(_to_kalshi_date(event_date))
-            scouts = [o for o in open_orders if str(o.get('client_order_id', '')).startswith(SCOUT_PREFIX)
+            scouts = [o for o in open_orders if str(o.get('client_order_id', '')).startswith((SCOUT_PREFIX, EXIT_PREFIX))
                       and pattern.search(o.get('ticker', ''))]
             if scouts:
                 client.batch_cancel_orders([(o['order_id'], o.get('ticker')) for o in scouts])
                 cancelled_scouts = len(scouts)
                 store.add_alert(market.slug, 'watchdog_heartbeat',
                                 f'tt-mm heartbeat is {"missing" if age is None else f"{age:.0f} s old"}; '
-                                f'cancelled {len(scouts)} scout(s). Anchors stay until the cutoff.',
+                                f'cancelled {len(scouts)} scout/exit order(s). Anchors stay until the cutoff.',
                                 level='error', tourn_date=event_date)
         report[market.slug] = {'cutoff': cancelled_cutoff, 'scouts': cancelled_scouts}
     return report
