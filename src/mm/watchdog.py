@@ -20,6 +20,7 @@ from kalshi_core import _to_kalshi_date
 
 from . import store
 from .config import EXIT_PREFIX, SCOUT_PREFIX, is_mm_order
+from .gateway import cancel_in_chunks
 
 log = logging.getLogger(__name__)
 
@@ -58,7 +59,7 @@ def check(client: Any, markets: dict, now: float | None = None) -> dict:
             patterns = [market.spec.ticker_pattern(_to_kalshi_date(d)) for d in past_cutoff]
             late = [o for o in open_orders if any(p.search(o.get('ticker', '')) for p in patterns)]
             if late:
-                client.batch_cancel_orders([(o['order_id'], o.get('ticker')) for o in late])
+                cancel_in_chunks(client, [(o['order_id'], o.get('ticker')) for o in late])
                 cancelled_cutoff = len(late)
                 store.add_alert(market.slug, 'watchdog_cutoff',
                                 f'Watchdog cancelled {len(late)} market-maker order(s) still resting '
@@ -68,7 +69,7 @@ def check(client: Any, markets: dict, now: float | None = None) -> dict:
             scouts = [o for o in open_orders if str(o.get('client_order_id', '')).startswith((SCOUT_PREFIX, EXIT_PREFIX))
                       and pattern.search(o.get('ticker', ''))]
             if scouts:
-                client.batch_cancel_orders([(o['order_id'], o.get('ticker')) for o in scouts])
+                cancel_in_chunks(client, [(o['order_id'], o.get('ticker')) for o in scouts])
                 cancelled_scouts = len(scouts)
                 store.add_alert(market.slug, 'watchdog_heartbeat',
                                 f'tt-mm heartbeat is {"missing" if age is None else f"{age:.0f} s old"}; '

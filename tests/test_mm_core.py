@@ -6,7 +6,7 @@ import pytest
 from src.mm import risk
 from src.mm.book import Book
 from src.mm.config import MMParams, is_mm_order
-from src.mm.gateway import LiveGateway, book_side, yes_price
+from src.mm.gateway import LiveGateway, book_side, cancel_in_chunks, yes_price
 from src.mm.oms import ANCHOR, EXIT, OMS, RESTING, SCOUT, UNKNOWN, TokenBucket
 from src.mm.quoting import Quote, exit_quote, quote_side, scout_volume, side_fair
 
@@ -276,3 +276,29 @@ def test_live_gateway_converts_no_bids_to_yes_frame_asks():
     body = C.order_body(**c.kw)
     assert body['post_only'] is True and body['expiration_time'] == 123 and body['side'] == 'ask'
     assert body['client_order_id'].startswith('mma-') and body['order_group_id'] == 'g'
+
+
+def test_cancel_in_chunks_paces_and_retries_429():
+    class Throttled(Exception):
+        response = type('R', (), {'status_code': 429})()
+
+    class C:
+        def __init__(self):
+            self.calls, self.fail_next = [], 2
+
+        def batch_cancel_orders(self, part):
+            if self.fail_next:
+                self.fail_next -= 1
+                raise Throttled()
+            self.calls.append(len(part))
+
+    c, sleeps = C(), []
+    pairs = [(f'o{i}', 'T') for i in range(45)]
+    assert cancel_in_chunks(c, pairs, sleep=sleeps.append) == 45
+    assert c.calls == [20, 20, 5]
+    assert sleeps[:2] == [1.0, 2.0]                     # backoff on the two 429s
+
+    c2 = C()
+    c2.fail_next = 99
+    with pytest.raises(Throttled):
+        cancel_in_chunks(c2, pairs, retries=2, sleep=lambda s: None)

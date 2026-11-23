@@ -9,9 +9,11 @@ Side conversion happens here: a bid on NO at q cents is Kalshi's YES-frame
 """
 from __future__ import annotations
 
+import logging
+import time
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from .oms import Action, Order
 
@@ -35,6 +37,38 @@ def yes_price(side: str, price_c: int) -> int:
 def _status_of(e: Exception) -> int | None:
     resp = getattr(e, 'response', None)
     return getattr(resp, 'status_code', None)
+
+
+log = logging.getLogger(__name__)
+
+CANCEL_CHUNK = 20          # Kalshi's per-request batch limit
+CANCEL_PAUSE_S = 0.5       # 20 cancels = 40 write tokens; Basic tier refills 100/s
+
+
+def cancel_in_chunks(client: Any, pairs: list[tuple[str, str | None]], *, chunk: int = CANCEL_CHUNK,
+                     pause: float = CANCEL_PAUSE_S, retries: int = 6,
+                     sleep: Callable[[float], None] = time.sleep) -> int:
+    """Batch-cancel any number of (order_id, ticker) pairs without tripping the
+    rate limit: `chunk` per request, paced, exponential backoff on 429. Returns
+    how many were sent. Raises the last error once a chunk exhausts its retries."""
+    sent = 0
+    for i in range(0, len(pairs), chunk):
+        part = pairs[i:i + chunk]
+        delay = 1.0
+        for attempt in range(retries + 1):
+            try:
+                client.batch_cancel_orders(part)
+                break
+            except Exception as e:  # noqa: BLE001
+                if _status_of(e) != 429 or attempt == retries:
+                    raise
+                log.warning('batch cancel throttled; retrying in %.0f s', delay)
+                sleep(delay)
+                delay = min(delay * 2, 30)
+        sent += len(part)
+        if i + chunk < len(pairs):
+            sleep(pause)
+    return sent
 
 
 def _err(e: Exception) -> Result:

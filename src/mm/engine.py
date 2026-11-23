@@ -31,6 +31,7 @@ from ..markets import MarketSpec
 from . import fair_value, risk, store
 from .book import SIDES, Book
 from .config import MMParams, is_mm_order
+from .gateway import cancel_in_chunks
 from .journal import Journal
 from .oms import ANCHOR, EXIT, OMS, SCOUT, Action, FillEvent, Slot, TokenBucket
 from .quoting import Quote, exit_quote, quote_side, side_fair
@@ -571,7 +572,7 @@ class Engine:
             ours = [o for o in self.client.get_open_orders()
                     if is_mm_order(o) and pattern.search(o.get('ticker', ''))]
             if ours:
-                self.client.batch_cancel_orders([(o['order_id'], o.get('ticker')) for o in ours])
+                cancel_in_chunks(self.client, [(o['order_id'], o.get('ticker')) for o in ours])
                 left = [o for o in self.client.get_open_orders()
                         if is_mm_order(o) and pattern.search(o.get('ticker', ''))]
                 remaining = len(left)
@@ -677,7 +678,13 @@ class Engine:
         leftovers = [o for o in orders if is_mm_order(o) and self._is_registered_ticker(o.get('ticker', ''))]
         if leftovers:
             log.info('startup: cancelling %d leftover market-maker orders', len(leftovers))
-            self.client.batch_cancel_orders([(o['order_id'], o.get('ticker')) for o in leftovers])
+            try:
+                cancel_in_chunks(self.client, [(o['order_id'], o.get('ticker')) for o in leftovers])
+            except Exception:  # noqa: BLE001 — never crash-loop here; reconcile cancels what is left
+                log.exception('startup cancel incomplete; reconciliation will cancel the remainder')
+                for ms in self.markets.values():
+                    self._alert(ms, 'startup_cancel', 'Could not cancel every leftover market-maker '
+                                'order at startup; the reconcile loop will retry', level='error')
         self.oms.reconcile([o for o in orders if not is_mm_order(o)], is_mm_order)   # seed external orders
         for ms in self.markets.values():
             self.ensure_order_group(ms)
@@ -712,7 +719,7 @@ class Engine:
         orders = await _to_thread(self.client.get_open_orders)
         to_cancel = self.reconcile(orders)
         if to_cancel:
-            await _to_thread(self.client.batch_cancel_orders,
+            await _to_thread(cancel_in_chunks, self.client,
                              [(o['order_id'], o.get('ticker')) for o in to_cancel])
 
     async def _slow_loop(self) -> None:
@@ -761,7 +768,7 @@ class Engine:
         ours = [o for o in self.client.get_open_orders()
                 if is_mm_order(o) and self._is_registered_ticker(o.get('ticker', ''))]
         if ours:
-            self.client.batch_cancel_orders([(o['order_id'], o.get('ticker')) for o in ours])
+            cancel_in_chunks(self.client, [(o['order_id'], o.get('ticker')) for o in ours])
 
 
 def _ovr_key(overrides: dict[str, dict]) -> dict:
