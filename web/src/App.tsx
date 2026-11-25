@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { createContext, useContext, useEffect, useState, type FormEvent } from 'react';
+import { createContext, useContext, useEffect, useRef, useState, type FormEvent } from 'react';
 import { ApiError, req, type Market, type Status } from './api';
-import { Banner, ConfirmDialog, ErrorNote, Toasts, useToasts } from './components';
+import { Banner, ConfirmDialog, ErrorNote, Toasts, useCollapsibleCards, useToasts } from './components';
 import { JobDrawer } from './JobDrawer';
 import Attendance from './pages/Attendance';
 import Edges from './pages/Edges';
@@ -83,6 +83,8 @@ function Shell({ markets }: { markets: Market[] }) {
   const [jobId, setJobId] = useState<number | null>(null);
   const [killing, setKilling] = useState(false);
   const { toasts, toast } = useToasts();
+  const mainRef = useRef<HTMLElement>(null);
+  useCollapsibleCards(mainRef, page);
 
   const status = useQuery({
     queryKey: ['status', market.slug],
@@ -133,7 +135,7 @@ function Shell({ markets }: { markets: Market[] }) {
       </header>
       <Banner status={status.data} onGoPipeline={() => setPage('pipeline')} />
       {/* Keyed so form values and filters never carry over to another market. */}
-      <main className="page"><Page key={market.slug} /></main>
+      <main className="page" ref={mainRef}><Page key={market.slug} /></main>
       {jobId !== null && <JobDrawer id={jobId} onClose={() => setJobId(null)} />}
       {killing && (
         <ConfirmDialog

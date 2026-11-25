@@ -121,7 +121,16 @@ export default function MarketMaker() {
     mutationFn: (username: string) => req(`/markets/${market.slug}/mm/players/${encodeURIComponent(username)}/pull`, 'POST'),
     onSuccess: () => { toast('Player pulled'); refresh(); },
   });
-  const ack = useMutation({ mutationFn: (id: number) => req(`/mm/alerts/${id}/ack`, 'POST'), onSuccess: refresh });
+  const [dismissed, setDismissed] = useState<Set<number>>(new Set());
+  const ack = useMutation({
+    mutationFn: (id: number) => req(`/mm/alerts/${id}/ack`, 'POST'),
+    onMutate: (id: number) => setDismissed((s) => new Set(s).add(id)),
+    onError: (e, id) => {
+      setDismissed((s) => { const n = new Set(s); n.delete(id); return n; });
+      toast((e as Error).message, 'error');
+    },
+    onSuccess: refresh,
+  });
   const ackAll = useMutation({ mutationFn: () => req(`/markets/${market.slug}/mm/alerts/ack-all`, 'POST'), onSuccess: refresh });
 
   const ov = q.data;
@@ -131,7 +140,7 @@ export default function MarketMaker() {
     const shown = filter === 'all' ? rows : rows.filter(([, r]) => r.live.length || r.yes?.anchor || r.no?.anchor || r.yes?.exit || r.no?.exit);
     return shown.sort(([, a], [, b]) => a.n - b.n || (b.fair_yes ?? 0) - (a.fair_yes ?? 0));
   }, [st.quotes, filter]);
-  const unacked = ov?.alerts.filter((a) => !a.acknowledged) ?? [];
+  const unacked = ov?.alerts.filter((a) => !a.acknowledged && !dismissed.has(a.id)) ?? [];
   const paused = ov?.control.paused ?? false;
 
   return (
@@ -174,16 +183,16 @@ export default function MarketMaker() {
             <button className="btn small ghost" disabled={ackAll.isPending} onClick={() => ackAll.mutate()}>Dismiss all</button>
           )}
         </div>
-        {ov && ov.alerts.length === 0 && <Empty>No alerts yet.</Empty>}
+        {ov && unacked.length === 0 && <Empty>No alerts.</Empty>}
         <ul className="stack" style={{ listStyle: 'none', padding: 0, margin: 0 }}>
-          {ov?.alerts.slice(0, 30).map((a) => (
-            <li key={a.id} className="row between wrap" style={{ opacity: a.acknowledged ? 0.6 : 1 }}>
+          {unacked.slice(0, 30).map((a) => (
+            <li key={a.id} className="row between wrap">
               <span className="row wrap">
                 <span className={`badge ${LEVEL[a.level] ?? 'neutral'}`}>{a.kind.replace(/_/g, ' ')}</span>
                 <span>{a.message}</span>
                 <small className="muted">{ago(a.ts)}</small>
               </span>
-              {!a.acknowledged && <button className="btn small ghost" onClick={() => ack.mutate(a.id)}>Dismiss</button>}
+              <button className="btn small ghost" onClick={() => ack.mutate(a.id)}>Dismiss</button>
             </li>
           ))}
         </ul>

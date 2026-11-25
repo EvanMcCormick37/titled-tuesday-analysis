@@ -284,7 +284,7 @@ def mm_overview(slug: str) -> dict:
         'param_schema': MMParams.model_json_schema(),
         'state': state,
         'overrides': list(mm_store.get_overrides(slug, event_date).values()),
-        'alerts': mm_store.list_alerts(slug, 100),
+        'alerts': mm_store.list_alerts(slug, 100, unacked_only=True),
         'fills': mm_store.list_fills(slug, event_date, 100),
     }
 

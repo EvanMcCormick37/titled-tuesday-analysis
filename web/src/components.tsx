@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactNode, type RefObject } from 'react';
 import type { Job, JobStatus, Status } from './api';
 import { ago, humanize } from './format';
 
@@ -140,4 +140,79 @@ export function DataAge({ fetchedAt, error, onRefresh, busy }: {
       {error && <span className="note bad inline">Last refresh failed: {error}</span>}
     </div>
   );
+}
+
+// ── Collapsible cards ────────────────────────────────────────────────────────
+// Every `.card` whose first child is (or directly contains) a heading collapses
+// when that heading is clicked; everything after the first child hides.
+// State is per page and heading text (up to any " · " suffix), kept in
+// localStorage so it survives refreshes. Native <details> cards are left alone.
+
+const COLLAPSE_KEY = 'tt.collapsedCards';
+
+function readCollapsed(): Set<string> {
+  try { return new Set(JSON.parse(localStorage.getItem(COLLAPSE_KEY) ?? '[]')); } catch { return new Set(); }
+}
+
+function writeCollapsed(s: Set<string>) {
+  try { localStorage.setItem(COLLAPSE_KEY, JSON.stringify([...s])); } catch { /* storage unavailable */ }
+}
+
+function cardHeading(card: Element): HTMLElement | null {
+  const first = card.firstElementChild;
+  if (!first) return null;
+  if (/^H[1-3]$/.test(first.tagName)) return first as HTMLElement;
+  return first.querySelector<HTMLElement>(':scope > h1, :scope > h2, :scope > h3');
+}
+
+function cardKey(page: string, h: HTMLElement): string {
+  const text = (h.firstChild?.textContent ?? h.textContent ?? '').split('·')[0].trim();
+  return `${page}|${text}`;
+}
+
+export function useCollapsibleCards(root: RefObject<HTMLElement | null>, page: string) {
+  useEffect(() => {
+    const el = root.current;
+    if (!el) return;
+    const collapsed = readCollapsed();
+
+    const sync = () => {
+      el.querySelectorAll('.card:not(details)').forEach((card) => {
+        const h = cardHeading(card);
+        if (!h) return;
+        const isCollapsed = collapsed.has(cardKey(page, h));
+        if (!h.classList.contains('card-toggle')) {
+          h.classList.add('card-toggle');
+          h.setAttribute('role', 'button');
+          h.tabIndex = 0;
+        }
+        if (card.hasAttribute('data-collapsed') !== isCollapsed) card.toggleAttribute('data-collapsed', isCollapsed);
+        if (h.getAttribute('aria-expanded') !== String(!isCollapsed)) h.setAttribute('aria-expanded', String(!isCollapsed));
+      });
+    };
+
+    const toggle = (target: EventTarget | null) => {
+      const t = target as HTMLElement | null;
+      const h = t?.closest<HTMLElement>('.card-toggle');
+      if (!h || !el.contains(h) || t?.closest('button, a, input, select, textarea, label')) return false;
+      const key = cardKey(page, h);
+      if (collapsed.has(key)) collapsed.delete(key); else collapsed.add(key);
+      writeCollapsed(collapsed);
+      sync();
+      return true;
+    };
+    const onClick = (e: MouseEvent) => { toggle(e.target); };
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.key === 'Enter' || e.key === ' ') && (e.target as HTMLElement).classList?.contains('card-toggle')
+          && toggle(e.target)) e.preventDefault();
+    };
+
+    sync();
+    // Only childList: our own attribute writes never re-trigger the observer.
+    const mo = new MutationObserver(sync);
+    mo.observe(el, { childList: true, subtree: true });
+    el.addEventListener('click', onClick);
+    el.addEventListener('keydown', onKey);
+    return () => { mo.disconnect(); el.removeEventListener('click', onClick); el.removeEventListener('keydown', onKey); };
+  }, [root, page]);
 }

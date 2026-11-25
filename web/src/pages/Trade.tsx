@@ -229,12 +229,12 @@ function Queue({ jobs, labelFor }: { jobs: Job[]; labelFor: (n: string) => strin
   );
 
   return (
-    <div className="stack">
+    <>
       <h2>Queue</h2>
       {active.length ? <ul className="jobs">{active.map(row)}</ul> : <Empty>Nothing queued.</Empty>}
       <h3>Recent</h3>
       {finished.length ? <ul className="jobs">{finished.map(row)}</ul> : <Empty>No finished jobs yet.</Empty>}
-    </div>
+    </>
   );
 }
 
@@ -287,7 +287,7 @@ export default function Trade() {
         <DraftForm key={current.key} draft={current} strategies={strategies}
                    update={(p) => patch(current.key, p)} onQueued={() => removeDraft(current.key)} />
       </section>
-      <section className="card">
+      <section className="card stack">
         {jobs.error ? <ErrorNote error={jobs.error} /> : <Queue jobs={jobs.data ?? []} labelFor={labelFor} />}
       </section>
     </div>

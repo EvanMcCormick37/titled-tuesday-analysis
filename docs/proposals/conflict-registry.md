@@ -1,8 +1,8 @@
-Architecture proposal · Kalshi automated trading
+> **Status: approved, not started (phase 0 next).** This is a plan, not a description of the code. When a phase ships, move what it built into the relevant `CLAUDE.md`, record the main reasoning in `docs/decisions/`, and delete this file when the last phase ships.
 
 # Conflict registry: one source of truth for attendance conflicts across markets
 
-22 November 2026 · Draft v2 for review
+22 November 2026 · v2, decisions through 22 November
 
 **Changes since v1:** the conflict effect is a **learned log-odds adjustment** from a walk-forward model of conflict features, not a hand-set table of `q` values (§7). First evidence from history is in §7.1. Collection runs only up to **each market's next event**, not 14 days ahead, but stores every tournament it finds in full (§5). Every unfinished tournament in the registry is **re-checked on each run** for new players and schedule changes (new §5.4). Performance effects stay out of scope, and global jobs use `market = '_global'`. All five v1 open questions are resolved (§14).
 
@@ -18,7 +18,7 @@ Architecture proposal · Kalshi automated trading
 8. [How compiled adjustments reach the model](#8-how-compiled-adjustments-reach-the-model)
 9. [Dashboard](#9-dashboard)
 10. [Feedback loop: registry → history](#10-feedback-loop-registry--history)
-11. [Relationship to the LLM researcher proposal](#11-relationship-to-the-llm-researcher-proposal)
+11. [The LLM entry finder and the emergency halt](#11-the-llm-entry-finder-and-the-emergency-halt)
 12. [Failure modes and safeguards](#12-failure-modes-and-safeguards)
 13. [Phased roadmap](#13-phased-roadmap)
 14. [Open questions](#14-open-questions)
@@ -381,7 +381,7 @@ Unchanged in phases 1–2: `run_raw` → `adjustments_pending` → you press Sav
 
 ### 9.1 New top-level page: **Conflicts** (global)
 
-This reverses the researcher proposal's "sections on the Attendance page" decision, for the reason you gave: the registry is cross-market, so it shouldn't live under one market's picker. The market picker is hidden on this page. Like the rest of the React app, it is designed phone-first: cards, not wide tables.
+The registry is cross-market, so it gets its own page rather than living under one market's picker. The market picker is hidden on this page. Like the rest of the React app, it is designed phone-first: cards, not wide tables.
 
 - **This week strip:** each market's next event as a column (TT Tue · FF Fri · BB Sat). Each tournament card shows chips per event it hits, e.g. `TT 24 Nov · overlap 105 min` (red), `FF 27 Nov · adjacent 2 h` (amber).
 - **Tabs:** *Needs review* (new tournaments with a clash, schedule changes, new or dropped entrants, likely duplicates to link), *Approved*, *Dismissed*, *All*. Tournaments without any clash are hidden by default.
@@ -430,19 +430,27 @@ The registry produces labelled data the PGN dumps can't: conflicts in chess.com 
 2. **Write verified conflicts into history.** For every approved conflict on a past occurrence, insert into `attendance_conflicts` with a new `source = 'registry'` column (existing rows become `source = 'pgn'`). `build_attendance_conflicts.py` replaces only `pgn` rows. Conflict weeks you verified by hand then also leave the participation denominator.
 3. **Monitor calibration live.** A section in `notebooks/model-performance-audit.ipynb`: realised attendance versus predicted, by Δ decile, market and format. Refit on a schedule (monthly, or after N new labelled rows), then compare the walk-forward score with the active version before promoting.
 
-## 11. Relationship to the LLM researcher proposal
+## 11. The LLM entry finder and the emergency halt
 
-This changes what the LLM phases are *for*, for the better:
+The LLM layer is phase 4. The provider facts (minirouter.sh, `zai/glm-5.3-flash`, the `max_tool_calls` and retry pitfalls) are in `CLAUDE.md`. The registry narrows what the LLM is for:
 
-| Researcher proposal (v2) | With the registry |
-|---|---|
-| Per-market runs every few hours, each ±1 day around one event | One global lookahead; LLM runs on tournaments, not on markets |
-| LLM output = per-market adjustment proposals (cut/nudge items) | LLM output = **entry proposals**: "player X is entered in tournament Y (source URL)", ratings, team format and schedule corrections. These are facts (model inputs), which a cheap model handles well. |
-| Policy stage maps evidence categories to numbers by a hand-set table | The conflict model (§7) does this from data, once for all markets |
-| Rejection memory table | `tournament_entries.status = rejected` already stores it, and re-collection respects it |
-| `adjustment_proposals` + merge-apply + version check | Mostly unnecessary: entries are small, independent rows, and the compiled layer never writes `manual_adjustments` |
+- **It runs on tournaments, not markets:** once per lookahead, for approved or new tournaments whose entry lists are empty or incomplete.
+- **Its output is facts, not adjustments:** "player X is entered in tournament Y (source URL)", ratings, team format and schedule corrections, written as `source = 'llm'` entries with status `probable`. These are model inputs, and classifying them is a task a cheap model handles well. The conflict model (§7) sets every number.
+- **Each finding needs a fetched page as its source.** The page must have been read through our own `fetch_page` in that run and must contain the player's surname and the tournament name; otherwise the entry isn't written. A search snippet alone never counts.
+- **Rejections are remembered for free:** an entry you mark `rejected` stays rejected, and the LLM is told so on later runs.
 
-The emergency halt (§7 of that proposal) still makes sense, keyed to "an approved tournament gained a confirmed high-value entrant within N hours of an occurrence".
+### 11.1 Emergency halt (design, not built)
+
+Late news of a star's absence is exactly when resting YES anchors on that player get picked off. Other players' prices are also wrong then, because the absent player's share moves to everyone else. So the lookahead may trigger the existing kill switch (`job_queue.enqueue_kill(market, tourn_date, created_by='lookahead:<run_id>')`): pause the MM, cancel queued jobs, sweep orders. It is per market, and **all** of these gates must hold, checked in code:
+
+1. **Hard and grounded:** a `confirmed` entry in an approved tournament with an `overlap` clash, or an LLM finding that the player confirmed their absence, sourced from a page fetched in this run.
+2. **New:** no manual cut, override ≤ 0.2 or `ignore_conflict` already covers it, and the tournament has no `delta_override` that says otherwise.
+3. **Material:** the fair-value move on at least one traded contract, `Δp × P_top{N}_given_play`, is **at least the MM's `buffer_c`** (default 2¢). The scout never bids above fair − buffer, so a smaller move leaves every resting bid still above water, and the next recompute can fix it calmly. A larger move can leave scouts above the new fair value. The halt threshold follows the MM buffer, including per-market overrides.
+4. **Exposed:** resting orders or MM quotes on that player, or positions on the event above $50.
+5. **In time:** before the event start.
+6. **Once:** at most one halt per (market, event date, player, tournament).
+
+Modes, following the MM's shadow-then-live pattern: `off`, `shadow` (records "would have halted" and alerts; the launch default) and `live`. Nothing resumes trading automatically: after a halt, you review the finding and press Resume on the Market maker page.
 
 ## 12. Failure modes and safeguards
 
