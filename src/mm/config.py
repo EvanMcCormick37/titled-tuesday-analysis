@@ -34,9 +34,10 @@ class MMParams(BaseModel):
     war_cooloff_s: int = Field(120, ge=10, le=3_600, title='Price-war cool-off (s)')
 
     # ── Exit layer: resting sells of what we hold, at fair value ─────────────
-    exits_enabled: bool = Field(True, title='Exit orders enabled',
+    exits_enabled: bool = Field(False, title='Exit orders enabled',
                                 description='Rest a sell of every position at fair value (a long YES '
-                                            'is offered as a NO bid at 100 − fair)')
+                                            'is offered as a NO bid at 100 − fair). Off by default: '
+                                            'selling at fair sells the underpriced holdings and keeps the overpriced ones')
 
     # ── Fallback on anchor wipes (per player, as a ratio) ─────────────────────
     wipe_ratio: float = Field(0.33, gt=0, lt=1, title='Wipe cut',

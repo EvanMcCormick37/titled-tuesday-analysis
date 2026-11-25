@@ -12,7 +12,7 @@ Replaces resting `place_bids` with an event-driven quoter. One asyncio process q
 ## Quoting
 
 - Two tiers per contract and side (YES bid, NO bid), all prices integer cents in that side's frame. **Anchor** = the old place_bids price, `max(fair/markup, fair − max_discount)`. **Scout** = one cent above the best *competing* bid, capped at `fair − buffer_c` (default 2¢) and below the cross. Below 45¢ fair the anchor is fair / markup, so the ceiling only clears it above 3 × buffer: no scout on contracts at or below 6¢ fair. Scout size tapers linearly from AV at the anchor to 0 at fair; anchor size = AV − scout. Pure function: `quoting.quote_side`.
-- **Exit layer** (`exits_enabled`, default on): rests a sell of every position at fair value (a long YES is offered as a NO bid at 100 − fair), `client_order_id` prefix `mmx-`.
+- **Exit layer** (`exits_enabled`, default **off**): when switched on, rests a sell of every position at fair value (a long YES is offered as a NO bid at 100 − fair), `client_order_id` prefix `mmx-`. Turned off on 2026-11-25: selling at fair gets adversely selected (the holdings that sell are the underpriced ones, the overpriced ones stay) and gives up edge, which the risk reduction no longer justifies. Switching it off cancels resting `mmx-` orders on the next cycle.
 - The ex-own book subtracts **all** of the account's resting orders (MM, place_bids, fade, manual), so the scout never outbids us.
 - The price-war governor rests at the buffer edge silently (no alert).
 - Quoting is active only when the market is unpaused, not held (a model run that fails hard validation holds the market and raises a `model_invalid` alert), fair values are loaded, and the time is before the cutoff (minus 5 s).

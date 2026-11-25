@@ -251,8 +251,20 @@ def test_small_fill_is_never_a_wipe(env):
     assert 'a' not in store.get_overrides(MARKET, DATE)
 
 
+def test_exits_are_off_by_default(env):
+    eng, _, _, _ = make_engine()
+    for t in (WIN_A, WIN_B, TOP3_A):
+        eng.handle(snap(t))
+    eng.positions[WIN_A] = 50
+    eng.positions[TOP3_A] = -20
+    cycle(eng)
+    assert not any(s[2] == EXIT for s in live_slots(eng))
+
+
 def test_exits_rest_held_positions_at_fair_and_track_fills(env):
     eng, _, _, _ = make_engine()
+    store.set_params(MARKET, {'exits_enabled': True})
+    eng.poll_control(eng.markets[MARKET])
     for t in (WIN_A, WIN_B, TOP3_A):
         eng.handle(snap(t))
     eng.positions[WIN_A] = 50          # long YES on Player A to win (fair 0.30)
