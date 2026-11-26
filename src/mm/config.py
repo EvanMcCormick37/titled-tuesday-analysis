@@ -14,6 +14,14 @@ from pydantic import BaseModel, ConfigDict, Field
 class MMParams(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
+    # ── Sides quoted (anchors and scouts) ────────────────────────────────────
+    quote_yes: bool = Field(False, title='Quote YES bids',
+                            description='Rest YES bids (buy YES). Off by default: whoever sells YES '
+                                        'into them is more often a sharp or a bot')
+    quote_no: bool = Field(True, title='Quote NO bids',
+                           description='Rest NO bids (i.e. offer YES at 100 − price), which retail '
+                                       'YES takers lift')
+
     # ── Anchor (deep) layer: today's place_bids pricing ──────────────────────
     anchor_volume: int = Field(200, ge=1, le=10_000, title='Anchor volume (AV)',
                                description='Contracts per side; scout + anchor never exceed this')

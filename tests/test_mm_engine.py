@@ -131,6 +131,12 @@ def make_engine(client=None, live=False, wall=BEFORE_CUTOFF, **kw):
     return eng, client, gw, clock
 
 
+def both_sides(eng, **params):
+    """Quote YES bids too (off by default), plus any other parameter overrides."""
+    store.set_params(MARKET, {'quote_yes': True, **params})
+    eng.poll_control(eng.markets[MARKET])
+
+
 def snap(ticker, yes=(), no=()):
     return {'type': 'orderbook_snapshot', 'sid': 1, 'seq': 1, 'msg': {
         'market_ticker': ticker,
@@ -164,6 +170,7 @@ def test_fair_value_validation():
 
 def test_shadow_quotes_anchors_and_scouts(env):
     eng, client, gw, _ = make_engine()
+    both_sides(eng)
     assert eng.markets[MARKET].fv is not None and eng.markets[MARKET].tickers == {WIN_A, WIN_B, TOP3_A}
     eng.handle(snap(WIN_A, yes=[(22, 50)], no=[(40, 10)]))
     for t in (WIN_B, TOP3_A):
@@ -212,6 +219,7 @@ def _wipe(eng, side='yes', ticker=WIN_A):
 
 def test_wipes_cut_the_whole_player_then_pull_and_repost(env):
     eng, _, _, _ = make_engine()
+    both_sides(eng)
     for t in (WIN_A, WIN_B, TOP3_A):
         eng.handle(snap(t))
     cycle(eng)
@@ -242,13 +250,30 @@ def test_wipes_cut_the_whole_player_then_pull_and_repost(env):
 
 def test_small_fill_is_never_a_wipe(env):
     eng, _, _, _ = make_engine()
-    store.set_params(MARKET, {'wipe_min_qty': 10, 'anchor_volume': 5})
-    eng.poll_control(eng.markets[MARKET])
+    both_sides(eng, wipe_min_qty=10, anchor_volume=5)
     for t in (WIN_A, WIN_B, TOP3_A):
         eng.handle(snap(t))
     cycle(eng)
     _wipe(eng, 'yes', WIN_A)
     assert 'a' not in store.get_overrides(MARKET, DATE)
+
+
+def test_only_no_bids_by_default_and_sides_are_switchable(env):
+    eng, _, _, _ = make_engine()
+    eng.handle(snap(WIN_A, yes=[(22, 50)], no=[(40, 10)]))
+    for t in (WIN_B, TOP3_A):
+        eng.handle(snap(t))
+    cycle(eng)
+    slots = live_slots(eng)
+    assert slots and all(s[1] == 'no' for s in slots)
+    assert slots[(WIN_A, 'no', ANCHOR)][0] == 55
+    # Switched to YES only: the NO quotes come down and YES quotes go up.
+    store.set_params(MARKET, {'quote_yes': True, 'quote_no': False})
+    eng.poll_control(eng.markets[MARKET])
+    cycle(eng)
+    slots = live_slots(eng)
+    assert slots and all(s[1] == 'yes' for s in slots)
+    assert slots[(WIN_A, 'yes', ANCHOR)] == (20, 60)
 
 
 def test_exits_are_off_by_default(env):
@@ -320,6 +345,7 @@ def test_cutoff_stops_quoting_and_cancels(env):
 
 def test_seq_gap_marks_books_stale_and_drops_scouts(env):
     eng, _, _, _ = make_engine()
+    both_sides(eng)
     eng.handle(snap(WIN_A, yes=[(22, 50)]))
     eng.handle({'type': 'orderbook_delta', 'sid': 1, 'seq': 5, 'msg': {
         'market_ticker': WIN_A, 'side': 'yes', 'price_dollars': '0.2100', 'delta_fp': '5.00'}})

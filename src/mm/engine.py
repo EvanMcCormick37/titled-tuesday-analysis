@@ -417,6 +417,8 @@ class Engine:
                                  float(ovr.get('no_factor') or 1.0))
                 if p.exits_enabled:
                     exits[e_slot] = exit_quote(book, side, fair, self.positions.get(ticker, 0.0), p)
+                if not (p.quote_yes if side == 'yes' else p.quote_no):
+                    continue           # side switched off: its anchor/scout come down
                 war = self._war_until.get((ticker, side), 0) > now
                 sq = quote_side(book, side, fair, self.oms.own_levels(ticker, side), p,
                                 markup=ovr.get('markup_override'), war_mode=war, scouts=self.scouts)
